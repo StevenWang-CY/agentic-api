@@ -16,12 +16,12 @@ use super::gateway::{
     append_gateway_calls_to_new_input, append_output_items_to_input, append_tool_outputs,
     execute_and_emit_output_calls, has_client_owned_calls, public_output_items,
 };
-use crate::executor::accumulator::ResponseAccumulator;
 use crate::executor::error::{ExecutorError, ExecutorResult};
-use crate::executor::inference::{DONE_MARKER, call_inference, fetch_response_json};
-use crate::executor::persist::persist_response;
+use crate::executor::inference::DONE_MARKER;
+use crate::executor::persist::persist_if_needed;
 use crate::executor::rehydrate::rehydrate_conversation;
 use crate::executor::request::{ExecutionContext, RequestContext};
+use crate::executor::upstream::{fetch_blocking_payload, fetch_stream_payload};
 use crate::tool::ToolRegistry;
 use crate::types::io::{ResponseUsage, ToolChoice};
 use crate::types::request_response::{RequestPayload, ResponsePayload};
@@ -30,60 +30,6 @@ use crate::utils::common::serialize_to_string;
 pub use crate::executor::inference::BoxStream;
 
 const MAX_GATEWAY_TOOL_ROUNDS: usize = 10;
-
-fn should_persist(ctx: &RequestContext) -> bool {
-    ctx.original_request.store
-        || ctx.original_request.previous_response_id.is_some()
-        || ctx.original_request.conversation_id.is_some()
-}
-
-async fn fetch_blocking_payload(
-    ctx: &RequestContext,
-    exec_ctx: &ExecutionContext,
-    auth: Option<&str>,
-) -> ExecutorResult<ResponsePayload> {
-    let url = exec_ctx.responses_url();
-    // Non-streaming request: stream=false → full JSON body → from_json.
-    let upstream_json =
-        serialize_to_string(&ctx.enriched_request.to_upstream_request(false)).map_err(ExecutorError::JsonError)?;
-
-    let body = fetch_response_json(upstream_json, &url, &exec_ctx.client, auth).await?;
-
-    let acc = ResponseAccumulator::from_json(&body, ctx.conversation_id.as_deref())?;
-    let mut payload = acc.finalize(
-        &ctx.enriched_request.model,
-        ctx.original_request.previous_response_id.as_deref(),
-        ctx.original_request.instructions.as_deref(),
-    );
-    ctx.inject_ids(&mut payload);
-
-    Ok(payload)
-}
-
-async fn fetch_stream_payload(
-    ctx: &RequestContext,
-    exec_ctx: &ExecutionContext,
-    auth: Option<&str>,
-) -> ExecutorResult<ResponsePayload> {
-    let url = exec_ctx.responses_url();
-    let upstream_json =
-        serialize_to_string(&ctx.enriched_request.to_upstream_request(true)).map_err(ExecutorError::JsonError)?;
-    let line_stream = Box::pin(call_inference(
-        upstream_json,
-        url,
-        Arc::clone(&exec_ctx.client),
-        auth.map(str::to_owned),
-        exec_ctx.streaming_timeout,
-    ));
-    let acc = ResponseAccumulator::from_stream(line_stream, ctx.conversation_id.as_deref()).await?;
-    let mut payload = acc.finalize(
-        &ctx.enriched_request.model,
-        ctx.original_request.previous_response_id.as_deref(),
-        ctx.original_request.instructions.as_deref(),
-    );
-    ctx.inject_ids(&mut payload);
-    Ok(payload)
-}
 
 fn add_usage(total: ResponseUsage, usage: ResponseUsage) -> ResponseUsage {
     ResponseUsage {
@@ -222,12 +168,10 @@ async fn run_blocking(
 ) -> ExecutorResult<ResponsePayload> {
     let (payload, ctx) = run_until_gateway_tools_complete(ctx, exec_ctx, auth, false, None).await?;
 
-    if should_persist(&ctx) {
-        let ch = exec_ctx.conv_handler.clone();
-        let rh = exec_ctx.resp_handler.clone();
-        if let Err(e) = persist_response(payload.clone(), ctx, ch, rh).await {
-            warn!("persist failed: {e}");
-        }
+    let ch = exec_ctx.conv_handler.clone();
+    let rh = exec_ctx.resp_handler.clone();
+    if let Err(e) = persist_if_needed(payload.clone(), ctx, ch, rh).await {
+        warn!("persist failed: {e}");
     }
 
     Ok(payload)
@@ -235,7 +179,6 @@ async fn run_blocking(
 
 fn run_stream(ctx: RequestContext, exec_ctx: Arc<ExecutionContext>, auth: Option<String>) -> BoxStream {
     Box::pin(stream! {
-        let should_persist = should_persist(&ctx);
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
         let exec_ctx_for_run = Arc::clone(&exec_ctx);
         let mut run_handle = AbortOnDrop::new(tokio::spawn(async move {
@@ -271,12 +214,10 @@ fn run_stream(ctx: RequestContext, exec_ctx: Arc<ExecutionContext>, auth: Option
                             yield payload.as_responses_chunk();
                             yield DONE_MARKER.to_string();
 
-                            if should_persist {
-                                let ch = exec_ctx.conv_handler.clone();
-                                let rh = exec_ctx.resp_handler.clone();
-                                if let Err(e) = persist_response(payload, ctx, ch, rh).await {
-                                    warn!("persist failed: {e}");
-                                }
+                            let ch = exec_ctx.conv_handler.clone();
+                            let rh = exec_ctx.resp_handler.clone();
+                            if let Err(e) = persist_if_needed(payload, ctx, ch, rh).await {
+                                warn!("persist failed: {e}");
                             }
                         }
                     }

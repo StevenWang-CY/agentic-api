@@ -9,6 +9,26 @@ use crate::executor::request::RequestContext;
 use crate::types::event::ResponseStatus;
 use crate::types::request_response::ResponsePayload;
 
+#[must_use]
+pub(crate) fn should_persist(ctx: &RequestContext) -> bool {
+    ctx.original_request.store
+        || ctx.original_request.previous_response_id.is_some()
+        || ctx.original_request.conversation_id.is_some()
+}
+
+pub(crate) async fn persist_if_needed(
+    payload: ResponsePayload,
+    ctx: RequestContext,
+    conv_handler: ConversationHandler,
+    resp_handler: ResponseHandler,
+) -> ExecutorResult<()> {
+    if should_persist(&ctx) {
+        persist_response(payload, ctx, conv_handler, resp_handler).await
+    } else {
+        Ok(())
+    }
+}
+
 /// Step 3 — Persist the completed response to storage.
 ///
 /// Skipped if [`ResponseStatus`] is not `Completed`/`Incomplete` or `payload.id` is empty.
