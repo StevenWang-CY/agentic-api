@@ -88,10 +88,7 @@ impl InOutItem {
             .into_iter()
             .filter_map(|i| match i {
                 InOutItem::Input(item) => Some(item),
-                InOutItem::Output(OutputItem::Message(msg)) => Some(InputItem::Message(msg.into())),
-                InOutItem::Output(OutputItem::Reasoning(r)) => Some(InputItem::Reasoning(r)),
-                InOutItem::Output(OutputItem::FunctionCall(f)) => Some(InputItem::FunctionCall(f)),
-                InOutItem::Output(OutputItem::WebSearchCall(_) | OutputItem::Unknown) => None,
+                InOutItem::Output(output) => output.to_input_item(),
             })
             .collect()
     }

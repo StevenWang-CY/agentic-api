@@ -6,7 +6,7 @@ use crate::executor::error::ExecutorError;
 use crate::types::event::MessageStatus;
 use crate::utils::uuid7_str;
 
-use super::input::{InputContent, InputMessage, InputMessageContent, InputTextContent};
+use super::input::{InputContent, InputItem, InputMessage, InputMessageContent, InputTextContent};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OutputTextContent {
@@ -315,6 +315,18 @@ pub enum OutputItem {
     Reasoning(ReasoningOutput),
     #[serde(other)]
     Unknown,
+}
+
+impl OutputItem {
+    #[must_use]
+    pub fn to_input_item(&self) -> Option<InputItem> {
+        match self {
+            Self::Message(message) => Some(InputItem::Message(message.clone().into())),
+            Self::Reasoning(reasoning) => Some(InputItem::Reasoning(reasoning.clone())),
+            Self::FunctionCall(call) => Some(InputItem::FunctionCall(call.clone())),
+            Self::WebSearchCall(_) | Self::Unknown => None,
+        }
+    }
 }
 
 #[cfg(test)]

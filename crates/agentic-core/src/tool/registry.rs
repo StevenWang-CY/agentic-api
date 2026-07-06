@@ -1,8 +1,10 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::{GatewayExecutor, ToolError, ToolOutput};
 use crate::types::io::output::FunctionToolCall;
 use crate::types::tools::ResponsesTool;
 
@@ -20,13 +22,30 @@ pub enum ToolType {
 }
 
 /// Per-request routing entry keyed by the tool name the model will call.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ToolEntry {
     pub tool_type: ToolType,
     /// Full serialised tool param for the executor (used during dispatch).
     pub config: Value,
     /// For MCP tools: which server this tool belongs to.
     pub server_label: Option<String>,
+    pub handler: Option<Arc<dyn GatewayExecutor>>,
+}
+
+impl std::fmt::Debug for ToolEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ToolEntry")
+            .field("tool_type", &self.tool_type)
+            .field("config", &self.config)
+            .field("server_label", &self.server_label)
+            .field("handler", &self.handler.is_some())
+            .finish()
+    }
+}
+
+pub struct GatewayDispatchResult {
+    pub tool_type: ToolType,
+    pub output: Result<ToolOutput, ToolError>,
 }
 
 /// Request-scoped registry built from `RequestPayload.tools`.
@@ -48,6 +67,20 @@ impl ToolRegistry {
     /// for the types defined in this module (`#[derive(Serialize)]` on plain structs).
     #[must_use]
     pub fn build(tools: &[ResponsesTool]) -> Self {
+        Self::build_with_handlers(tools, |_| None)
+    }
+
+    #[must_use]
+    /// Build a registry from declared tools and attach gateway handlers for dispatchable tool types.
+    ///
+    /// # Panics
+    ///
+    /// Panics if serialization of a tool param struct fails, which cannot happen
+    /// for the types defined in this module (`#[derive(Serialize)]` on plain structs).
+    pub fn build_with_handlers(
+        tools: &[ResponsesTool],
+        mut handler_for: impl FnMut(ToolType) -> Option<Arc<dyn GatewayExecutor>>,
+    ) -> Self {
         let mut entries = HashMap::with_capacity(tools.len());
 
         for tool in tools {
@@ -62,6 +95,7 @@ impl ToolRegistry {
                                 tool_type: ToolType::Function,
                                 config: serde_json::to_value(p).expect("serialization of known struct is infallible"),
                                 server_label: None,
+                                handler: None,
                             },
                         )
                         .is_some()
@@ -88,6 +122,7 @@ impl ToolRegistry {
                             tool_type: ToolType::WebSearch,
                             config: serde_json::to_value(p).expect("serialization of known struct is infallible"),
                             server_label: None,
+                            handler: handler_for(ToolType::WebSearch),
                         },
                     );
                 }
@@ -98,6 +133,7 @@ impl ToolRegistry {
                             tool_type: ToolType::FileSearch,
                             config: serde_json::to_value(p).expect("serialization of known struct is infallible"),
                             server_label: None,
+                            handler: handler_for(ToolType::FileSearch),
                         },
                     );
                 }
@@ -108,6 +144,7 @@ impl ToolRegistry {
                             tool_type: ToolType::CodeInterpreter,
                             config: serde_json::to_value(p).expect("serialization of known struct is infallible"),
                             server_label: None,
+                            handler: handler_for(ToolType::CodeInterpreter),
                         },
                     );
                 }
@@ -158,5 +195,18 @@ impl ToolRegistry {
                     .is_none_or(|e| e.tool_type == ToolType::Function)
             })
             .collect()
+    }
+
+    pub async fn dispatch(&self, call: &FunctionToolCall) -> Option<GatewayDispatchResult> {
+        let entry = self.entries.get(&call.name)?;
+        let handler = entry.handler.clone()?;
+        let tool_type = entry.tool_type;
+        let config = entry.config.clone();
+        Some(GatewayDispatchResult {
+            tool_type,
+            output: handler
+                .execute(&call.call_id, &call.name, &call.arguments, &config)
+                .await,
+        })
     }
 }

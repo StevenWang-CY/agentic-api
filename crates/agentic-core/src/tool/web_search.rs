@@ -5,7 +5,8 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::types::io::FunctionTool;
+use crate::types::io::output::{FunctionToolCall, WebSearchCall, WebSearchCallStatus, WebSearchSource};
+use crate::types::io::{FunctionTool, OutputItem};
 use crate::types::tools::{WebSearchContextSize, WebSearchToolParam};
 use crate::utils::common::serialize_to_string;
 
@@ -61,6 +62,28 @@ pub(crate) fn web_search_function_tool() -> FunctionTool {
         })),
         strict: Some(false),
     }
+}
+
+#[must_use]
+pub(crate) fn output_item(call: &FunctionToolCall, output: &ToolOutput, status: WebSearchCallStatus) -> OutputItem {
+    let parsed_output = serde_json::from_str::<Value>(&output.output).ok();
+    let query = parsed_output
+        .as_ref()
+        .and_then(|value| clean_json_str(value.get("query")))
+        .or_else(|| query_from_arguments(&call.arguments))
+        .unwrap_or_default();
+    let sources = parsed_output.as_ref().map(sources_from_output).unwrap_or_default();
+    OutputItem::WebSearchCall(WebSearchCall::new(call_output_id(call), status, query, sources))
+}
+
+#[must_use]
+pub(crate) fn started_output_item(call: &FunctionToolCall) -> OutputItem {
+    OutputItem::WebSearchCall(WebSearchCall::new(
+        call_output_id(call),
+        WebSearchCallStatus::InProgress,
+        query_from_arguments(&call.arguments).unwrap_or_default(),
+        Vec::new(),
+    ))
 }
 
 #[derive(Debug, Clone)]
@@ -375,6 +398,46 @@ fn clean_string(value: Option<&str>) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_owned)
+}
+
+fn clean_json_str(value: Option<&Value>) -> Option<String> {
+    value
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+fn call_output_id(call: &FunctionToolCall) -> String {
+    if let Some(suffix) = call.id.strip_prefix("fc_").filter(|suffix| !suffix.is_empty()) {
+        return format!("ws_{suffix}");
+    }
+    if let Some(suffix) = call.call_id.strip_prefix("call_").filter(|suffix| !suffix.is_empty()) {
+        return format!("ws_{suffix}");
+    }
+    crate::utils::uuid7_str("ws_")
+}
+
+fn query_from_arguments(arguments: &str) -> Option<String> {
+    let args = serde_json::from_str::<Value>(arguments).ok()?;
+    clean_json_str(args.get("query"))
+}
+
+fn sources_from_output(output: &Value) -> Vec<WebSearchSource> {
+    ["web", "news"]
+        .into_iter()
+        .filter_map(|section| output.get("results")?.get(section)?.as_array())
+        .flat_map(|results| results.iter())
+        .filter_map(source_from_result)
+        .collect()
+}
+
+fn source_from_result(result: &Value) -> Option<WebSearchSource> {
+    let url = clean_json_str(result.get("url"))?;
+    Some(WebSearchSource {
+        url,
+        title: clean_json_str(result.get("title")),
+    })
 }
 
 fn clean_base_url(value: &str) -> Option<String> {
