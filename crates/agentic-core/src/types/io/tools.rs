@@ -1,7 +1,7 @@
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de, ser::SerializeMap};
 use serde_json::Value;
 
-use crate::types::tools::ResponsesTool;
+use crate::types::tools::{NonEmptyToolName, ResponsesTool};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FunctionTool {
@@ -21,7 +21,7 @@ pub enum ToolChoice {
     Required,
     Function {
         namespace: Option<String>,
-        name: String,
+        name: NonEmptyToolName,
     },
 }
 
@@ -40,7 +40,7 @@ impl Serialize for ToolChoice {
                 if let Some(namespace) = namespace {
                     map.serialize_entry("namespace", namespace)?;
                 }
-                map.serialize_entry("name", name)?;
+                map.serialize_entry("name", name.as_str())?;
                 map.end()
             }
         }
@@ -70,10 +70,8 @@ impl<'de> Deserialize<'de> for ToolChoice {
                         .get("name")
                         .and_then(Value::as_str)
                         .ok_or_else(|| de::Error::missing_field("name"))?;
-                    return Ok(Self::Function {
-                        namespace,
-                        name: name.to_string(),
-                    });
+                    let name = NonEmptyToolName::try_from(name).map_err(de::Error::custom)?;
+                    return Ok(Self::Function { namespace, name });
                 }
 
                 if let Some(function) = object.get("function").and_then(Value::as_object) {
@@ -82,10 +80,8 @@ impl<'de> Deserialize<'de> for ToolChoice {
                         .get("name")
                         .and_then(Value::as_str)
                         .ok_or_else(|| de::Error::missing_field("name"))?;
-                    return Ok(Self::Function {
-                        namespace,
-                        name: name.to_string(),
-                    });
+                    let name = NonEmptyToolName::try_from(name).map_err(de::Error::custom)?;
+                    return Ok(Self::Function { namespace, name });
                 }
 
                 Err(de::Error::custom("expected tool_choice string or function object"))
@@ -122,5 +118,29 @@ pub(crate) fn resolve_tool_choice(
         request_choice.cloned().unwrap_or_default()
     } else {
         stored_choice.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn function_tool_choice_rejects_empty_name() {
+        assert!(
+            serde_json::from_value::<ToolChoice>(serde_json::json!({
+                "type": "function",
+                "name": ""
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<ToolChoice>(serde_json::json!({
+                "function": {
+                    "name": ""
+                }
+            }))
+            .is_err()
+        );
     }
 }

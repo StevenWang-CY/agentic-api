@@ -21,8 +21,8 @@ pub(super) async fn fetch_blocking_payload(
 ) -> ExecutorResult<ResponsePayload> {
     let url = exec_ctx.responses_url();
     // Non-streaming request: stream=false -> full JSON body -> from_json.
-    let upstream_json =
-        serialize_to_string(&ctx.enriched_request.to_upstream_request(false)).map_err(ExecutorError::JsonError)?;
+    let upstream_request = ctx.enriched_request.to_upstream_request(false)?;
+    let upstream_json = serialize_to_string(&upstream_request).map_err(ExecutorError::JsonError)?;
 
     let body = fetch_response_json(upstream_json, &url, &exec_ctx.client, auth).await?;
 
@@ -45,8 +45,8 @@ pub(super) async fn fetch_stream_payload(
     stream_events: Option<&mpsc::UnboundedSender<String>>,
 ) -> ExecutorResult<ResponsePayload> {
     let url = exec_ctx.responses_url();
-    let upstream_json =
-        serialize_to_string(&ctx.enriched_request.to_upstream_request(true)).map_err(ExecutorError::JsonError)?;
+    let upstream_request = ctx.enriched_request.to_upstream_request(true)?;
+    let upstream_json = serialize_to_string(&upstream_request).map_err(ExecutorError::JsonError)?;
     let mut line_stream = Box::pin(call_inference(
         upstream_json,
         url,

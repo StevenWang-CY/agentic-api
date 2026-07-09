@@ -302,6 +302,36 @@ async fn test_codex_namespace_tool_shape_rehydrates_from_previous_response_metad
 }
 
 #[tokio::test]
+async fn test_codex_namespace_collision_with_top_level_function_is_rejected() {
+    let fixture = TestFixture::new_with_responses(vec![text_response("should not be called")]).await;
+    let tools: Vec<ResponsesTool> = serde_json::from_value(serde_json::json!([
+        {"type": "function", "name": "agentic_ns__mcp__shell__run"},
+        {
+            "type": "namespace",
+            "name": "mcp__shell",
+            "tools": [{"type": "function", "name": "run"}]
+        }
+    ]))
+    .unwrap();
+
+    let mut request = make_request("run pwd", true, false, None, None);
+    request.tools = Some(tools);
+
+    let Err(err) = execute(request, Arc::clone(&fixture.exec_ctx)).await else {
+        panic!("colliding namespace member should be rejected");
+    };
+
+    assert!(
+        err.to_string().contains("collides with top-level function"),
+        "unexpected error: {err}"
+    );
+    assert!(
+        fixture.request_bodies().await.is_empty(),
+        "invalid request must fail before calling upstream"
+    );
+}
+
+#[tokio::test]
 async fn test_previous_response_id_explicit_tool_choice_overrides_stored_choice() {
     let fixture =
         TestFixture::new_with_responses(vec![text_response("seed answer"), text_response("next answer")]).await;

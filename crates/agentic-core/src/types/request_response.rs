@@ -5,7 +5,7 @@ use super::io::{
     FunctionTool, InputItem, InputMessage, InputMessageContent, OutputItem, ResponseUsage, ResponsesInput, ToolChoice,
 };
 use super::tools::ResponsesTool;
-use crate::tool::CodexNamespaceHandler;
+use crate::tool::{CodexNamespaceHandler, ToolError};
 use crate::utils::common::serialize_to_string;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,19 +78,25 @@ impl RequestPayload {
     /// All tool types are then normalised to `Vec<FunctionTool>` via
     /// [`ResponsesTool::to_function_tools`]. `tool_choice` is resolved the
     /// same way via [`CodexNamespaceHandler::resolve_tool_choice`].
-    #[must_use]
-    pub fn to_upstream_request(&self, stream: bool) -> UpstreamRequest<'_> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolError::Config`] when a Codex namespace member's generated
+    /// flat name collides with a top-level function tool or another namespace
+    /// member.
+    pub fn to_upstream_request(&self, stream: bool) -> Result<UpstreamRequest<'_>, ToolError> {
         let renamed_tools = self
             .tools
             .as_deref()
-            .map(|tools| CodexNamespaceHandler.resolve_namespace_members(tools));
+            .map(|tools| CodexNamespaceHandler.resolve_namespace_members(tools))
+            .transpose()?;
         let tools: Option<Vec<FunctionTool>> = renamed_tools
             .as_deref()
             .map(|tools| tools.iter().flat_map(ResponsesTool::to_function_tools).collect());
         let tools = tools.filter(|tools| !tools.is_empty());
-        let namespace_map = CodexNamespaceHandler.build_namespace_map(self.tools.as_deref());
+        let namespace_map = CodexNamespaceHandler.build_namespace_map(self.tools.as_deref())?;
         let tool_choice = CodexNamespaceHandler.resolve_tool_choice(namespace_map.as_ref(), self.tool_choice.as_ref());
-        UpstreamRequest {
+        Ok(UpstreamRequest {
             model: &self.model,
             input: &self.input,
             stream,
@@ -103,7 +109,7 @@ impl RequestPayload {
             max_output_tokens: self.max_output_tokens,
             truncation: self.truncation.as_deref(),
             metadata: self.metadata.as_ref(),
-        }
+        })
     }
 }
 
@@ -202,7 +208,7 @@ mod tests {
         assert_eq!(payload.instructions.as_deref(), Some("rules"));
         assert!(matches!(&payload.input, ResponsesInput::Text(text) if text == "hi"));
 
-        let upstream = payload.to_upstream_request(false);
+        let upstream = payload.to_upstream_request(false).expect("valid upstream request");
         let value = serde_json::to_value(upstream).unwrap();
         assert_eq!(value["instructions"], "rules");
         assert_eq!(value["input"], "hi");
@@ -234,10 +240,33 @@ mod tests {
         };
         assert_eq!(namespace.tools.len(), 2);
 
-        let upstream = payload.to_upstream_request(false);
+        let upstream = payload.to_upstream_request(false).expect("valid upstream request");
         let value = serde_json::to_value(upstream).unwrap();
         assert_eq!(value["tools"].as_array().expect("upstream tools").len(), 1);
         assert_eq!(value["tools"][0]["name"], "agentic_ns__mcp__shell__run");
+    }
+
+    #[test]
+    fn to_upstream_request_rejects_namespace_collisions() {
+        let payload: RequestPayload = serde_json::from_value(serde_json::json!({
+            "model": "test",
+            "input": "hi",
+            "tools": [
+                {"type": "function", "name": "agentic_ns__mcp__shell__run"},
+                {
+                    "type": "namespace",
+                    "name": "mcp__shell",
+                    "tools": [{"type": "function", "name": "run"}]
+                }
+            ]
+        }))
+        .unwrap();
+
+        let Err(err) = payload.to_upstream_request(false) else {
+            panic!("colliding namespace member should be rejected");
+        };
+
+        assert!(err.to_string().contains("collides with top-level function"));
     }
 
     #[test]

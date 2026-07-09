@@ -72,20 +72,27 @@ pub struct ToolRegistry {
 impl ToolRegistry {
     /// Build a registry from the declared tools.
     ///
-    /// Function tools with empty names are skipped with a warning. Duplicate
-    /// tool names result in last-write-wins, also logged at `warn` level.
+    /// Duplicate tool names result in last-write-wins, logged at `warn` level.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolError::Config`] when Codex namespace member flattening
+    /// would collide with another declared tool name.
     ///
     /// # Panics
     ///
     /// Panics if serialization of a tool param struct fails, which cannot happen
     /// for the types defined in this module (`#[derive(Serialize)]` on plain structs).
-    #[must_use]
-    pub fn build(tools: &[ResponsesTool]) -> Self {
+    pub fn build(tools: &[ResponsesTool]) -> Result<Self, ToolError> {
         Self::build_with_handlers(tools, |_| None)
     }
 
-    #[must_use]
     /// Build a registry from declared tools and attach gateway handlers for dispatchable tool types.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolError::Config`] when Codex namespace member flattening
+    /// would collide with another declared tool name.
     ///
     /// # Panics
     ///
@@ -94,12 +101,12 @@ impl ToolRegistry {
     pub fn build_with_handlers(
         tools: &[ResponsesTool],
         mut handler_for: impl FnMut(ToolType) -> Option<Arc<dyn GatewayExecutor>>,
-    ) -> Self {
+    ) -> Result<Self, ToolError> {
         let mut entries = HashMap::with_capacity(tools.len());
         // Namespace members must be keyed by the same flat, model-visible name
         // the model will call, so resolve them first — the same pure pass used
         // to build the upstream request.
-        let resolved_tools = CodexNamespaceHandler.resolve_namespace_members(tools);
+        let resolved_tools = CodexNamespaceHandler.resolve_namespace_members(tools)?;
 
         for tool in &resolved_tools {
             match tool {
@@ -197,9 +204,9 @@ impl ToolRegistry {
             }
         }
 
-        let namespace_map = CodexNamespaceHandler.build_namespace_map((!tools.is_empty()).then_some(tools));
+        let namespace_map = CodexNamespaceHandler.build_namespace_map((!tools.is_empty()).then_some(tools))?;
 
-        Self { entries, namespace_map }
+        Ok(Self { entries, namespace_map })
     }
 
     #[must_use]
