@@ -94,7 +94,7 @@ jobs:
 
           echo "version=$core_version" >> "$GITHUB_OUTPUT"
           echo "tag=v$core_version" >> "$GITHUB_OUTPUT"
-          echo "release_branch=release/v$core_version" >> "$GITHUB_OUTPUT"
+          echo "release_branch=releases/v$core_version" >> "$GITHUB_OUTPUT"
           echo "Release version: $core_version"
 
       - name: Check release refs
@@ -134,7 +134,6 @@ jobs:
           set -euo pipefail
           cargo publish --dry-run -p agentic-server-core
           cargo package -p agentic-server --no-verify
-          echo "Would create empty chore release commit: chore: release ${{ steps.version.outputs.tag }}"
           echo "Would create tag ${{ steps.version.outputs.tag }}"
           echo "Would create branch ${{ steps.version.outputs.release_branch }}"
           echo "Would create GitHub release ${{ steps.version.outputs.tag }} with generated notes"
@@ -180,12 +179,9 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git commit --allow-empty -s -m "chore: release $tag"
-          release_commit="$(git rev-parse HEAD)"
-
-          git tag -a "$tag" "$release_commit" -m "$tag"
+          git tag -a "$tag" "$GITHUB_SHA" -m "$tag"
           git push origin "$tag"
-          git push origin "$release_commit:refs/heads/$release_branch"
+          git push origin "$GITHUB_SHA:refs/heads/$release_branch"
 
       - name: Create GitHub release
         if: ${{ !inputs.dry_run }}
@@ -195,5 +191,6 @@ jobs:
           set -euo pipefail
           tag="${{ steps.version.outputs.tag }}"
           gh release create "$tag" \
+            --target "$GITHUB_SHA" \
             --title "$tag" \
             --generate-notes
