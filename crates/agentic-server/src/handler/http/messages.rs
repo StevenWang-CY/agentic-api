@@ -4,12 +4,12 @@ use bytes::Bytes;
 
 use agentic_core::proxy::{ProxyAuth, ProxyRequest, proxy_request_with_path};
 
-use super::super::common::{convert_response, read_bytes};
+use super::super::common::{convert_response, read_bytes_with_auth};
 use crate::app::AppState;
 
 async fn proxy_messages(state: &AppState, request: Request, path: &'static str) -> Response {
     let (parts, body) = request.into_parts();
-    let body: Bytes = match read_bytes(body).await {
+    let body: Bytes = match read_bytes_with_auth(body, ProxyAuth::Anthropic).await {
         Ok(body) => body,
         Err(response) => return response,
     };

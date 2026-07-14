@@ -195,3 +195,31 @@ async fn messages_preserves_upstream_error_status_and_body() {
         r#"{"type":"error","error":{"type":"invalid_request_error","message":"bad"}}"#
     );
 }
+
+#[tokio::test]
+async fn messages_returns_anthropic_error_for_unreachable_upstream() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dead_addr = listener.local_addr().unwrap();
+    drop(listener);
+    let (gateway_url, _gateway) = spawn_gateway(test_state(&test_config(&format!("http://{dead_addr}")))).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/v1/messages"))
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(
+        body,
+        serde_json::json!({
+            "type": "error",
+            "error": {
+                "type": "api_error",
+                "message": "LLM unavailable",
+            },
+        })
+    );
+}

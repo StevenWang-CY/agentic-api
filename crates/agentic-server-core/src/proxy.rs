@@ -152,14 +152,28 @@ fn is_sse_content_type(headers: &reqwest::header::HeaderMap) -> bool {
 
 #[must_use]
 pub fn error_response(status: StatusCode, code: &str, message: &str) -> ProxyResponse {
-    let body = serde_json::json!({
-        "error": {
-            "message": message,
-            "type": "api_error",
-            "param": null,
-            "code": code,
-        }
-    });
+    error_response_for_auth(status, code, message, ProxyAuth::OpenAiBearer)
+}
+
+#[must_use]
+pub fn error_response_for_auth(status: StatusCode, code: &str, message: &str, auth: ProxyAuth) -> ProxyResponse {
+    let body = match auth {
+        ProxyAuth::OpenAiBearer => serde_json::json!({
+            "error": {
+                "message": message,
+                "type": "api_error",
+                "param": null,
+                "code": code,
+            }
+        }),
+        ProxyAuth::Anthropic => serde_json::json!({
+            "type": "error",
+            "error": {
+                "type": "api_error",
+                "message": message,
+            }
+        }),
+    };
     let mut headers = HeaderMap::new();
     headers.insert("content-type", HeaderValue::from_static("application/json"));
     ProxyResponse {
@@ -247,11 +261,11 @@ pub async fn proxy_request_with_path(
         Ok(r) => r,
         Err(e) if e.is_timeout() => {
             warn!("LLM request timed out: {e}");
-            return error_response(StatusCode::GATEWAY_TIMEOUT, "llm_timeout", "LLM timeout");
+            return error_response_for_auth(StatusCode::GATEWAY_TIMEOUT, "llm_timeout", "LLM timeout", auth);
         }
         Err(e) => {
             warn!("LLM request failed: {e}");
-            return error_response(StatusCode::BAD_GATEWAY, "llm_unavailable", "LLM unavailable");
+            return error_response_for_auth(StatusCode::BAD_GATEWAY, "llm_unavailable", "LLM unavailable", auth);
         }
     };
 
@@ -274,10 +288,11 @@ pub async fn proxy_request_with_path(
         Ok(b) => b,
         Err(e) => {
             warn!("failed to read LLM response body: {e}");
-            return error_response(
+            return error_response_for_auth(
                 StatusCode::BAD_GATEWAY,
                 "llm_unavailable",
                 "Failed to read LLM response",
+                auth,
             );
         }
     };
