@@ -75,11 +75,11 @@ async fn spawn_recording_upstream(
 }
 
 #[tokio::test]
-async fn messages_forwards_raw_body_query_and_claude_headers() {
+async fn messages_forwards_raw_body_query_headers_and_client_tools() {
     let (llm_url, requests, _upstream) =
         spawn_recording_upstream(StatusCode::OK, "application/json", r#"{"id":"msg_1"}"#).await;
     let (gateway_url, _gateway) = spawn_gateway(test_state(&test_config(&llm_url))).await;
-    let body = br#"{"model":"test","tools":[{"type":"web_search_20250305","name":"web_search"}],"stream":false,"new_field":{"keep":true}}"#;
+    let body = br#"{"model":"test","tools":[{"name":"WebSearch","description":"Search the web","input_schema":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}},{"name":"WebFetch","description":"Fetch a web page","input_schema":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}}],"stream":false,"new_field":{"keep":true}}"#;
 
     let response = reqwest::Client::new()
         .post(format!("{gateway_url}/v1/messages?beta=true"))
