@@ -75,7 +75,7 @@ async fn spawn_recording_upstream(
 }
 
 #[tokio::test]
-async fn messages_forwards_raw_body_query_headers_and_client_tools() {
+async fn messages_forwards_raw_body_query_headers_and_open_beta_list() {
     let (llm_url, requests, _upstream) =
         spawn_recording_upstream(StatusCode::OK, "application/json", r#"{"id":"msg_1"}"#).await;
     let (gateway_url, _gateway) = spawn_gateway(test_state(&test_config(&llm_url))).await;
@@ -84,7 +84,7 @@ async fn messages_forwards_raw_body_query_headers_and_client_tools() {
     let response = reqwest::Client::new()
         .post(format!("{gateway_url}/v1/messages?beta=true"))
         .header("anthropic-version", "2023-06-01")
-        .header("anthropic-beta", "web-search-2025-03-05")
+        .header("anthropic-beta", "future-beta-unknown,web-search-2025-03-05")
         .header("x-claude-code-session-id", "session-1")
         .header("x-claude-code-agent-id", "agent-1")
         .header("x-api-key", "anthropic-key")
@@ -102,7 +102,10 @@ async fn messages_forwards_raw_body_query_headers_and_client_tools() {
     assert_eq!(requests[0].uri, "/v1/messages?beta=true");
     assert_eq!(requests[0].body.as_ref(), body);
     assert_eq!(requests[0].headers["anthropic-version"], "2023-06-01");
-    assert_eq!(requests[0].headers["anthropic-beta"], "web-search-2025-03-05");
+    assert_eq!(
+        requests[0].headers["anthropic-beta"],
+        "future-beta-unknown,web-search-2025-03-05"
+    );
     assert_eq!(requests[0].headers["x-claude-code-session-id"], "session-1");
     assert_eq!(requests[0].headers["x-claude-code-agent-id"], "agent-1");
     assert_eq!(requests[0].headers["x-api-key"], "anthropic-key");
@@ -111,6 +114,26 @@ async fn messages_forwards_raw_body_query_headers_and_client_tools() {
         requests[0].headers.get("host").and_then(|v| v.to_str().ok()),
         Some("gateway.invalid")
     );
+}
+
+#[tokio::test]
+async fn messages_forwards_system_attribution_blocks_verbatim() {
+    let (llm_url, requests, _upstream) =
+        spawn_recording_upstream(StatusCode::OK, "application/json", r#"{"id":"msg_system"}"#).await;
+    let (gateway_url, _gateway) = spawn_gateway(test_state(&test_config(&llm_url))).await;
+    let body = br#"{"model":"test","system":[{"type":"text","text":"<attribution>session-1</attribution>"},{"type":"text","text":"You are helpful."}],"messages":[{"role":"user","content":"hello"}],"stream":false}"#;
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/v1/messages"))
+        .body(body.to_vec())
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let requests = requests.lock().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].body.as_ref(), body);
 }
 
 #[tokio::test]
