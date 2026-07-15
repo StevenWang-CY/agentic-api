@@ -13,10 +13,10 @@ struct CommonArgs {
     #[arg(long, env = "OPENAI_API_KEY", hide_env_values = true, global = true)]
     openai_api_key: Option<String>,
 
-    #[arg(long, default_value = "0.0.0.0", global = true)]
+    #[arg(long, env = "GATEWAY_HOST", default_value = "0.0.0.0", global = true)]
     gateway_host: String,
 
-    #[arg(long, default_value_t = 9000, global = true)]
+    #[arg(long, env = "GATEWAY_PORT", default_value_t = 9000, global = true)]
     gateway_port: u16,
 
     #[arg(long, default_value_t = 600.0, global = true)]
@@ -46,7 +46,7 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
 
-    #[arg(long)]
+    #[arg(long, env = "LLM_API_BASE")]
     llm_api_base: Option<String>,
 
     #[command(flatten)]
@@ -219,6 +219,25 @@ mod tests {
             "--skip-llm-ready-check",
         ]);
         assert!(cli.common.skip_llm_ready_check);
+    }
+
+    #[test]
+    fn container_runtime_options_are_bound_to_environment_variables() {
+        let command = Cli::command();
+
+        for (argument, expected_env) in [
+            ("llm_api_base", "LLM_API_BASE"),
+            ("gateway_host", "GATEWAY_HOST"),
+            ("gateway_port", "GATEWAY_PORT"),
+        ] {
+            let env = command
+                .get_arguments()
+                .find(|arg| arg.get_id() == argument)
+                .and_then(clap::Arg::get_env)
+                .unwrap_or_else(|| panic!("{argument} must be configurable through {expected_env}"));
+
+            assert_eq!(env, expected_env);
+        }
     }
 
     #[test]

@@ -94,6 +94,8 @@ nav:
   - API Reference: api/index.md
   - Developing:
     - Getting Started: developing/getting-started.md
+  - Deploying:
+    - Container: deploying/container.md
   - Community: community/index.md
 
 extra:

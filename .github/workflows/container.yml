@@ -1,0 +1,80 @@
+name: Container
+
+on:
+  merge_group:
+  pull_request:
+    paths:
+      - ".dockerignore"
+      - ".github/workflows/container.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "Dockerfile"
+      - "crates/**"
+  push:
+    branches: [main]
+    paths:
+      - ".dockerignore"
+      - ".github/workflows/container.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "Dockerfile"
+      - "crates/**"
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-smoke-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Build runtime image
+        env:
+          DOCKER_BUILDKIT: "1"
+        run: |
+          docker build \
+            --build-arg OCI_BUILD_PIPELINE="$GITHUB_WORKFLOW" \
+            --build-arg OCI_BUILD_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --build-arg OCI_CREATED="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --build-arg OCI_REVISION="$GITHUB_SHA" \
+            --build-arg OCI_VERSION="${GITHUB_REF_NAME}" \
+            --tag agentic-api:test \
+            .
+
+      - name: Verify runtime contents and identity
+        run: |
+          docker run --rm --entrypoint sh agentic-api:test -eu -c '
+            for command in cargo rustc python vllm; do
+              ! command -v "$command"
+            done
+            test "$(id -u)" -ne 0
+            test "$(id -g)" -eq 0
+          '
+
+      - name: Smoke test health and readiness
+        run: |
+          mkdir -p /tmp/agentic-api-upstream
+          touch /tmp/agentic-api-upstream/health
+          python3 -m http.server 18000 --directory /tmp/agentic-api-upstream >/tmp/agentic-api-upstream.log 2>&1 &
+
+          docker run --detach --name agentic-api-smoke --network host --user 12345:0 \
+            --env LLM_API_BASE=http://127.0.0.1:18000 \
+            agentic-api:test
+          trap 'docker logs agentic-api-smoke; docker rm --force agentic-api-smoke' EXIT
+
+          ready=false
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:9000/health >/dev/null && \
+               curl --fail --silent http://127.0.0.1:9000/ready >/dev/null; then
+              docker exec agentic-api-smoke test -f /var/lib/agentic-api/agentic_api.db
+              ready=true
+              break
+            fi
+            sleep 1
+          done
+
+          test "$ready" = true
+          docker stop --timeout 10 agentic-api-smoke
+          test "$(docker inspect --format '{{.State.ExitCode}}' agentic-api-smoke)" -eq 0

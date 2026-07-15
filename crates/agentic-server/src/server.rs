@@ -45,13 +45,28 @@ async fn serve_gateway_until_signal(state: AppState, host: &str, port: u16) -> R
 
     tokio::select! {
         result = &mut gateway => result,
-        signal = tokio::signal::ctrl_c() => {
+        signal = shutdown_signal() => {
             signal?;
             info!("shutdown signal received");
             shutdown_token.cancel();
             gateway.await
         }
     }
+}
+
+#[cfg(unix)]
+async fn shutdown_signal() -> Result<(), std::io::Error> {
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+
+    tokio::select! {
+        signal = tokio::signal::ctrl_c() => signal,
+        _ = terminate.recv() => Ok(()),
+    }
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() -> Result<(), std::io::Error> {
+    tokio::signal::ctrl_c().await
 }
 
 async fn wait_until_llm_ready(config: &Config) -> Result<(), Error> {
@@ -134,7 +149,7 @@ pub async fn run_with_llm(config: Config, host: &str, port: u16, llm_args: Vec<S
             let status = status?;
             Err(Error::LlmProcessExited { status: status.to_string() })
         },
-        signal = tokio::signal::ctrl_c() => {
+        signal = shutdown_signal() => {
             signal?;
             info!("shutdown signal received");
             shutdown_token.cancel();

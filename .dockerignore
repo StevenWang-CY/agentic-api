@@ -1,0 +1,12 @@
+.git
+.github
+.gstack
+.worktrees
+target
+docs
+scripts
+*.db
+*.db-shm
+*.db-wal
+Dockerfile*
+README.md
