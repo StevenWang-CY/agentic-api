@@ -22,6 +22,34 @@ use tokio::process::Command;
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
 const TOOL_TIMEOUT: Duration = Duration::from_secs(60);
 
+#[cfg(test)]
+mod tests {
+    use axum::{Router, response::Redirect, routing::get};
+
+    use super::build_http_client;
+
+    #[tokio::test]
+    async fn http_client_does_not_follow_redirects() {
+        let app = Router::new()
+            .route("/start", get(|| async { Redirect::temporary("/target") }))
+            .route("/target", get(|| async { "target reached" }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let response = build_http_client()
+            .unwrap()
+            .get(format!("http://{address}/start"))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum McpOperation {
     Connect,
@@ -45,6 +73,9 @@ impl fmt::Display for McpOperation {
 pub enum McpError {
     #[error("failed to spawn MCP stdio server")]
     SpawnStdio(#[source] std::io::Error),
+
+    #[error("failed to build MCP HTTP client")]
+    HttpClient(#[source] reqwest_mcp::Error),
 
     #[error("failed to connect to MCP server")]
     Connect(#[source] Box<ClientInitializeError>),
@@ -70,6 +101,13 @@ pub enum McpError {
 
     #[error("MCP server returned an unexpected response during {operation}")]
     UnexpectedResponse { operation: McpOperation },
+}
+
+fn build_http_client() -> Result<reqwest_mcp::Client, McpError> {
+    reqwest_mcp::Client::builder()
+        .redirect(reqwest_mcp::redirect::Policy::none())
+        .build()
+        .map_err(McpError::HttpClient)
 }
 
 #[derive(Clone)]
@@ -108,7 +146,7 @@ impl McpClient {
             }
             config = config.custom_headers(custom_headers);
         }
-        let transport = StreamableHttpClientTransport::from_config(config);
+        let transport = StreamableHttpClientTransport::with_client(build_http_client()?, config);
         let service = tokio::time::timeout(CONNECTION_TIMEOUT, AgenticMcpClientHandler.serve(transport))
             .await
             .map_err(|_| McpError::Timeout {
