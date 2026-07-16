@@ -166,7 +166,7 @@ async fn main() -> Result<(), Error> {
         None => {
             let base = llm_api_base.ok_or_else(|| {
                 Error::Config(
-                    "standalone mode requires --llm-api-base; use `agentic-server serve <model>` for integrated mode"
+                    "standalone mode requires LLM_API_BASE (or --llm-api-base); use `agentic-server serve <model>` for integrated mode"
                         .to_owned(),
                 )
             })?;

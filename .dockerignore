@@ -1,5 +1,7 @@
 .git
 .github
+.claude
+.codex
 .gstack
 .worktrees
 target
