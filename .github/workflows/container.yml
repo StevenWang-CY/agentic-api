@@ -72,6 +72,7 @@ jobs:
               ready=true
               break
             fi
+            echo "gateway not ready (attempt $attempt/30)"
             sleep 1
           done
 
