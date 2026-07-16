@@ -4,51 +4,10 @@ use std::time::Duration;
 use crate::config::Config;
 use crate::error::Error;
 use crate::executor::modes::{ConversationHandler, ResponseHandler};
-use crate::storage::{ConversationStore, ResponseStore, create_pool_with_schema};
-use crate::tool::{GatewayExecutor, ToolType, WebSearchHandler};
+use crate::storage::{ConversationStore, ResponseStore, create_pool_with_schema_and_sqlite_config};
+use crate::tool::{GatewayExecutor, GatewayExecutors};
 use crate::types::io::InputItem;
 use crate::types::request_response::{RequestPayload, ResponsePayload};
-
-#[derive(Clone, Default)]
-pub struct GatewayExecutors {
-    web_search: Option<Arc<dyn GatewayExecutor>>,
-}
-
-impl GatewayExecutors {
-    #[must_use]
-    pub fn from_env(client: Arc<reqwest::Client>) -> Self {
-        Self {
-            web_search: Some(Arc::new(WebSearchHandler::from_env(client))),
-        }
-    }
-
-    pub fn insert(&mut self, executor: Arc<dyn GatewayExecutor>) {
-        match executor.tool_type() {
-            ToolType::WebSearch => self.web_search = Some(executor),
-            other => tracing::debug!(tool_type = ?other, "gateway executor type not wired yet"),
-        }
-    }
-
-    #[must_use]
-    pub fn get(&self, tool_type: ToolType) -> Option<Arc<dyn GatewayExecutor>> {
-        match tool_type {
-            ToolType::WebSearch => self.web_search.clone(),
-            ToolType::Function
-            | ToolType::CodexNamespace
-            | ToolType::Mcp
-            | ToolType::FileSearch
-            | ToolType::CodeInterpreter => None,
-        }
-    }
-}
-
-impl std::fmt::Debug for GatewayExecutors {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("GatewayExecutors")
-            .field("web_search", &self.web_search.is_some())
-            .finish()
-    }
-}
 
 /// Context built by `rehydrate_conversation`, threaded through the execute pipeline.
 #[derive(Debug)]
@@ -144,7 +103,7 @@ impl ExecutionContext {
     /// migration fails.
     pub async fn from_config(cfg: &Config) -> Result<Self, Error> {
         let db_url = cfg.db_url.as_deref().unwrap_or("sqlite://./agentic_api.db");
-        let pool = create_pool_with_schema(Some(db_url))
+        let pool = create_pool_with_schema_and_sqlite_config(Some(db_url), cfg.sqlite)
             .await
             .map_err(|e| Error::Config(format!("failed to open database '{db_url}': {e}")))?;
 

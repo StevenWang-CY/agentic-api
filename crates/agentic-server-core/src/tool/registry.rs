@@ -4,11 +4,16 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::codex::NamespaceMap;
-use super::{CodexNamespaceHandler, GatewayExecutor, ToolError, ToolOutput};
+use super::codex::insert_namespace_entries;
+use super::executors::GatewayExecutors;
+use super::function::insert_function_entry;
+use super::mcp::{insert_mcp_entry, maybe_mcp_function};
+use super::web_search::insert_web_search_entry;
+use super::{CodexNamespaceHandler, GatewayExecutor, NamespaceMap, ToolError, ToolOutput};
 use crate::types::io::OutputItem;
 use crate::types::io::output::FunctionToolCall;
-use crate::types::tools::{CodexNamespaceMember, ResponsesTool};
+use crate::types::tools::{CodeInterpreterToolParam, FileSearchToolParam, ResponsesTool};
+use crate::utils::common::serialize_to_value_or_custom_default;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -58,6 +63,56 @@ pub struct GatewayDispatchResult {
     pub output: Result<ToolOutput, ToolError>,
 }
 
+// TODO: move to a dedicated file_search module alongside its `ToolHandler`
+// once file_search execution is implemented.
+fn insert_file_search_entry(
+    entries: &mut HashMap<String, ToolEntry>,
+    p: &FileSearchToolParam,
+    handler: Option<Arc<dyn GatewayExecutor>>,
+) {
+    serialize_to_value_or_custom_default(
+        p,
+        "file_search tool config serialization failed",
+        |config| {
+            entries.insert(
+                "file_search".to_owned(),
+                ToolEntry {
+                    tool_type: ToolType::FileSearch,
+                    config,
+                    server_label: None,
+                    handler,
+                },
+            );
+        },
+        (),
+    );
+}
+
+// TODO: move to a dedicated code_interpreter module alongside its `ToolHandler`
+// once code_interpreter execution is implemented.
+fn insert_code_interpreter_entry(
+    entries: &mut HashMap<String, ToolEntry>,
+    p: &CodeInterpreterToolParam,
+    handler: Option<Arc<dyn GatewayExecutor>>,
+) {
+    serialize_to_value_or_custom_default(
+        p,
+        "code_interpreter tool config serialization failed",
+        |config| {
+            entries.insert(
+                "code_interpreter".to_owned(),
+                ToolEntry {
+                    tool_type: ToolType::CodeInterpreter,
+                    config,
+                    server_label: None,
+                    handler,
+                },
+            );
+        },
+        (),
+    );
+}
+
 /// Request-scoped registry built from `RequestPayload.tools`.
 /// Maps the name the LLM sees → routing metadata.
 #[derive(Debug, Default)]
@@ -70,23 +125,6 @@ pub struct ToolRegistry {
 }
 
 impl ToolRegistry {
-    /// Build a registry from the declared tools.
-    ///
-    /// Duplicate tool names result in last-write-wins, logged at `warn` level.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ToolError::Config`] when Codex namespace member flattening
-    /// would collide with another declared tool name.
-    ///
-    /// # Panics
-    ///
-    /// Panics if serialization of a tool param struct fails, which cannot happen
-    /// for the types defined in this module (`#[derive(Serialize)]` on plain structs).
-    pub fn build(tools: &[ResponsesTool]) -> Result<Self, ToolError> {
-        Self::build_with_handlers(tools, |_| None)
-    }
-
     /// Build a registry from declared tools and attach gateway handlers for dispatchable tool types.
     ///
     /// # Errors
@@ -98,10 +136,7 @@ impl ToolRegistry {
     ///
     /// Panics if serialization of a tool param struct fails, which cannot happen
     /// for the types defined in this module (`#[derive(Serialize)]` on plain structs).
-    pub fn build_with_handlers(
-        tools: &[ResponsesTool],
-        mut handler_for: impl FnMut(ToolType) -> Option<Arc<dyn GatewayExecutor>>,
-    ) -> Result<Self, ToolError> {
+    pub async fn build_with_handlers(tools: &[ResponsesTool], executors: &GatewayExecutors) -> Result<Self, ToolError> {
         let mut entries = HashMap::with_capacity(tools.len());
         // Namespace members must be keyed by the same flat, model-visible name
         // the model will call, so resolve them first — the same pure pass used
@@ -110,94 +145,25 @@ impl ToolRegistry {
 
         for tool in &resolved_tools {
             match tool {
-                ResponsesTool::Function(p) => {
-                    // p.name is NonEmptyToolName — empty names are impossible here
-                    // (serde rejects them at deserialization time).
-                    if entries
-                        .insert(
-                            p.name.as_str().to_owned(),
-                            ToolEntry {
-                                tool_type: ToolType::Function,
-                                config: serde_json::to_value(p).expect("serialization of known struct is infallible"),
-                                server_label: None,
-                                handler: None,
-                            },
-                        )
-                        .is_some()
-                    {
-                        tracing::warn!(name = %p.name, "duplicate tool name — previous definition overwritten");
-                    }
-                }
-                ResponsesTool::Mcp(p) => {
-                    // MCP tool names are discovered at request-time via `tools/list`.
-                    // Without discovery, we cannot know which tool names to register —
-                    // keying by server_label would cause all MCP calls to miss on lookup
-                    // since gateway_owned/client_owned look up by tool name, not server.
-                    // MCP entries will be populated in PR C once HttpMcpHandler
-                    // implements discover() and the executor calls it before build().
-                    tracing::debug!(
-                        server_label = %p.server_label,
-                        "MCP server declared but skipped in registry — tool names unknown until discovery (PR C)"
-                    );
-                }
-                ResponsesTool::WebSearch(p) => {
-                    entries.insert(
-                        "web_search".to_owned(),
-                        ToolEntry {
-                            tool_type: ToolType::WebSearch,
-                            config: serde_json::to_value(p).expect("serialization of known struct is infallible"),
-                            server_label: None,
-                            handler: handler_for(ToolType::WebSearch),
-                        },
-                    );
-                }
-                ResponsesTool::FileSearch(p) => {
-                    entries.insert(
-                        "file_search".to_owned(),
-                        ToolEntry {
-                            tool_type: ToolType::FileSearch,
-                            config: serde_json::to_value(p).expect("serialization of known struct is infallible"),
-                            server_label: None,
-                            handler: handler_for(ToolType::FileSearch),
-                        },
-                    );
-                }
-                ResponsesTool::CodeInterpreter(p) => {
-                    entries.insert(
-                        "code_interpreter".to_owned(),
-                        ToolEntry {
-                            tool_type: ToolType::CodeInterpreter,
-                            config: serde_json::to_value(p).expect("serialization of known struct is infallible"),
-                            server_label: None,
-                            handler: handler_for(ToolType::CodeInterpreter),
-                        },
-                    );
-                }
-                ResponsesTool::Namespace(p) => {
-                    // p's members already carry their flat, model-visible names
-                    // (see the `resolve_namespace_members` call above).
-                    let config = serde_json::to_value(p).expect("serialization of known struct is infallible");
-                    for member in &p.tools {
-                        let CodexNamespaceMember::Function(function) = member else {
-                            continue;
-                        };
-                        let name = function.name.as_str().to_owned();
-                        if entries
-                            .insert(
-                                name.clone(),
-                                ToolEntry {
-                                    tool_type: ToolType::CodexNamespace,
-                                    config: config.clone(),
-                                    server_label: Some(p.name.clone()),
-                                    handler: None,
-                                },
-                            )
-                            .is_some()
-                        {
-                            tracing::warn!(name = %name, namespace = %p.name, "duplicate tool name - previous definition overwritten");
+                ResponsesTool::Function(p) => match maybe_mcp_function(p) {
+                    Some(mcp_params) if !mcp_params.is_empty() => {
+                        let handler = executors.mcp_read_resource_handler(&mcp_params).await;
+                        for declaration_param in &mcp_params {
+                            insert_mcp_entry(&mut entries, declaration_param, handler.clone()).await;
                         }
                     }
+                    _ => insert_function_entry(&mut entries, p),
+                },
+                ResponsesTool::Mcp(p) => {
+                    let handler = executors.mcp_handler(p).await;
+                    insert_mcp_entry(&mut entries, p, handler).await;
                 }
+                ResponsesTool::WebSearch(p) => {
+                    insert_web_search_entry(&mut entries, p, executors.web_search_handler());
+                }
+                ResponsesTool::FileSearch(p) => insert_file_search_entry(&mut entries, p, None),
+                ResponsesTool::CodeInterpreter(p) => insert_code_interpreter_entry(&mut entries, p, None),
+                ResponsesTool::Namespace(p) => insert_namespace_entries(&mut entries, p),
                 ResponsesTool::Unknown => {
                     tracing::debug!("unknown tool declared but skipped in registry");
                 }

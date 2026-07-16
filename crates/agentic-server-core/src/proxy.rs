@@ -32,10 +32,18 @@ fn is_request_drop(name: &str) -> bool {
     is_hop_by_hop(name) || REQUEST_DROP_EXTRA.iter().any(|h| h.eq_ignore_ascii_case(name))
 }
 
+/// Raw request data forwarded to the default Responses upstream endpoint.
 pub struct ProxyRequest {
     pub headers: HeaderMap,
     pub body: Bytes,
     pub query: Option<String>,
+}
+
+/// Authentication fallback used when proxying a request to an upstream API.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProxyAuth {
+    OpenAiBearer,
+    Anthropic,
 }
 
 pub enum ProxyBody {
@@ -84,7 +92,7 @@ impl ProxyState {
     }
 }
 
-fn filter_request_headers(headers: &HeaderMap, config: &Config) -> reqwest::header::HeaderMap {
+fn filter_request_headers(headers: &HeaderMap, config: &Config, auth: ProxyAuth) -> reqwest::header::HeaderMap {
     let mut out = reqwest::header::HeaderMap::new();
     for (name, value) in headers {
         if is_request_drop(name.as_str()) {
@@ -98,12 +106,20 @@ fn filter_request_headers(headers: &HeaderMap, config: &Config) -> reqwest::head
     }
 
     let has_auth = out.contains_key(reqwest::header::AUTHORIZATION);
-    if !has_auth {
+    let has_api_key = out.contains_key("x-api-key");
+    if !has_auth && !has_api_key {
         if let Some(key) = config.openai_api_key.as_deref() {
             let trimmed = key.trim();
             if !trimmed.is_empty() {
-                if let Ok(v) = reqwest::header::HeaderValue::from_str(&format!("Bearer {trimmed}")) {
-                    out.insert(reqwest::header::AUTHORIZATION, v);
+                let (name, value) = match auth {
+                    ProxyAuth::OpenAiBearer => (reqwest::header::AUTHORIZATION, format!("Bearer {trimmed}")),
+                    ProxyAuth::Anthropic => (
+                        reqwest::header::HeaderName::from_static("x-api-key"),
+                        trimmed.to_owned(),
+                    ),
+                };
+                if let Ok(v) = reqwest::header::HeaderValue::from_str(&value) {
+                    out.insert(name, v);
                 }
             }
         }
@@ -136,14 +152,28 @@ fn is_sse_content_type(headers: &reqwest::header::HeaderMap) -> bool {
 
 #[must_use]
 pub fn error_response(status: StatusCode, code: &str, message: &str) -> ProxyResponse {
-    let body = serde_json::json!({
-        "error": {
-            "message": message,
-            "type": "api_error",
-            "param": null,
-            "code": code,
-        }
-    });
+    error_response_for_auth(status, code, message, ProxyAuth::OpenAiBearer)
+}
+
+#[must_use]
+pub fn error_response_for_auth(status: StatusCode, code: &str, message: &str, auth: ProxyAuth) -> ProxyResponse {
+    let body = match auth {
+        ProxyAuth::OpenAiBearer => serde_json::json!({
+            "error": {
+                "message": message,
+                "type": "api_error",
+                "param": null,
+                "code": code,
+            }
+        }),
+        ProxyAuth::Anthropic => serde_json::json!({
+            "type": "error",
+            "error": {
+                "type": "api_error",
+                "message": message,
+            }
+        }),
+    };
     let mut headers = HeaderMap::new();
     headers.insert("content-type", HeaderValue::from_static("application/json"));
     ProxyResponse {
@@ -159,7 +189,7 @@ pub fn error_response(status: StatusCode, code: &str, message: &str) -> ProxyRes
 /// Uses the non-streaming client; the response body is returned as a full
 /// [`ProxyBody::Full`] payload.
 pub async fn proxy_get(path: &str, request_headers: &HeaderMap, state: &ProxyState) -> ProxyResponse {
-    let llm_headers = filter_request_headers(request_headers, &state.config);
+    let llm_headers = filter_request_headers(request_headers, &state.config, ProxyAuth::OpenAiBearer);
     let base = state.config.llm_api_base.trim_end_matches('/');
     let url = format!("{base}/{}", path.trim_start_matches('/'));
 
@@ -195,16 +225,27 @@ pub async fn proxy_get(path: &str, request_headers: &HeaderMap, state: &ProxySta
     }
 }
 
+/// Proxy a request to the default `/v1/responses` upstream endpoint.
 pub async fn proxy_request(request: ProxyRequest, state: &ProxyState) -> ProxyResponse {
+    proxy_request_with_path(request, "/v1/responses", ProxyAuth::OpenAiBearer, state).await
+}
+
+/// Proxy a raw request to a selected upstream path.
+pub async fn proxy_request_with_path(
+    request: ProxyRequest,
+    path: &str,
+    auth: ProxyAuth,
+    state: &ProxyState,
+) -> ProxyResponse {
     let is_streaming = serde_json::from_slice::<Value>(&request.body)
         .ok()
         .and_then(|v| v.get("stream")?.as_bool())
         .unwrap_or(false);
 
-    let llm_headers = filter_request_headers(&request.headers, &state.config);
+    let llm_headers = filter_request_headers(&request.headers, &state.config, auth);
 
     let base = state.config.llm_api_base.trim_end_matches('/');
-    let mut url = format!("{base}/v1/responses");
+    let mut url = format!("{base}/{}", path.trim_start_matches('/'));
     if let Some(q) = &request.query {
         url.push('?');
         url.push_str(q);
@@ -220,11 +261,11 @@ pub async fn proxy_request(request: ProxyRequest, state: &ProxyState) -> ProxyRe
         Ok(r) => r,
         Err(e) if e.is_timeout() => {
             warn!("LLM request timed out: {e}");
-            return error_response(StatusCode::GATEWAY_TIMEOUT, "llm_timeout", "LLM timeout");
+            return error_response_for_auth(StatusCode::GATEWAY_TIMEOUT, "llm_timeout", "LLM timeout", auth);
         }
         Err(e) => {
             warn!("LLM request failed: {e}");
-            return error_response(StatusCode::BAD_GATEWAY, "llm_unavailable", "LLM unavailable");
+            return error_response_for_auth(StatusCode::BAD_GATEWAY, "llm_unavailable", "LLM unavailable", auth);
         }
     };
 
@@ -247,10 +288,11 @@ pub async fn proxy_request(request: ProxyRequest, state: &ProxyState) -> ProxyRe
         Ok(b) => b,
         Err(e) => {
             warn!("failed to read LLM response body: {e}");
-            return error_response(
+            return error_response_for_auth(
                 StatusCode::BAD_GATEWAY,
                 "llm_unavailable",
                 "Failed to read LLM response",
+                auth,
             );
         }
     };
@@ -275,6 +317,7 @@ mod tests {
             llm_ready_interval_s: 0.1,
             skip_llm_ready_check: false,
             db_url: None,
+            sqlite: crate::config::SqliteConfig::default(),
         }
     }
 
@@ -310,6 +353,15 @@ mod tests {
     }
 
     #[test]
+    fn proxy_request_retains_legacy_construction_shape() {
+        let _request = ProxyRequest {
+            headers: HeaderMap::new(),
+            body: Bytes::new(),
+            query: None,
+        };
+    }
+
+    #[test]
     fn filter_request_headers_strips_hop_by_hop() {
         let mut headers = HeaderMap::new();
         headers.insert("content-type", "application/json".parse().unwrap());
@@ -318,7 +370,7 @@ mod tests {
         headers.insert("x-custom", "value".parse().unwrap());
 
         let config = test_config_no_key();
-        let filtered = filter_request_headers(&headers, &config);
+        let filtered = filter_request_headers(&headers, &config, ProxyAuth::OpenAiBearer);
 
         assert!(filtered.contains_key("content-type"));
         assert!(filtered.contains_key("x-custom"));
@@ -334,7 +386,7 @@ mod tests {
         headers.insert("accept", "*/*".parse().unwrap());
 
         let config = test_config_no_key();
-        let filtered = filter_request_headers(&headers, &config);
+        let filtered = filter_request_headers(&headers, &config, ProxyAuth::OpenAiBearer);
 
         assert!(!filtered.contains_key("host"));
         assert!(!filtered.contains_key("content-length"));
@@ -345,7 +397,7 @@ mod tests {
     fn auth_injected_when_no_client_auth() {
         let headers = HeaderMap::new();
         let config = test_config();
-        let filtered = filter_request_headers(&headers, &config);
+        let filtered = filter_request_headers(&headers, &config, ProxyAuth::OpenAiBearer);
 
         assert_eq!(
             filtered.get("authorization").unwrap().to_str().unwrap(),
@@ -359,12 +411,31 @@ mod tests {
         headers.insert("authorization", "Bearer client-token".parse().unwrap());
 
         let config = test_config();
-        let filtered = filter_request_headers(&headers, &config);
+        let filtered = filter_request_headers(&headers, &config, ProxyAuth::OpenAiBearer);
 
         assert_eq!(
             filtered.get("authorization").unwrap().to_str().unwrap(),
             "Bearer client-token"
         );
+    }
+
+    #[test]
+    fn anthropic_auth_preserves_client_api_key() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", "client-anthropic-key".parse().unwrap());
+
+        let filtered = filter_request_headers(&headers, &test_config(), ProxyAuth::Anthropic);
+
+        assert_eq!(filtered.get("x-api-key").unwrap(), "client-anthropic-key");
+        assert!(!filtered.contains_key("authorization"));
+    }
+
+    #[test]
+    fn anthropic_auth_uses_configured_key_as_api_key_fallback() {
+        let filtered = filter_request_headers(&HeaderMap::new(), &test_config(), ProxyAuth::Anthropic);
+
+        assert_eq!(filtered.get("x-api-key").unwrap(), "test-key");
+        assert!(!filtered.contains_key("authorization"));
     }
 
     #[test]
@@ -374,7 +445,7 @@ mod tests {
             openai_api_key: Some("  ".to_owned()),
             ..test_config()
         };
-        let filtered = filter_request_headers(&headers, &config);
+        let filtered = filter_request_headers(&headers, &config, ProxyAuth::OpenAiBearer);
 
         assert!(!filtered.contains_key("authorization"));
     }
@@ -383,7 +454,7 @@ mod tests {
     fn no_auth_injected_when_key_none() {
         let headers = HeaderMap::new();
         let config = test_config_no_key();
-        let filtered = filter_request_headers(&headers, &config);
+        let filtered = filter_request_headers(&headers, &config, ProxyAuth::OpenAiBearer);
 
         assert!(!filtered.contains_key("authorization"));
     }

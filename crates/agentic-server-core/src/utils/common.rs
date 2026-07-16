@@ -23,6 +23,36 @@ pub fn serialize_to_string<T: serde::Serialize>(value: &T) -> Result<String, ser
     serde_json::to_string(value)
 }
 
+/// Serialize any type to a `serde_json::Value`.
+///
+/// # Errors
+///
+/// Returns `serde_json::Error` if serialization fails.
+pub fn serialize_to_value<T: serde::Serialize>(value: &T) -> Result<serde_json::Value, serde_json::Error> {
+    serde_json::to_value(value)
+}
+
+/// Serializes `value` to a `serde_json::Value` and passes it to `then`,
+/// logging `message` at `debug` level and returning `default` if
+/// serialization fails.
+///
+/// Graceful serialization - used where callers fall back to a default result
+/// rather than propagate a serialization error.
+pub fn serialize_to_value_or_custom_default<T: serde::Serialize, R>(
+    value: &T,
+    message: &str,
+    then: impl FnOnce(serde_json::Value) -> R,
+    default: R,
+) -> R {
+    match serde_json::to_value(value) {
+        Ok(config) => then(config),
+        Err(error) => {
+            tracing::debug!(error = %error, message);
+            default
+        }
+    }
+}
+
 /// Deserialize JSON string to any type.
 ///
 /// Strict deserialization - returns error if deserialization fails.
@@ -83,6 +113,26 @@ pub fn deserialize_from_value<T: serde::de::DeserializeOwned>(
     value: serde_json::Value,
 ) -> Result<T, serde_json::Error> {
     serde_json::from_value(value)
+}
+
+/// Deserializes a `serde_json::Value` and passes it to `then`, logging
+/// `message` at `debug` level and returning `default` if deserialization fails.
+///
+/// Graceful deserialization - used where callers fall back to a default result
+/// rather than propagate a deserialization error.
+pub fn deserialize_from_value_or_custom_default<T: serde::de::DeserializeOwned, R>(
+    value: serde_json::Value,
+    message: &str,
+    then: impl FnOnce(T) -> R,
+    default: R,
+) -> R {
+    match serde_json::from_value(value) {
+        Ok(value) => then(value),
+        Err(error) => {
+            tracing::debug!(error = %error, message);
+            default
+        }
+    }
 }
 
 /// Deserialize a `serde_json::Value` into `T`, returning `None` on type mismatch.

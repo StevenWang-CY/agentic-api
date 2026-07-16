@@ -6,7 +6,7 @@ use crate::types::io::{FunctionTool, FunctionToolCall, OutputItem, ToolChoice};
 use crate::types::tools::{CodexNamespaceMember, CodexNamespaceToolParam, NonEmptyToolName, ResponsesTool};
 
 use super::handler::{ToolError, ToolHandler};
-use super::registry::ToolType;
+use super::registry::{ToolEntry, ToolType};
 
 // Upstream Responses-compatible backends only see flat function names. Prefix
 // flattened Codex namespace members so generated names are recognizable,
@@ -17,6 +17,34 @@ pub const MODEL_VISIBLE_NAMESPACE_MEMBER_PREFIX: &str = "agentic_ns__";
 #[must_use]
 pub fn model_visible_namespace_member_name(namespace: &str, member: &str) -> String {
     format!("{MODEL_VISIBLE_NAMESPACE_MEMBER_PREFIX}{namespace}__{member}")
+}
+
+/// Registers one `ToolEntry` per `Function` member of `p`, keyed by the
+/// member's already-flattened, model-visible name — callers must resolve
+/// namespace members to those flat names first (see
+/// [`CodexNamespaceHandler::resolve_namespace_members`]).
+pub(crate) fn insert_namespace_entries(entries: &mut HashMap<String, ToolEntry>, p: &CodexNamespaceToolParam) {
+    let config = serde_json::to_value(p).expect("serialization of known struct is infallible");
+    for member in &p.tools {
+        let CodexNamespaceMember::Function(function) = member else {
+            continue;
+        };
+        let name = function.name.as_str().to_owned();
+        if entries
+            .insert(
+                name.clone(),
+                ToolEntry {
+                    tool_type: ToolType::CodexNamespace,
+                    config: config.clone(),
+                    server_label: Some(p.name.clone()),
+                    handler: None,
+                },
+            )
+            .is_some()
+        {
+            tracing::warn!(name = %name, namespace = %p.name, "duplicate tool name - previous definition overwritten");
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
