@@ -57,11 +57,13 @@ curl --fail http://127.0.0.1:9000/health
 curl --fail http://127.0.0.1:9000/ready
 ```
 
-The container CI workflow builds the image, verifies that build tools are absent, launches the gateway against a mock upstream, and checks both probes. HTTP streaming and WebSockets use the same gateway binary and exposed port; the image does not add a transport proxy.
+The container CI workflow builds the image, verifies that build tools are absent, launches the gateway against a mock upstream, checks both probes, and exercises a stored Responses API request through SQLite persistence. HTTP streaming and WebSockets use the same gateway binary and exposed port; the image does not add a transport proxy.
 
 ## Kubernetes and OpenShift security context
 
-The image defaults to UID `10001` and GID `0`. Its working directory is writable by group 0, so OpenShift can replace the UID while retaining the group-0 permission model. Do not set a fixed `runAsUser` when the cluster assigns arbitrary UIDs.
+The image defaults to UID `10001` and GID `0`. Its working directory is setgid and the entrypoint uses a group-cooperative umask, so new SQLite files remain writable when OpenShift replaces the UID while retaining the group-0 permission model. Do not set a fixed `runAsUser` when the cluster assigns arbitrary UIDs.
+
+Volumes initialized by an older image may contain SQLite files without group-write permission. Before rotating to an arbitrary UID, repair those volumes once as an administrator with `chmod -R g+rwX /var/lib/agentic-api`.
 
 ```yaml
 securityContext:

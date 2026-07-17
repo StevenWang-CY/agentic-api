@@ -150,10 +150,14 @@ pub async fn run_with_llm(config: Config, host: &str, port: u16, llm_args: Vec<S
             Err(Error::LlmProcessExited { status: status.to_string() })
         },
         signal = shutdown_signal() => {
-            signal?;
-            info!("shutdown signal received");
-            shutdown_token.cancel();
-            gateway.await
+            match signal {
+                Ok(()) => {
+                    info!("shutdown signal received");
+                    shutdown_token.cancel();
+                    gateway.await
+                }
+                Err(err) => Err(err.into()),
+            }
         }
     };
 

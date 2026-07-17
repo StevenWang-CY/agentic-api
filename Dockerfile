@@ -20,14 +20,25 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 
 FROM debian:${DEBIAN_VERSION}-slim AS runtime
 
+ARG RUNTIME_GID=0
+ARG RUNTIME_UID=10001
+
+RUN apt-get update && \
+    apt-get install --yes --no-install-recommends ca-certificates && \
+    rm -rf /var/lib/apt/lists/* && \
+    mkdir -p /var/lib/agentic-api && \
+    chown "${RUNTIME_UID}:${RUNTIME_GID}" /var/lib/agentic-api && \
+    chmod g=u,g+s /var/lib/agentic-api
+
+COPY --from=rust-build /out/agentic-server /usr/local/bin/agentic-server
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+
 ARG OCI_CREATED=""
 ARG OCI_BUILD_PIPELINE=local
 ARG OCI_BUILD_URL=""
 ARG OCI_REVISION=""
 ARG OCI_SOURCE="https://github.com/vllm-project/agentic-api"
 ARG OCI_VERSION=""
-ARG RUNTIME_GID=0
-ARG RUNTIME_UID=10001
 
 LABEL org.opencontainers.image.created="${OCI_CREATED}" \
       org.opencontainers.image.description="Rust gateway for stateful agentic APIs backed by vLLM" \
@@ -42,15 +53,6 @@ LABEL org.opencontainers.image.created="${OCI_CREATED}" \
       ai.vllm.build.url="${OCI_BUILD_URL}" \
       ai.vllm.image.tag="${OCI_VERSION}"
 
-RUN apt-get update && \
-    apt-get install --yes --no-install-recommends ca-certificates && \
-    rm -rf /var/lib/apt/lists/* && \
-    mkdir -p /var/lib/agentic-api && \
-    chown "${RUNTIME_UID}:${RUNTIME_GID}" /var/lib/agentic-api && \
-    chmod g=u /var/lib/agentic-api
-
-COPY --from=rust-build --chown=${RUNTIME_UID}:${RUNTIME_GID} /out/agentic-server /usr/local/bin/agentic-server
-
 WORKDIR /var/lib/agentic-api
 USER ${RUNTIME_UID}:${RUNTIME_GID}
 
@@ -58,4 +60,4 @@ ENV GATEWAY_HOST=0.0.0.0 \
     GATEWAY_PORT=9000
 
 EXPOSE 9000
-ENTRYPOINT ["agentic-server"]
+ENTRYPOINT ["docker-entrypoint.sh"]
