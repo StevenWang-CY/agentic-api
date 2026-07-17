@@ -10,5 +10,11 @@ scripts
 *.db
 *.db-shm
 *.db-wal
+# Keep local credentials and private keys out of the build context.
+.env*
+.npmrc
+.cargo
+*.pem
+*.key
 Dockerfile*
 README.md
