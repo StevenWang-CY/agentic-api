@@ -243,13 +243,20 @@ fn run_stream(ctx: RequestContext, exec_ctx: Arc<ExecutionContext>, auth: Option
                             yield DONE_MARKER.to_string();
                         }
                         Ok(Ok((payload, ctx))) => {
+                            let persistence_payload = payload.clone();
+                            let ch = exec_ctx.conv_handler.clone();
+                            let rh = exec_ctx.resp_handler.clone();
+                            let persist_handle = tokio::spawn(async move {
+                                if let Err(e) = persist_if_needed(persistence_payload, ctx, ch, rh).await {
+                                    warn!("persist failed: {e}");
+                                }
+                            });
+
                             yield payload.as_terminal_response_chunk();
                             yield DONE_MARKER.to_string();
 
-                            let ch = exec_ctx.conv_handler.clone();
-                            let rh = exec_ctx.resp_handler.clone();
-                            if let Err(e) = persist_if_needed(payload, ctx, ch, rh).await {
-                                warn!("persist failed: {e}");
+                            if let Err(e) = persist_handle.await {
+                                warn!("persist task failed: {e}");
                             }
                         }
                     }

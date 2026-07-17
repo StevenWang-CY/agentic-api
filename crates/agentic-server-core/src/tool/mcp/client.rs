@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fmt;
+use std::net::SocketAddr;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,6 +16,7 @@ use rmcp::service::{ClientInitializeError, PeerRequestOptions, RoleClient, Runni
 use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::transport::child_process::TokioChildProcess;
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
+use rmcp_reqwest as http_client;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
@@ -48,6 +50,15 @@ pub enum McpError {
 
     #[error("failed to connect to MCP server")]
     Connect(#[source] Box<ClientInitializeError>),
+
+    #[error("failed to resolve MCP server host")]
+    ResolveHost(#[source] std::io::Error),
+
+    #[error("MCP server URL has no resolvable host")]
+    UnresolvableHost,
+
+    #[error("failed to build MCP HTTP client")]
+    BuildHttpClient(#[source] http_client::Error),
 
     #[error("invalid MCP HTTP header name")]
     InvalidHeaderName(#[source] http::header::InvalidHeaderName),
@@ -97,6 +108,7 @@ impl McpClient {
     ///
     /// Returns [`McpError::Connect`] if the MCP initialization handshake fails.
     pub async fn connect(server_url: &str, headers: Option<HashMap<String, String>>) -> Result<Self, McpError> {
+        let http_client = pinned_http_client(server_url).await?;
         let mut config = StreamableHttpClientTransportConfig::with_uri(server_url.to_owned());
         if let Some(headers) = headers.filter(|headers| !headers.is_empty()) {
             let mut custom_headers = HashMap::with_capacity(headers.len());
@@ -108,7 +120,7 @@ impl McpClient {
             }
             config = config.custom_headers(custom_headers);
         }
-        let transport = StreamableHttpClientTransport::from_config(config);
+        let transport = StreamableHttpClientTransport::with_client(http_client, config);
         let service = tokio::time::timeout(CONNECTION_TIMEOUT, AgenticMcpClientHandler.serve(transport))
             .await
             .map_err(|_| McpError::Timeout {
@@ -276,4 +288,25 @@ impl McpClient {
             source,
         })
     }
+}
+
+/// Build the HTTP client used by an MCP connection with DNS pinned to the
+/// address resolved during connection setup. This prevents a hostname from
+/// resolving to a different address between URL validation and a later request.
+async fn pinned_http_client(server_url: &str) -> Result<http_client::Client, McpError> {
+    let url = http_client::Url::parse(server_url).map_err(|_| McpError::UnresolvableHost)?;
+    let host = url.host_str().ok_or(McpError::UnresolvableHost)?;
+    let port = url.port_or_known_default().ok_or(McpError::UnresolvableHost)?;
+    let address = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(McpError::ResolveHost)?
+        .next()
+        .ok_or(McpError::UnresolvableHost)?;
+
+    http_client::Client::builder()
+        .pool_max_idle_per_host(0)
+        .redirect(http_client::redirect::Policy::none())
+        .resolve(host, SocketAddr::new(address.ip(), port))
+        .build()
+        .map_err(McpError::BuildHttpClient)
 }

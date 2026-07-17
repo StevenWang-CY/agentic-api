@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
@@ -194,11 +194,21 @@ fn is_allowed_request_host(host: &str) -> bool {
 }
 
 fn host_allowed_by_env(host: &str) -> bool {
-    std::env::var(MCP_ALLOWED_HOSTS_ENV).is_ok_and(|allowed_hosts| {
-        allowed_hosts
+    allowed_hosts()
+        .iter()
+        .any(|allowed_host| allowed_host.eq_ignore_ascii_case(host))
+}
+
+fn allowed_hosts() -> &'static [String] {
+    static ALLOWED_HOSTS: OnceLock<Vec<String>> = OnceLock::new();
+    ALLOWED_HOSTS.get_or_init(|| {
+        std::env::var(MCP_ALLOWED_HOSTS_ENV)
+            .unwrap_or_default()
             .split(',')
             .map(str::trim)
-            .any(|allowed_host| allowed_host.eq_ignore_ascii_case(host))
+            .filter(|host| !host.is_empty())
+            .map(str::to_owned)
+            .collect()
     })
 }
 
