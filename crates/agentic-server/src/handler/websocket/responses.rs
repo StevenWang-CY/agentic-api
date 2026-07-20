@@ -7,7 +7,7 @@ use axum::http::HeaderMap;
 use axum::response::Response;
 use either::Either;
 use futures::stream::{SplitSink, SplitStream};
-use futures::{SinkExt, StreamExt};
+use futures::{SinkExt, Stream, StreamExt};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
@@ -99,6 +99,9 @@ async fn responses_ws_loop(socket: WebSocket, state: AppState, headers: HeaderMa
                 }
             }
         }
+    }
+    if let Err(error) = sender.close().await {
+        debug!(%error, "failed to close responses websocket cleanly");
     }
     debug!("responses websocket session closed");
 }
@@ -210,6 +213,35 @@ fn empty_response_event(
     })
 }
 
+enum ShutdownInput<ReceiverItem, UpstreamItem> {
+    Receiver(Option<ReceiverItem>),
+    Upstream(Option<UpstreamItem>),
+}
+
+async fn next_shutdown_input<Receiver, Upstream>(
+    receiver: &mut Receiver,
+    upstream: &mut Upstream,
+    prefer_receiver: bool,
+) -> ShutdownInput<Receiver::Item, Upstream::Item>
+where
+    Receiver: Stream + Unpin,
+    Upstream: Stream + Unpin,
+{
+    if prefer_receiver {
+        tokio::select! {
+            biased;
+            message = receiver.next() => ShutdownInput::Receiver(message),
+            line = upstream.next() => ShutdownInput::Upstream(line),
+        }
+    } else {
+        tokio::select! {
+            biased;
+            line = upstream.next() => ShutdownInput::Upstream(line),
+            message = receiver.next() => ShutdownInput::Receiver(message),
+        }
+    }
+}
+
 /// Stream a response from the executor to the client.
 ///
 /// Requests arriving from the client while the stream is active are pushed
@@ -221,12 +253,33 @@ async fn stream_ws_response(
     shutdown_token: &CancellationToken,
     queue: &mut VecDeque<String>,
 ) -> Result<(), WsError> {
+    let mut prefer_shutdown_receiver = true;
     'stream: loop {
         if shutdown_token.is_cancelled() {
-            let Some(line) = stream.next().await else {
-                break;
-            };
-            forward_ws_stream_line(sender, &line).await?;
+            match next_shutdown_input(receiver, &mut stream, prefer_shutdown_receiver).await {
+                ShutdownInput::Receiver(message) => {
+                    prefer_shutdown_receiver = false;
+                    match message {
+                        None | Some(Ok(Message::Close(_))) => return Err(WsError::ClientDisconnected),
+                        Some(Ok(Message::Ping(payload))) => {
+                            sender
+                                .send(Message::Pong(payload))
+                                .await
+                                .map_err(|_| WsError::SendFailed)?;
+                        }
+                        Some(Ok(Message::Text(_) | Message::Binary(_) | Message::Pong(_))) => {}
+                        Some(Err(error)) => return Err(WsError::Receive(error.to_string())),
+                    }
+                    continue 'stream;
+                }
+                ShutdownInput::Upstream(line) => {
+                    prefer_shutdown_receiver = true;
+                    let Some(line) = line else {
+                        break;
+                    };
+                    forward_ws_stream_line(sender, &line).await?;
+                }
+            }
             continue;
         }
 
@@ -304,4 +357,26 @@ async fn send_ws_json(sender: &mut WsSender, value: Value) -> Result<(), WsError
         .send(Message::Text(text.into()))
         .await
         .map_err(|_| WsError::SendFailed)
+}
+
+#[cfg(test)]
+mod tests {
+    use futures::stream;
+
+    use super::{ShutdownInput, next_shutdown_input};
+
+    #[tokio::test]
+    async fn shutdown_input_priority_alternates_when_both_streams_are_ready() {
+        let mut receiver = stream::repeat(());
+        let mut upstream = stream::repeat(());
+
+        assert!(matches!(
+            next_shutdown_input(&mut receiver, &mut upstream, true).await,
+            ShutdownInput::Receiver(Some(()))
+        ));
+        assert!(matches!(
+            next_shutdown_input(&mut receiver, &mut upstream, false).await,
+            ShutdownInput::Upstream(Some(()))
+        ));
+    }
 }
