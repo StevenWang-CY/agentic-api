@@ -40,6 +40,8 @@ impl WebSocketTracker {
     pub async fn wait_until_idle(&self) {
         loop {
             let idle = self.inner.idle.notified();
+            tokio::pin!(idle);
+            idle.as_mut().enable();
             if self.inner.active.load(Ordering::Acquire) == 0 {
                 return;
             }

@@ -12,7 +12,10 @@ cleanup() {
 trap cleanup EXIT
 
 mkdir -p "$test_root/bin"
-printf '%s\n' '#!/bin/sh' 'exit 0' >"$test_root/bin/agentic-server"
+printf '%s\n' \
+    '#!/bin/sh' \
+    'if [ "${EXPECT_DATABASE_URL_UNSET:-}" = 1 ] && [ "${DATABASE_URL+x}" = x ]; then exit 1; fi' \
+    'exit 0' >"$test_root/bin/agentic-server"
 chmod +x "$test_root/bin/agentic-server"
 test_path=$test_root/bin:/usr/bin:/bin
 
@@ -20,9 +23,10 @@ unset_dir=$test_root/unset
 mkdir "$unset_dir"
 (
     cd "$unset_dir"
-    env -u DATABASE_URL PATH="$test_path" "$entrypoint"
+    env -u DATABASE_URL EXPECT_DATABASE_URL_UNSET=1 PATH="$test_path" "$entrypoint"
 )
-test ! -e "$unset_dir/agentic_api.db"
+test -f "$unset_dir/agentic_api.db"
+test "$(stat -c '%a' "$unset_dir/agentic_api.db" 2>/dev/null || stat -f '%Lp' "$unset_dir/agentic_api.db")" = "664"
 
 sqlite_dir=$test_root/sqlite
 mkdir "$sqlite_dir"

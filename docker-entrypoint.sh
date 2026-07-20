@@ -5,7 +5,9 @@ set -eu
 # arbitrary UID while retaining the image's root-group permission model.
 umask 0002
 
-database_url=${DATABASE_URL:-}
+# Mirror the server's default only for permission preparation. Keep DATABASE_URL
+# unset so the Rust CLI remains authoritative for the actual connection URL.
+database_url=${DATABASE_URL:-sqlite://./agentic_api.db}
 case "$database_url" in
     sqlite::memory:*)
         ;;
