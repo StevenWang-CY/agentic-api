@@ -4,7 +4,7 @@ The production image contains only the Rust gateway and its runtime libraries. I
 
 ## Build the image
 
-The multi-stage build pins its Rust and Debian bases, uses BuildKit caches, and copies only `agentic-server` into the runtime stage:
+The multi-stage build pins its Rust and Debian bases by digest, uses BuildKit caches, and copies only `agentic-server` into the runtime stage. Dependabot proposes weekly digest updates so base-image changes remain explicit and reviewable.
 
 ```console
 DOCKER_BUILDKIT=1 docker build \
@@ -33,6 +33,8 @@ The image starts `agentic-server` in standalone mode. At minimum, set `LLM_API_B
 | `SKIP_LLM_READY_CHECK` | `false` | Skip the startup probe for hosted providers without `/health` |
 | `CORS_ALLOWED_ORIGINS` | none | Comma-separated browser origins |
 
+The container entrypoint rejects percent-encoded SQLite paths because SQLx decodes them before opening the database. Use a literal filesystem path or PostgreSQL instead.
+
 Do not put credentials into the image or Docker build arguments. Inject them at runtime through a secret manager.
 
 ```console
@@ -59,20 +61,30 @@ curl --fail http://127.0.0.1:9000/ready
 
 The container CI workflow builds the image, verifies that build tools are absent, launches the gateway against a mock upstream, checks both probes, and exercises a stored Responses API request through SQLite persistence. HTTP streaming and WebSockets use the same gateway binary and exposed port; the image does not add a transport proxy.
 
+On `SIGTERM`, the gateway stops accepting connections and gives in-flight requests up to eight seconds to drain before closing the remaining connections. Set an orchestrator termination grace period longer than eight seconds; the default 30-second Kubernetes grace period and the documented 10-second Docker stop timeout both satisfy this requirement.
+
 ## Kubernetes and OpenShift security context
 
 The image defaults to UID `10001` and GID `0`. Its working directory is setgid and the entrypoint uses a group-cooperative umask, so new SQLite files remain writable when OpenShift replaces the UID while retaining the group-0 permission model. Do not set a fixed `runAsUser` when the cluster assigns arbitrary UIDs.
 
+A volume mounted at `/var/lib/agentic-api` hides the ownership and mode stored in the image. For SQLite, configure the storage class or pod-level `fsGroup` so the mounted directory is writable by a supplemental group assigned to the container. The example below uses group 0 to match the image; if the cluster assigns a different permitted supplemental group, use that group and ensure the volume root is group-writable and setgid. PostgreSQL deployments do not need this pod-level filesystem setting.
+
 Volumes initialized by an older image may contain SQLite files without group-write permission. Before rotating to an arbitrary UID, repair those volumes once as an administrator with `chmod -R g+rwX /var/lib/agentic-api`.
 
 ```yaml
-securityContext:
-  allowPrivilegeEscalation: false
-  capabilities:
-    drop: ["ALL"]
-  runAsNonRoot: true
-  seccompProfile:
-    type: RuntimeDefault
+spec:
+  securityContext:
+    fsGroup: 0
+    fsGroupChangePolicy: OnRootMismatch
+  containers:
+    - name: agentic-api
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ["ALL"]
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
 ```
 
 Mount writable storage at `/var/lib/agentic-api` only when using SQLite. PostgreSQL deployments do not need a persistent filesystem for the gateway.

@@ -18,7 +18,7 @@ use agentic_core::config::Config;
 use agentic_core::executor::{ConversationHandler, ExecutionContext, ResponseHandler};
 use agentic_core::proxy::ProxyState;
 use agentic_core::storage::{ConversationStore, ResponseStore};
-use agentic_server::app::{AppState, ServerConfig, build_router};
+use agentic_server::app::{AppState, ServerConfig, WebSocketTracker, build_router};
 
 const CONTENT_TYPE_JSON: &str = "application/json";
 const PROMPT_SIZES: [usize; 3] = [1024, 10 * 1024, 100 * 1024];
@@ -93,6 +93,7 @@ async fn spawn_gateway(config: Config) -> String {
         proxy_state,
         exec_ctx,
         shutdown_token: CancellationToken::new(),
+        websocket_tracker: WebSocketTracker::default(),
         llm_api_base: config.llm_api_base,
         openai_api_key: config.openai_api_key,
     };

@@ -13,6 +13,7 @@ on:
       - "crates/**"
       - "scripts/container-fixture-server.py"
       - "scripts/fixtures/vllm-response-single-nonstreaming.json"
+      - "scripts/test-container-entrypoint.sh"
   push:
     branches: [main]
     paths:
@@ -25,6 +26,7 @@ on:
       - "crates/**"
       - "scripts/container-fixture-server.py"
       - "scripts/fixtures/vllm-response-single-nonstreaming.json"
+      - "scripts/test-container-entrypoint.sh"
 
 permissions:
   contents: read
@@ -36,6 +38,9 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Test container entrypoint
+        run: scripts/test-container-entrypoint.sh
 
       - name: Build runtime image
         env:
@@ -61,6 +66,32 @@ jobs:
             test ! -w /usr/local/bin/agentic-server
             test ! -w /usr/local/bin/docker-entrypoint.sh
           '
+          container_id=$(docker create agentic-api:test)
+          binary_copy=$(mktemp)
+          cleanup_binary() {
+            docker rm --force "$container_id" >/dev/null 2>&1 || true
+            rm -f "$binary_copy"
+          }
+          trap cleanup_binary EXIT
+          docker cp "$container_id:/usr/local/bin/agentic-server" "$binary_copy"
+          binary_description=$(file "$binary_copy")
+          echo "$binary_description"
+          case "$binary_description" in
+            *"not stripped"*) exit 1 ;;
+            *"stripped"*) ;;
+            *) echo "unable to verify that agentic-server is stripped" >&2; exit 1 ;;
+          esac
+          volume_dir=$(mktemp -d)
+          cleanup_volume() {
+            sudo rm -rf "$volume_dir"
+          }
+          trap 'cleanup_binary; cleanup_volume' EXIT
+          sudo chgrp 0 "$volume_dir"
+          chmod 2775 "$volume_dir"
+          docker run --rm --user 12345:0 \
+            --volume "$volume_dir:/var/lib/agentic-api" \
+            --entrypoint sh agentic-api:test \
+            -eu -c 'touch /var/lib/agentic-api/write-check && test -w /var/lib/agentic-api/write-check'
 
       - name: Test Responses API end to end
         run: |

@@ -2,8 +2,10 @@
 
 ARG RUST_VERSION=1.96.0
 ARG DEBIAN_VERSION=bookworm
+ARG RUST_IMAGE_DIGEST=sha256:5e2214abe154fe26e39f64488952e5c991eeed1d6d6da7cc8381ae83927f0cfc
+ARG DEBIAN_IMAGE_DIGEST=sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818
 
-FROM rust:${RUST_VERSION}-${DEBIAN_VERSION} AS rust-build
+FROM rust:${RUST_VERSION}-${DEBIAN_VERSION}@${RUST_IMAGE_DIGEST} AS rust-build
 
 ARG CARGO_BUILD_JOBS=4
 ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
@@ -16,9 +18,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,target=/workspace/target,sharing=locked \
     cargo build --locked --release -p agentic-server && \
-    install -Dm755 target/release/agentic-server /out/agentic-server
+    install -Dm755 -s target/release/agentic-server /out/agentic-server
 
-FROM debian:${DEBIAN_VERSION}-slim AS runtime
+FROM debian:${DEBIAN_VERSION}-slim@${DEBIAN_IMAGE_DIGEST} AS runtime
 
 ARG RUNTIME_GID=0
 ARG RUNTIME_UID=10001

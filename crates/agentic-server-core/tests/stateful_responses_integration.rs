@@ -14,7 +14,6 @@ use either::Either;
 use futures::StreamExt;
 use serde_json::Value;
 use std::sync::Arc;
-use std::time::Duration;
 use support::{
     MockResponse, TestFixture, collect_stream, expected_text, load_cassette, make_request, output_text,
     request_input_texts, text_response, unwrap_blocking,
@@ -152,21 +151,13 @@ async fn test_stream_persists_when_client_disconnects_after_completion_event() {
     // immediately after receiving the terminal response event.
     drop(stream);
 
-    for _ in 0..100 {
-        match execute(
-            make_request("follow up", true, true, Some(response_id.clone()), None),
-            Arc::clone(&fixture.exec_ctx),
-        )
-        .await
-        {
-            Ok(Either::Right(_)) => return,
-            Ok(Either::Left(_)) => panic!("expected streaming follow-up"),
-            Err(_) => {}
-        }
-        tokio::time::sleep(Duration::from_millis(1)).await;
-    }
-
-    panic!("stream response was not persisted after client disconnect");
+    let follow_up = execute(
+        make_request("follow up", true, true, Some(response_id), None),
+        Arc::clone(&fixture.exec_ctx),
+    )
+    .await
+    .expect("response must be persisted before response.completed is emitted");
+    assert!(matches!(follow_up, Either::Right(_)));
 }
 
 /// Case 3 — two turns, non-streaming, chained via `previous_response_id`.

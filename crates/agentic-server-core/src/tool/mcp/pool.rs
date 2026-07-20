@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::net::IpAddr;
 use std::sync::{Arc, OnceLock};
 
 use reqwest::Url;
@@ -8,9 +7,10 @@ use serde::{Deserialize, Serialize};
 use super::client::McpClient;
 use crate::types::tools::McpToolParam;
 
-// Hostnames configured here are a trust boundary: validation compares the
-// hostname string but does not pin its DNS resolution to the transport. Only
-// add names whose DNS records are controlled by a trusted administrator.
+// Hostnames configured here are a trust boundary. The HTTP client resolves a
+// configured name once per connection and pins all returned addresses for that
+// transport. Only add names whose DNS records are controlled by a trusted
+// administrator.
 const MCP_ALLOWED_HOSTS_ENV: &str = "AGENTIC_MCP_ALLOWED_HOSTS";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -177,8 +177,8 @@ fn validate_request_server_url(value: &str) -> Result<String, String> {
         return Err("URL must not include credentials".to_owned());
     }
 
-    let host = url.host_str().ok_or_else(|| "URL must include a host".to_owned())?;
-    if is_allowed_request_host(host) {
+    let host = url.host().ok_or_else(|| "URL must include a host".to_owned())?;
+    if is_allowed_request_host(&host) {
         return Ok(value.to_owned());
     }
 
@@ -187,10 +187,12 @@ fn validate_request_server_url(value: &str) -> Result<String, String> {
     ))
 }
 
-fn is_allowed_request_host(host: &str) -> bool {
-    host.eq_ignore_ascii_case("localhost")
-        || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
-        || host_allowed_by_env(host)
+fn is_allowed_request_host(host: &url::Host<&str>) -> bool {
+    match host {
+        url::Host::Domain(host) => host.eq_ignore_ascii_case("localhost") || host_allowed_by_env(host),
+        url::Host::Ipv4(address) => address.is_loopback() || host_allowed_by_env(&address.to_string()),
+        url::Host::Ipv6(address) => address.is_loopback() || host_allowed_by_env(&address.to_string()),
+    }
 }
 
 fn host_allowed_by_env(host: &str) -> bool {
@@ -201,15 +203,16 @@ fn host_allowed_by_env(host: &str) -> bool {
 
 fn allowed_hosts() -> &'static [String] {
     static ALLOWED_HOSTS: OnceLock<Vec<String>> = OnceLock::new();
-    ALLOWED_HOSTS.get_or_init(|| {
-        std::env::var(MCP_ALLOWED_HOSTS_ENV)
-            .unwrap_or_default()
-            .split(',')
-            .map(str::trim)
-            .filter(|host| !host.is_empty())
-            .map(str::to_owned)
-            .collect()
-    })
+    ALLOWED_HOSTS.get_or_init(|| parse_allowed_hosts(&std::env::var(MCP_ALLOWED_HOSTS_ENV).unwrap_or_default()))
+}
+
+fn parse_allowed_hosts(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|host| !host.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 fn clean_string(value: Option<&str>) -> Option<String> {
@@ -221,7 +224,7 @@ fn clean_string(value: Option<&str>) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{McpServerEntry, server_entry_from_param, validate_request_server_url};
+    use super::{McpServerEntry, parse_allowed_hosts, server_entry_from_param, validate_request_server_url};
     use crate::types::tools::McpToolParam;
 
     #[test]
@@ -274,6 +277,12 @@ mod tests {
     }
 
     #[test]
+    fn request_server_url_allows_ipv6_loopback_http() {
+        let url = validate_request_server_url("http://[::1]:8000/mcp").unwrap();
+        assert_eq!(url, "http://[::1]:8000/mcp");
+    }
+
+    #[test]
     fn request_server_url_rejects_unallowlisted_host() {
         let error = validate_request_server_url("http://169.254.169.254/mcp").unwrap_err();
         assert!(error.contains("not allowed"));
@@ -290,5 +299,13 @@ mod tests {
         .unwrap();
 
         assert!(server_entry_from_param(&param).is_none());
+    }
+
+    #[test]
+    fn allowed_host_parser_trims_and_discards_empty_entries() {
+        assert_eq!(
+            parse_allowed_hosts(" Example.COM, ,api.test "),
+            vec!["Example.COM", "api.test"]
+        );
     }
 }

@@ -11,7 +11,7 @@ use agentic_core::config::Config;
 use agentic_core::executor::{ConversationHandler, ExecutionContext, ResponseHandler};
 use agentic_core::proxy::ProxyState;
 use agentic_core::storage::{ConversationStore, ResponseStore};
-use agentic_server::app::{AppState, ServerConfig, build_router};
+use agentic_server::app::{AppState, ServerConfig, WebSocketTracker, build_router};
 
 pub fn test_config(llm_url: &str) -> Config {
     Config {
@@ -38,6 +38,7 @@ pub fn test_state(config: &Config) -> AppState {
         proxy_state,
         exec_ctx,
         shutdown_token: CancellationToken::new(),
+        websocket_tracker: WebSocketTracker::default(),
         llm_api_base: config.llm_api_base.clone(),
         openai_api_key: config.openai_api_key.clone(),
     }

@@ -26,7 +26,7 @@ use agentic_core::executor::{ConversationHandler, ExecutionContext, ResponseHand
 use agentic_core::proxy::ProxyState;
 use agentic_core::storage::{ConversationStore, ResponseStore, create_pool_with_schema};
 use agentic_core::tool::WebSearchHandler;
-use agentic_server::app::AppState;
+use agentic_server::app::{AppState, WebSocketTracker};
 
 use common::{spawn_gateway, test_config};
 
@@ -93,6 +93,10 @@ impl Drop for MockYouSearchServer {
 
 enum MockResponse {
     Static(String),
+    Gated {
+        response: String,
+        release: oneshot::Receiver<()>,
+    },
     Hanging {
         first_chunk: String,
         drop_tx: oneshot::Sender<()>,
@@ -144,6 +148,16 @@ impl MockResponsesServer {
         (server, drop_rx)
     }
 
+    async fn start_gated(response: String) -> (Self, oneshot::Sender<()>) {
+        let (release_tx, release_rx) = oneshot::channel();
+        let server = Self::start_with_responses(vec![MockResponse::Gated {
+            response,
+            release: release_rx,
+        }])
+        .await;
+        (server, release_tx)
+    }
+
     async fn start_with_responses(responses: Vec<MockResponse>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -163,6 +177,10 @@ impl MockResponsesServer {
                     let response = queue.lock().await.pop_front().expect("mock response queue exhausted");
                     let body = match response {
                         MockResponse::Static(response) => axum::body::Body::from(response),
+                        MockResponse::Gated { response, release } => {
+                            let _ = release.await;
+                            axum::body::Body::from(response)
+                        }
                         MockResponse::Hanging { first_chunk, drop_tx } => {
                             axum::body::Body::from_stream(HangingSse::new(first_chunk, drop_tx))
                         }
@@ -254,6 +272,7 @@ async fn storage_backed_state_with_web_search(llm_url: &str, web_search_base_url
         proxy_state,
         exec_ctx,
         shutdown_token: CancellationToken::new(),
+        websocket_tracker: WebSocketTracker::default(),
         llm_api_base: config.llm_api_base,
         openai_api_key: config.openai_api_key,
     };
@@ -1188,6 +1207,48 @@ async fn test_websocket_shutdown_token_closes_idle_connection() {
 
     recv_close_or_end(&mut ws).await;
     assert!(mock.request_bodies().await.is_empty());
+}
+
+#[tokio::test]
+async fn test_websocket_shutdown_drains_active_response_before_closing() {
+    let (mock, release) =
+        MockResponsesServer::start_gated(sse_response("resp_upstream_shutdown", "msg_upstream_shutdown", "DONE")).await;
+    let fixture = storage_backed_state(&mock.url).await;
+    let shutdown_token = fixture.state.shutdown_token.clone();
+    let (gateway_url, _gateway) = spawn_gateway(fixture.state.clone()).await;
+    let mut ws = connect_responses_ws(&gateway_url).await;
+
+    send_json(
+        &mut ws,
+        json!({
+            "type": "response.create",
+            "model": "test-model",
+            "input": [{"type": "message", "role": "user", "content": "hi"}],
+            "store": true,
+            "stream": true
+        }),
+    )
+    .await;
+    wait_for_request_count(&mock, 1).await;
+
+    shutdown_token.cancel();
+    send_json(
+        &mut ws,
+        json!({
+            "type": "response.create",
+            "model": "test-model",
+            "input": "must not start during shutdown",
+            "store": true,
+            "stream": true
+        }),
+    )
+    .await;
+    release.send(()).unwrap();
+
+    let events = recv_until_completed(&mut ws).await;
+    assert_eq!(events.last().unwrap()["type"], "response.completed");
+    recv_close_or_end(&mut ws).await;
+    assert_eq!(mock.request_bodies().await.len(), 1);
 }
 
 #[tokio::test]

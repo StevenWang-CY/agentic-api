@@ -21,12 +21,13 @@ hostnames can be allowed with the comma-separated `AGENTIC_MCP_ALLOWED_HOSTS`
 environment variable.
 
 Treat every hostname added to `AGENTIC_MCP_ALLOWED_HOSTS` as fully trusted. The
-allowlist validates the hostname text, while the HTTP transport performs DNS
-resolution later and does not pin the resolved IP address. Consequently, this
-setting is not an IP-level SSRF boundary and is unsafe for hostnames whose DNS
-records could be changed by an untrusted party (including through DNS
-rebinding). Only add hostnames whose DNS configuration is controlled by a
-trusted administrator.
+allowlist validates the hostname text. When it opens a connection, the HTTP
+client resolves the hostname once, pins all returned addresses for that
+transport, disables automatic proxy discovery, and disables redirects. This
+prevents later DNS changes, proxy-side resolution, or redirect targets from
+bypassing the validation, but it does not make an untrusted DNS record safe: a
+poisoned initial resolution is still trusted. Only add hostnames whose DNS
+configuration is controlled by a trusted administrator.
 
 ### First built-in tool: `read_mcp_resource`
 

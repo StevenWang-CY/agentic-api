@@ -43,7 +43,7 @@ use agentic_core::config::Config;
 use agentic_core::executor::{ConversationHandler, ExecutionContext, ResponseHandler};
 use agentic_core::proxy::ProxyState;
 use agentic_core::storage::{ConversationStore, ResponseStore, create_pool_with_schema};
-use agentic_server::app::{AppState, ServerConfig, build_router};
+use agentic_server::app::{AppState, ServerConfig, WebSocketTracker, build_router};
 
 fn bench_turns() -> usize {
     std::env::var("BENCH_TURNS")
@@ -173,6 +173,7 @@ async fn spawn_gateway(llm_url: &str) -> (Arc<reqwest::Client>, String) {
         proxy_state,
         exec_ctx,
         shutdown_token: CancellationToken::new(),
+        websocket_tracker: WebSocketTracker::default(),
         llm_api_base: config.llm_api_base,
         openai_api_key: config.openai_api_key,
     };

@@ -1,8 +1,10 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use axum::Router;
 use axum::routing::{get, post};
 use http::HeaderValue;
+use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
@@ -10,6 +12,49 @@ use agentic_core::executor::ExecutionContext;
 use agentic_core::proxy::ProxyState;
 
 use crate::handler::{conversations, count_tokens, health, messages, models, ready, responses, responses_ws};
+
+#[derive(Clone, Default)]
+pub struct WebSocketTracker {
+    inner: Arc<WebSocketTrackerInner>,
+}
+
+#[derive(Default)]
+struct WebSocketTrackerInner {
+    active: AtomicUsize,
+    idle: Notify,
+}
+
+pub(crate) struct WebSocketGuard {
+    inner: Arc<WebSocketTrackerInner>,
+}
+
+impl WebSocketTracker {
+    pub(crate) fn track(&self) -> WebSocketGuard {
+        self.inner.active.fetch_add(1, Ordering::AcqRel);
+        WebSocketGuard {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+
+    /// Wait until every upgraded WebSocket task has finished.
+    pub async fn wait_until_idle(&self) {
+        loop {
+            let idle = self.inner.idle.notified();
+            if self.inner.active.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            idle.await;
+        }
+    }
+}
+
+impl Drop for WebSocketGuard {
+    fn drop(&mut self) {
+        if self.inner.active.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.inner.idle.notify_waiters();
+        }
+    }
+}
 
 /// Server-level configuration read from environment variables.
 pub struct ServerConfig {
@@ -62,6 +107,8 @@ pub struct AppState {
     pub exec_ctx: Arc<ExecutionContext>,
     /// Shared cancellation signal used to drain long-lived handlers.
     pub shutdown_token: CancellationToken,
+    /// Tracks upgraded WebSocket tasks, which Axum does not await during HTTP drain.
+    pub websocket_tracker: WebSocketTracker,
     /// vLLM base URL — used by the `/ready` health probe.
     pub llm_api_base: String,
     /// Server-configured API key; used as fallback when the request carries no

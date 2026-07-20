@@ -25,9 +25,13 @@ type WsSender = SplitSink<WebSocket, Message>;
 type WsReceiver = SplitStream<WebSocket>;
 
 pub async fn responses_ws(State(state): State<AppState>, headers: HeaderMap, ws: WebSocketUpgrade) -> Response {
+    let websocket_guard = state.websocket_tracker.track();
     ws.max_message_size(MAX_BODY_SIZE)
         .max_frame_size(MAX_BODY_SIZE)
-        .on_upgrade(move |socket| responses_ws_loop(socket, state, headers))
+        .on_upgrade(move |socket| async move {
+            let _websocket_guard = websocket_guard;
+            responses_ws_loop(socket, state, headers).await;
+        })
 }
 
 async fn responses_ws_loop(socket: WebSocket, state: AppState, headers: HeaderMap) {
@@ -39,6 +43,9 @@ async fn responses_ws_loop(socket: WebSocket, state: AppState, headers: HeaderMa
     let mut queue: VecDeque<String> = VecDeque::new();
 
     loop {
+        if shutdown_token.is_cancelled() {
+            break;
+        }
         let text = if let Some(buffered) = queue.pop_front() {
             buffered
         } else {
@@ -215,8 +222,16 @@ async fn stream_ws_response(
     queue: &mut VecDeque<String>,
 ) -> Result<(), WsError> {
     'stream: loop {
+        if shutdown_token.is_cancelled() {
+            let Some(line) = stream.next().await else {
+                break;
+            };
+            forward_ws_stream_line(sender, &line).await?;
+            continue;
+        }
+
         let next_line = tokio::select! {
-            () = shutdown_token.cancelled() => return Err(WsError::Shutdown),
+            () = shutdown_token.cancelled() => continue 'stream,
             message = receiver.next() => {
                 match message {
                     None | Some(Ok(Message::Close(_))) => return Err(WsError::ClientDisconnected),
@@ -244,26 +259,30 @@ async fn stream_ws_response(
         let Some(line) = next_line else {
             break;
         };
-        let Some(data) = line.strip_prefix("data: ") else {
-            continue;
-        };
-        let data = data.trim();
-        if data == "[DONE]" {
-            continue;
-        }
-        let value = match serde_json::from_str::<Value>(data) {
-            Ok(value) => value,
-            Err(e) => return Err(WsError::Executor(ExecutorError::from(e))),
-        };
-        send_ws_json(sender, value).await?;
+        forward_ws_stream_line(sender, &line).await?;
     }
 
     Ok(())
 }
 
+async fn forward_ws_stream_line(sender: &mut WsSender, line: &str) -> Result<(), WsError> {
+    let Some(data) = line.strip_prefix("data: ") else {
+        return Ok(());
+    };
+    let data = data.trim();
+    if data == "[DONE]" {
+        return Ok(());
+    }
+    let value = match serde_json::from_str::<Value>(data) {
+        Ok(value) => value,
+        Err(e) => return Err(WsError::Executor(ExecutorError::from(e))),
+    };
+    send_ws_json(sender, value).await
+}
+
 async fn handle_ws_error(sender: &mut WsSender, err: WsError) -> bool {
     match err {
-        WsError::Shutdown | WsError::ClientDisconnected | WsError::SendFailed => false,
+        WsError::ClientDisconnected | WsError::SendFailed => false,
         WsError::Receive(message) => {
             warn!("responses websocket receive error: {message}");
             false

@@ -1,14 +1,19 @@
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use agentic_core::config::Config;
 use agentic_core::error::Error;
 use agentic_core::executor::ExecutionContext;
 use agentic_core::proxy::ProxyState;
 use agentic_core::readiness::wait_llm_ready;
-use agentic_server::app::{AppState, ServerConfig, build_router};
+use agentic_server::app::{AppState, ServerConfig, WebSocketTracker, build_router};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
-use tracing::info;
+use tracing::{info, warn};
+
+const GATEWAY_DRAIN_TIMEOUT: Duration = Duration::from_secs(8);
 
 async fn build_state(config: &Config, shutdown_token: CancellationToken) -> Result<AppState, Error> {
     let proxy_state = ProxyState::new(config.clone())?;
@@ -18,6 +23,7 @@ async fn build_state(config: &Config, shutdown_token: CancellationToken) -> Resu
         proxy_state,
         exec_ctx,
         shutdown_token,
+        websocket_tracker: WebSocketTracker::default(),
         llm_api_base: config.llm_api_base.clone(),
         openai_api_key: config.openai_api_key.clone(),
     })
@@ -27,6 +33,7 @@ async fn serve_gateway(state: AppState, host: &str, port: u16) -> Result<(), Err
     let addr = format!("{host}:{port}");
     let server_config = ServerConfig::from_env();
     let shutdown_token = state.shutdown_token.clone();
+    let websocket_tracker = state.websocket_tracker.clone();
     let router = build_router(state, &server_config);
     let listener = TcpListener::bind(&addr).await?;
     info!("gateway listening on {addr}");
@@ -35,6 +42,7 @@ async fn serve_gateway(state: AppState, host: &str, port: u16) -> Result<(), Err
             shutdown_token.cancelled().await;
         })
         .await?;
+    websocket_tracker.wait_until_idle().await;
     Ok(())
 }
 
@@ -49,8 +57,23 @@ async fn serve_gateway_until_signal(state: AppState, host: &str, port: u16) -> R
             signal?;
             info!("shutdown signal received");
             shutdown_token.cancel();
-            gateway.await
+            drain_gateway(gateway.as_mut()).await
         }
+    }
+}
+
+async fn drain_gateway<F>(gateway: Pin<&mut F>) -> Result<(), Error>
+where
+    F: Future<Output = Result<(), Error>>,
+{
+    if let Ok(result) = tokio::time::timeout(GATEWAY_DRAIN_TIMEOUT, gateway).await {
+        result
+    } else {
+        warn!(
+            timeout_seconds = GATEWAY_DRAIN_TIMEOUT.as_secs(),
+            "gateway drain timed out; closing remaining connections"
+        );
+        Ok(())
     }
 }
 
@@ -154,7 +177,7 @@ pub async fn run_with_llm(config: Config, host: &str, port: u16, llm_args: Vec<S
                 Ok(()) => {
                     info!("shutdown signal received");
                     shutdown_token.cancel();
-                    gateway.await
+                    drain_gateway(gateway.as_mut()).await
                 }
                 Err(err) => Err(err.into()),
             }
@@ -164,4 +187,28 @@ pub async fn run_with_llm(config: Config, host: &str, port: u16, llm_args: Vec<S
     let _ = child.kill().await;
     let _ = child.wait().await;
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::drain_gateway;
+    use agentic_core::error::Error;
+
+    #[tokio::test(start_paused = true)]
+    async fn gateway_drain_is_bounded() {
+        let gateway = std::future::pending::<Result<(), Error>>();
+        tokio::pin!(gateway);
+
+        drain_gateway(gateway.as_mut()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn gateway_drain_preserves_server_errors() {
+        let gateway = std::future::ready(Err(Error::Config("gateway failed".to_owned())));
+        tokio::pin!(gateway);
+
+        let error = drain_gateway(gateway.as_mut()).await.unwrap_err();
+
+        assert_eq!(error.to_string(), "gateway failed");
+    }
 }
