@@ -30,7 +30,8 @@ The recorder scripts (`record_reasoning_cassettes.sh`, `record_tool_call_cassett
 
 | Mode | Description |
 |------|-------------|
-| `responses` | Chains turns via `previous_response_id`. Only mode supported with `--vllm`. Common mode for gateway-backed built-in tool cassettes. |
+| `responses` | Chains turns via `previous_response_id`. Supported with `--vllm`. Common mode for gateway-backed built-in tool cassettes. |
+| `messages` | Anthropic Messages API (`/v1/messages`). Stateless: resends the full `messages` history each turn. With `--tool-outputs`, a turn following a `tool_use` feeds back matching `tool_result` blocks (keyed by tool name) instead of prompting. Supported with `--vllm`. |
 | `conv` | Creates a conversation object, passes `conversation` id each turn. |
 | `isolation` | Two independent conversations (A and B) recorded into one cassette. |
 | `mixed` | Turn 1 uses `conversation` id, turns 2+ switch to `previous_response_id`. |
@@ -160,6 +161,7 @@ turns:
 | `record_text_only_cassettes.sh` | 10 text-only cassettes (responses + conv modes, streaming + non-streaming) | OpenAI (`OPENAI_API_KEY`) |
 | `record_reasoning_cassettes.sh` | 2 reasoning cassettes (single turn, streaming + non-streaming) | vLLM |
 | `record_tool_call_cassettes.sh` | 8 tool-call cassettes (4 tool_choice modes x streaming + non-streaming) | vLLM |
+| `record_codex_cli_tool_call_cassettes.sh` | Codex function/namespace/custom-tool matrix | gateway, vLLM, and OpenAI |
 
 ### Text-only (OpenAI)
 
@@ -182,4 +184,23 @@ VLLM_URL=http://0.0.0.0:5050 MODEL=Qwen/Qwen3-30B-A3B-FP8 bash tests/cassettes/r
 vllm serve Qwen/Qwen3-30B-A3B-FP8 --tool-call-parser hermes --enable-auto-tool-choice --port 5050 > server.log 2>&1
 
 VLLM_URL=http://0.0.0.0:5050 MODEL=Qwen/Qwen3-30B-A3B-FP8 bash tests/cassettes/record_tool_call_cassettes.sh
+```
+
+### Codex custom tools (gateway, vLLM, and OpenAI)
+
+The custom fixture uses a Lark grammar and records two turns: the model returns raw `custom_tool_call.input`, then the
+recorder submits the matching `custom_tool_call_output` before the follow-up user message.
+
+```bash
+GATEWAY_URL=http://127.0.0.1:3018 \
+V_MODEL=Qwen/Qwen3.6-35B-A3B \
+bash tests/cassettes/record_codex_cli_tool_call_cassettes.sh gateway-custom
+
+VLLM_URL=http://127.0.0.1:8000 \
+V_MODEL=Qwen/Qwen3.6-35B-A3B \
+bash tests/cassettes/record_codex_cli_tool_call_cassettes.sh direct-vllm-custom
+
+OPENAI_API_KEY=sk-... \
+OPENAI_CUSTOM_MODEL=gpt-5.6 \
+bash tests/cassettes/record_codex_cli_tool_call_cassettes.sh openai-custom
 ```

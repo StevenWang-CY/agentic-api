@@ -369,6 +369,8 @@ pub fn make_request(
         max_output_tokens: None,
         truncation: None,
         metadata: None,
+        parallel_tool_calls: None,
+        cache_salt: None,
     }
 }
 
@@ -415,6 +417,7 @@ pub fn output_text(payload: &ResponsePayload) -> String {
         .filter_map(|item| match item {
             OutputItem::Message(msg) => Some(msg.content.iter().map(|c| c.text.as_str()).collect::<String>()),
             OutputItem::FunctionCall(_)
+            | OutputItem::CustomToolCall(_)
             | OutputItem::WebSearchCall(_)
             | OutputItem::McpToolCall(_)
             | OutputItem::Reasoning(_)
