@@ -31,7 +31,7 @@ RUN apt-get update && \
     chmod g=u,g+s /var/lib/agentic-api
 
 COPY --from=rust-build /out/agentic-server /usr/local/bin/agentic-server
-COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+COPY --chmod=0755 docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
 ARG OCI_CREATED=""
 ARG OCI_BUILD_PIPELINE=local
