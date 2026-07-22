@@ -49,10 +49,7 @@ async fn responses_ws_loop(socket: WebSocket, state: AppState, headers: HeaderMa
         let text = if let Some(buffered) = queue.pop_front() {
             buffered
         } else {
-            let message = tokio::select! {
-                () = shutdown_token.cancelled() => break,
-                message = receiver.next() => message,
-            };
+            let message = next_ws_message(&shutdown_token, &mut receiver).await;
 
             let Some(message) = message else {
                 break;
@@ -102,6 +99,30 @@ async fn responses_ws_loop(socket: WebSocket, state: AppState, headers: HeaderMa
     }
     close_ws(&mut sender, &mut receiver).await;
     debug!("responses websocket session closed");
+}
+
+async fn next_ws_message<Receiver>(
+    shutdown_token: &CancellationToken,
+    receiver: &mut Receiver,
+) -> Option<Receiver::Item>
+where
+    Receiver: Stream + Unpin,
+{
+    tokio::select! {
+        biased;
+        () = shutdown_token.cancelled() => None,
+        message = receiver.next() => {
+            if shutdown_token.is_cancelled() {
+                None
+            } else {
+                message
+            }
+        },
+    }
+}
+
+fn keep_if_running<T>(shutdown_token: &CancellationToken, value: T) -> Option<T> {
+    (!shutdown_token.is_cancelled()).then_some(value)
 }
 
 async fn close_ws<Sender, Receiver, SendError, ReceiveError>(sender: &mut Sender, receiver: &mut Receiver)
@@ -175,6 +196,10 @@ async fn handle_ws_text(
         .with_auth(auth)
         .run()
         .await?;
+    let Some(result) = keep_if_running(shutdown_token, result) else {
+        debug!("discarded websocket response initialized during shutdown");
+        return Ok(());
+    };
     let Either::Right(stream) = result else {
         return Err(WsError::Executor(ExecutorError::InvalidRequest(
             "websocket response.create must produce a stream".to_owned(),
@@ -383,10 +408,81 @@ async fn send_ws_json(sender: &mut WsSender, value: Value) -> Result<(), WsError
 
 #[cfg(test)]
 mod tests {
-    use axum::extract::ws::Message;
-    use futures::{StreamExt, sink, stream};
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
 
-    use super::{ShutdownInput, close_ws, next_shutdown_input};
+    use axum::extract::ws::Message;
+    use futures::{Sink, Stream, StreamExt, sink, stream};
+    use tokio_util::sync::CancellationToken;
+
+    use super::{ShutdownInput, close_ws, keep_if_running, next_shutdown_input, next_ws_message};
+
+    struct CloseErrorSink;
+
+    struct CancellingStream {
+        shutdown_token: CancellationToken,
+        item: Option<&'static str>,
+    }
+
+    impl Stream for CancellingStream {
+        type Item = &'static str;
+
+        fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            self.shutdown_token.cancel();
+            Poll::Ready(self.item.take())
+        }
+    }
+
+    impl Sink<Message> for CloseErrorSink {
+        type Error = &'static str;
+
+        fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn start_send(self: Pin<&mut Self>, _item: Message) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Err("close failed"))
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_shutdown_wins_over_ready_websocket_message() {
+        let shutdown_token = CancellationToken::new();
+        shutdown_token.cancel();
+        let mut receiver = stream::iter(["must remain unread"]);
+
+        assert!(next_ws_message(&shutdown_token, &mut receiver).await.is_none());
+        assert_eq!(receiver.next().await, Some("must remain unread"));
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_receive_discards_websocket_message() {
+        let shutdown_token = CancellationToken::new();
+        let mut receiver = CancellingStream {
+            shutdown_token: shutdown_token.clone(),
+            item: Some("must be discarded"),
+        };
+
+        assert!(next_ws_message(&shutdown_token, &mut receiver).await.is_none());
+        assert!(shutdown_token.is_cancelled());
+        assert_eq!(receiver.next().await, None);
+    }
+
+    #[test]
+    fn cancellation_after_request_setup_discards_unpolled_stream() {
+        let shutdown_token = CancellationToken::new();
+        shutdown_token.cancel();
+
+        assert_eq!(keep_if_running(&shutdown_token, "unpolled stream"), None);
+    }
 
     #[tokio::test]
     async fn close_ws_ignores_late_frames_until_peer_close() {
@@ -401,6 +497,26 @@ mod tests {
         close_ws(&mut sender, &mut receiver).await;
 
         assert!(matches!(receiver.next().await, Some(Err("must remain unread"))));
+    }
+
+    #[tokio::test]
+    async fn close_ws_returns_without_reading_when_close_send_fails() {
+        let mut sender = CloseErrorSink;
+        let mut receiver = stream::iter([Ok::<_, &'static str>(Message::Close(None))]);
+
+        close_ws(&mut sender, &mut receiver).await;
+
+        assert!(matches!(receiver.next().await, Some(Ok(Message::Close(None)))));
+    }
+
+    #[tokio::test]
+    async fn close_ws_stops_reading_after_receive_error() {
+        let mut sender = sink::drain();
+        let mut receiver = stream::iter([Err::<Message, _>("receive failed"), Ok(Message::Close(None))]);
+
+        close_ws(&mut sender, &mut receiver).await;
+
+        assert!(matches!(receiver.next().await, Some(Ok(Message::Close(None)))));
     }
 
     #[tokio::test]
