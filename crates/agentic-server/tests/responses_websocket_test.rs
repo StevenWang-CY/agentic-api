@@ -1302,6 +1302,25 @@ async fn test_websocket_shutdown_drains_active_response_before_closing() {
         }),
     )
     .await;
+    let barrier = Bytes::from_static(b"shutdown-request-received");
+    ws.send(Message::Ping(barrier.clone())).await.unwrap();
+    loop {
+        let message = tokio::time::timeout(std::time::Duration::from_secs(2), ws.next())
+            .await
+            .expect("timed out waiting for shutdown barrier pong")
+            .expect("websocket should yield a message")
+            .expect("websocket message should be ok");
+        match message {
+            Message::Pong(payload) => {
+                assert_eq!(payload, barrier);
+                break;
+            }
+            Message::Ping(_) | Message::Frame(_) => {}
+            Message::Text(text) => panic!("unexpected response before upstream release: {text}"),
+            Message::Close(frame) => panic!("websocket closed before upstream release: {frame:?}"),
+            Message::Binary(_) => panic!("unexpected binary websocket message"),
+        }
+    }
     release.send(()).unwrap();
 
     let events = recv_until_completed(&mut ws).await;

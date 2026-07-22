@@ -7,7 +7,7 @@ use axum::http::HeaderMap;
 use axum::response::Response;
 use either::Either;
 use futures::stream::{SplitSink, SplitStream};
-use futures::{SinkExt, Stream, StreamExt};
+use futures::{Sink, SinkExt, Stream, StreamExt};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
@@ -100,10 +100,32 @@ async fn responses_ws_loop(socket: WebSocket, state: AppState, headers: HeaderMa
             }
         }
     }
-    if let Err(error) = sender.close().await {
-        debug!(%error, "failed to close responses websocket cleanly");
-    }
+    close_ws(&mut sender, &mut receiver).await;
     debug!("responses websocket session closed");
+}
+
+async fn close_ws<Sender, Receiver, SendError, ReceiveError>(sender: &mut Sender, receiver: &mut Receiver)
+where
+    Sender: Sink<Message, Error = SendError> + Unpin,
+    Receiver: Stream<Item = Result<Message, ReceiveError>> + Unpin,
+    SendError: std::fmt::Display,
+    ReceiveError: std::fmt::Display,
+{
+    if let Err(error) = sender.close().await {
+        debug!(%error, "failed to send responses websocket close frame");
+        return;
+    }
+
+    while let Some(message) = receiver.next().await {
+        match message {
+            Ok(Message::Close(_)) => break,
+            Ok(Message::Text(_) | Message::Binary(_) | Message::Ping(_) | Message::Pong(_)) => {}
+            Err(error) => {
+                debug!(%error, "responses websocket close handshake receive failed");
+                break;
+            }
+        }
+    }
 }
 
 /// Process one `response.create` message.
@@ -361,9 +383,25 @@ async fn send_ws_json(sender: &mut WsSender, value: Value) -> Result<(), WsError
 
 #[cfg(test)]
 mod tests {
-    use futures::stream;
+    use axum::extract::ws::Message;
+    use futures::{StreamExt, sink, stream};
 
-    use super::{ShutdownInput, next_shutdown_input};
+    use super::{ShutdownInput, close_ws, next_shutdown_input};
+
+    #[tokio::test]
+    async fn close_ws_ignores_late_frames_until_peer_close() {
+        let mut sender = sink::drain();
+        let mut receiver = stream::iter([
+            Ok::<_, &'static str>(Message::Text("late request".into())),
+            Ok(Message::Binary(vec![1].into())),
+            Ok(Message::Close(None)),
+            Err("must remain unread"),
+        ]);
+
+        close_ws(&mut sender, &mut receiver).await;
+
+        assert!(matches!(receiver.next().await, Some(Err("must remain unread"))));
+    }
 
     #[tokio::test]
     async fn shutdown_input_priority_alternates_when_both_streams_are_ready() {
