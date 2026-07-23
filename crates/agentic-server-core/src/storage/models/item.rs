@@ -1,12 +1,16 @@
 //! Conversation history item stored in the database.
 
 use serde_json::Value;
+use std::fmt::Write;
 use tracing::warn;
 
 use super::super::pool::{DbPool, DbResult, DbTransaction};
 use super::super::types::item::{InOutItem, ItemKind, STORED_ITEM_KIND_KEY};
 use crate::types::io::{InputItem, OutputItem};
 use crate::utils::common::{deserialize_from_str_opt, utcnow_str};
+
+const ITEM_COLUMN_COUNT: usize = 5;
+const SEQUENCE_COLUMN_INDEX: usize = 4;
 
 /// Conversation history item stored in the database.
 ///
@@ -88,6 +92,32 @@ impl Item {
     }
 }
 
+fn item_values_clause(row_count: usize, first_bind_index: usize, sequence_from_cte: bool) -> String {
+    let mut clause = String::new();
+    let mut bind_index = first_bind_index;
+
+    for row_index in 0..row_count {
+        if row_index > 0 {
+            clause.push_str(", ");
+        }
+        clause.push('(');
+        for column_index in 0..ITEM_COLUMN_COUNT {
+            if column_index > 0 {
+                clause.push_str(", ");
+            }
+            if sequence_from_cte && column_index == SEQUENCE_COLUMN_INDEX {
+                write!(clause, "(SELECT start + ${bind_index} FROM next_seq)").expect("writing to String cannot fail");
+            } else {
+                write!(clause, "${bind_index}").expect("writing to String cannot fail");
+            }
+            bind_index += 1;
+        }
+        clause.push(')');
+    }
+
+    clause
+}
+
 /// Create items in a transaction with optional conversation context.
 ///
 /// If `conversation_id` is provided, the next sequence range is computed in the insert statement so
@@ -109,8 +139,7 @@ pub async fn create_in_tx(
     }
 
     let now = utcnow_str();
-    let placeholders: Vec<&str> = vec!["(?, ?, ?, ?, ?)"; items.len()];
-    let values_clause = placeholders.join(", ");
+    let values_clause = item_values_clause(items.len(), 1, false);
     let sql =
         format!("INSERT INTO items (id, data, created_at, conversation_id, seq) VALUES {values_clause} RETURNING *");
 
@@ -128,13 +157,12 @@ async fn create_in_tx_with_next_conversation_seq(
     conversation_id: &str,
 ) -> DbResult<Vec<Item>> {
     let now = utcnow_str();
-    let placeholders: Vec<&str> = vec!["(?, ?, ?, ?, (SELECT start + ? FROM next_seq))"; items.len()];
-    let values_clause = placeholders.join(", ");
+    let values_clause = item_values_clause(items.len(), 2, true);
     let sql = format!(
         "WITH next_seq AS ( \
              SELECT COALESCE(MAX(seq), -1) + 1 AS start \
              FROM items \
-             WHERE conversation_id = ? \
+             WHERE conversation_id = $1 \
          ) \
          INSERT INTO items (id, data, created_at, conversation_id, seq) \
          VALUES {values_clause} \
@@ -163,7 +191,10 @@ pub async fn get_items(pool: &DbPool, ids: &[String]) -> DbResult<Vec<Item>> {
     if ids.is_empty() {
         return Ok(vec![]);
     }
-    let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+    let placeholders = (1..=ids.len())
+        .map(|index| format!("${index}"))
+        .collect::<Vec<_>>()
+        .join(", ");
     let sql = format!("SELECT * FROM items WHERE id IN ({placeholders})");
     let mut q = sqlx::query_as::<_, Item>(&sql);
     for id in ids {
@@ -177,7 +208,7 @@ pub async fn get_items(pool: &DbPool, ids: &[String]) -> DbResult<Vec<Item>> {
 /// # Errors
 /// Returns `DbResult::Err` if the database query fails.
 pub async fn get_items_by_conversation(pool: &DbPool, conversation_id: &str) -> DbResult<Vec<Item>> {
-    sqlx::query_as::<_, Item>("SELECT * FROM items WHERE conversation_id = ? ORDER BY seq ASC")
+    sqlx::query_as::<_, Item>("SELECT * FROM items WHERE conversation_id = $1 ORDER BY seq ASC")
         .bind(conversation_id)
         .fetch_all(pool)
         .await
@@ -188,6 +219,23 @@ mod tests {
     use super::*;
     use crate::types::event::MessageStatus;
     use crate::types::io::{InputItem, OutputItem, ReasoningOutput, ReasoningTextContent};
+
+    #[test]
+    fn item_values_clause_numbers_plain_rows() {
+        assert_eq!(
+            item_values_clause(2, 1, false),
+            "($1, $2, $3, $4, $5), ($6, $7, $8, $9, $10)"
+        );
+    }
+
+    #[test]
+    fn item_values_clause_numbers_conversation_rows_after_cte_bind() {
+        assert_eq!(
+            item_values_clause(2, 2, true),
+            "($2, $3, $4, $5, (SELECT start + $6 FROM next_seq)), \
+             ($7, $8, $9, $10, (SELECT start + $11 FROM next_seq))"
+        );
+    }
 
     #[test]
     fn test_item_basic() {

@@ -5,7 +5,7 @@ use std::{sync::Arc, time::Duration};
 use sqlx::AnyConnection;
 use sqlx::any::AnyPoolOptions;
 
-use crate::config::SqliteConfig;
+use crate::config::{PostgresConfig, SqliteConfig};
 
 const SQLITE_MEMORY_MAX_CONNECTIONS: u32 = 1;
 const DEFAULT_MAX_CONNECTIONS: u32 = 10;
@@ -86,6 +86,29 @@ fn sqlite_max_connections(url: &str, config: SqliteConfig) -> u32 {
     }
 }
 
+fn is_postgres_url(url: &str) -> bool {
+    url.starts_with("postgres://") || url.starts_with("postgresql://")
+}
+
+fn pool_options(url: &str, sqlite_config: SqliteConfig, postgres_config: PostgresConfig) -> AnyPoolOptions {
+    if url.starts_with("sqlite") {
+        return AnyPoolOptions::new()
+            .max_connections(sqlite_max_connections(url, sqlite_config))
+            .after_connect(move |conn, _meta| Box::pin(configure_sqlite_connection(conn, sqlite_config)));
+    }
+
+    if is_postgres_url(url) {
+        return AnyPoolOptions::new()
+            .max_connections(postgres_config.max_connections)
+            .acquire_timeout(postgres_config.acquire_timeout)
+            .idle_timeout(postgres_config.idle_timeout)
+            .max_lifetime(postgres_config.max_lifetime)
+            .after_connect(move |conn, _meta| Box::pin(configure_postgres_connection(conn, postgres_config)));
+    }
+
+    AnyPoolOptions::new().max_connections(DEFAULT_MAX_CONNECTIONS)
+}
+
 async fn configure_sqlite_connection(conn: &mut AnyConnection, config: SqliteConfig) -> DbResult<()> {
     sqlx::query(&format!("PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}"))
         .execute(&mut *conn)
@@ -105,6 +128,20 @@ async fn configure_sqlite_connection(conn: &mut AnyConnection, config: SqliteCon
     sqlx::query("PRAGMA foreign_keys = ON").execute(&mut *conn).await?;
     sqlx::query("PRAGMA synchronous = NORMAL").execute(&mut *conn).await?;
 
+    Ok(())
+}
+
+async fn configure_postgres_connection(conn: &mut AnyConnection, config: PostgresConfig) -> DbResult<()> {
+    let lock_timeout_ms = format!("{}ms", config.lock_timeout.as_millis());
+    sqlx::query("SELECT set_config('lock_timeout', $1, false)")
+        .bind(lock_timeout_ms)
+        .execute(&mut *conn)
+        .await?;
+    let statement_timeout_ms = format!("{}ms", config.statement_timeout.as_millis());
+    sqlx::query("SELECT set_config('statement_timeout', $1, false)")
+        .bind(statement_timeout_ms)
+        .execute(conn)
+        .await?;
     Ok(())
 }
 
@@ -174,21 +211,26 @@ pub async fn create_pool_with_sqlite_config(
     db_url: Option<&str>,
     sqlite_config: SqliteConfig,
 ) -> DbResult<Arc<DbPool>> {
+    create_pool_with_configs(db_url, sqlite_config, PostgresConfig::default()).await
+}
+
+/// Creates a connection pool with explicit database-specific tuning.
+///
+/// # Errors
+///
+/// Returns [`sqlx::Error`] if pool creation or connection initialization fails.
+pub async fn create_pool_with_configs(
+    db_url: Option<&str>,
+    sqlite_config: SqliteConfig,
+    postgres_config: PostgresConfig,
+) -> DbResult<Arc<DbPool>> {
     // Install default drivers for auto-detection
     sqlx::any::install_default_drivers();
 
     // Prepare URL with database-specific parameters
     let url = prepare_db_url(db_url);
 
-    let max_connections = if url.starts_with("sqlite") {
-        sqlite_max_connections(&url, sqlite_config)
-    } else {
-        DEFAULT_MAX_CONNECTIONS
-    };
-    let mut options = AnyPoolOptions::new().max_connections(max_connections);
-    if url.starts_with("sqlite") {
-        options = options.after_connect(move |conn, _meta| Box::pin(configure_sqlite_connection(conn, sqlite_config)));
-    }
+    let options = pool_options(&url, sqlite_config, postgres_config);
     let pool = options.connect(&url).await?;
     if sqlite_should_enable_wal(&url) {
         enable_sqlite_wal(&pool).await?;
@@ -222,10 +264,23 @@ pub async fn create_pool_with_schema_and_sqlite_config(
     db_url: Option<&str>,
     sqlite_config: SqliteConfig,
 ) -> DbResult<Arc<DbPool>> {
+    create_pool_with_schema_and_configs(db_url, sqlite_config, PostgresConfig::default()).await
+}
+
+/// Creates a connection pool with explicit database-specific tuning and initializes the database schema.
+///
+/// # Errors
+///
+/// Returns error if pool creation or schema initialization fails.
+pub async fn create_pool_with_schema_and_configs(
+    db_url: Option<&str>,
+    sqlite_config: SqliteConfig,
+    postgres_config: PostgresConfig,
+) -> DbResult<Arc<DbPool>> {
     use crate::storage::PoolWithSchema;
 
-    let pool = create_pool_with_sqlite_config(db_url, sqlite_config).await?;
-    let pool_with_schema = PoolWithSchema::new(pool);
+    let pool = create_pool_with_configs(db_url, sqlite_config, postgres_config).await?;
+    let pool_with_schema = PoolWithSchema::with_postgres_migration_timeout(pool, postgres_config.migration_timeout);
     pool_with_schema.ensure_schema_ready().await?;
 
     Ok(pool_with_schema.pool().clone())
@@ -236,7 +291,7 @@ mod tests {
     use super::*;
     use crate::config::{
         DEFAULT_SQLITE_JOURNAL_SIZE_LIMIT_BYTES, DEFAULT_SQLITE_MAX_CONNECTIONS, DEFAULT_SQLITE_MMAP_SIZE_BYTES,
-        SqliteTempStore,
+        PostgresConfig, SqliteTempStore,
     };
     use sqlx::Connection;
 
@@ -307,6 +362,30 @@ mod tests {
         let url = "postgresql://user:pass@localhost/db";
         let prepared = prepare_db_url(Some(url));
         assert_eq!(prepared, "postgresql://user:pass@localhost/db");
+    }
+
+    #[test]
+    fn test_postgres_pool_options_use_explicit_config() {
+        let postgres_config = PostgresConfig {
+            max_connections: 7,
+            acquire_timeout: Duration::from_secs(11),
+            lock_timeout: Duration::from_secs(13),
+            migration_timeout: Duration::from_secs(17),
+            statement_timeout: Duration::from_secs(23),
+            idle_timeout: None,
+            max_lifetime: Some(Duration::from_secs(19)),
+        };
+
+        let options = pool_options(
+            "postgresql://user:pass@localhost/db",
+            SqliteConfig::default(),
+            postgres_config,
+        );
+
+        assert_eq!(options.get_max_connections(), 7);
+        assert_eq!(options.get_acquire_timeout(), Duration::from_secs(11));
+        assert_eq!(options.get_idle_timeout(), None);
+        assert_eq!(options.get_max_lifetime(), Some(Duration::from_secs(19)));
     }
 
     #[test]

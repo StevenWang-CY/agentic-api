@@ -113,6 +113,7 @@ impl ConversationStore {
 
         let mut tx = pool.begin().await?;
 
+        conversation::lock_in_tx(&mut tx, conversation_id).await?;
         item::create_in_tx(&mut tx, items_, Some(conversation_id)).await?;
 
         response::create_in_tx(

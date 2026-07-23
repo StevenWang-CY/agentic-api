@@ -10,7 +10,7 @@ use std::sync::Arc;
 use async_stream::stream;
 use either::Either;
 use tokio::sync::mpsc;
-use tracing::{debug, warn};
+use tracing::debug;
 
 use super::compaction::maybe_compact_context;
 use super::gateway::{
@@ -336,9 +336,7 @@ async fn run_blocking(
 
     let ch = exec_ctx.conv_handler.clone();
     let rh = exec_ctx.resp_handler.clone();
-    if let Err(e) = persist_if_needed(payload.clone(), ctx, ch, rh).await {
-        warn!("persist failed: {e}");
-    }
+    persist_if_needed(payload.clone(), ctx, ch, rh).await?;
 
     Ok(payload)
 }
@@ -393,12 +391,11 @@ fn run_stream(ctx: RequestContext, exec_ctx: Arc<ExecutionContext>, auth: Option
                             let terminal_chunk = stream_accumulator.terminal_response_chunk(&payload);
                             let ch = exec_ctx.conv_handler.clone();
                             let rh = exec_ctx.resp_handler.clone();
-                            if let Err(e) = persist_if_needed(payload, ctx, ch, rh).await {
-                                warn!("persist failed: {e}");
-                            }
-
-                            match terminal_chunk {
-                                Ok(chunk) => yield chunk,
+                            match persist_if_needed(payload, ctx, ch, rh).await {
+                                Ok(()) => match terminal_chunk {
+                                    Ok(chunk) => yield chunk,
+                                    Err(e) => yield stream_accumulator.error_chunk(&e.to_string()),
+                                },
                                 Err(e) => yield stream_accumulator.error_chunk(&e.to_string()),
                             }
                             yield DONE_MARKER.to_string();
