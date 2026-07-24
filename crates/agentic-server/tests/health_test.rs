@@ -4,7 +4,13 @@ use std::sync::Arc;
 
 use agentic_core::config::Config;
 use agentic_core::executor::ExecutionContext;
+use axum::Router;
+use axum::http::HeaderMap;
+use axum::response::IntoResponse;
+use axum::routing::get;
 use common::{spawn_gateway, spawn_mock_llm, test_config, test_state};
+use http::StatusCode;
+use tokio::net::TcpListener;
 
 fn test_config_no_key(llm_url: &str) -> Config {
     Config {
@@ -73,4 +79,44 @@ async fn test_ready_returns_503_when_database_pool_is_exhausted() {
 
     assert_eq!(resp.status(), 503);
     drop(held_connection);
+}
+
+#[tokio::test]
+async fn test_ready_skips_upstream_when_configured() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dead_addr = listener.local_addr().unwrap();
+    drop(listener);
+    let config = Config {
+        skip_llm_ready_check: true,
+        ..test_config_no_key(&format!("http://{dead_addr}"))
+    };
+    let (gw_url, _gateway) = spawn_gateway(test_state(&config)).await;
+
+    let resp = reqwest::get(format!("{gw_url}/ready")).await.unwrap();
+
+    assert_eq!(resp.status(), 200);
+}
+
+#[tokio::test]
+async fn test_ready_authenticates_upstream_health_check() {
+    let app = Router::new().route(
+        "/health",
+        get(|headers: HeaderMap| async move {
+            if headers.get("authorization").and_then(|value| value.to_str().ok()) == Some("Bearer test-key") {
+                StatusCode::OK.into_response()
+            } else {
+                StatusCode::UNAUTHORIZED.into_response()
+            }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let upstream = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let (gw_url, gateway) = spawn_gateway(test_state(&test_config(&format!("http://{addr}")))).await;
+    let resp = reqwest::get(format!("{gw_url}/ready")).await.unwrap();
+
+    assert_eq!(resp.status(), 200);
+    upstream.abort();
+    gateway.abort();
 }

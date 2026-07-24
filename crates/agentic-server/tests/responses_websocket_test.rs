@@ -308,6 +308,7 @@ async fn storage_backed_state_with_web_search(llm_url: &str, web_search_base_url
         shutdown_token: CancellationToken::new(),
         websocket_tracker: WebSocketTracker::default(),
         llm_api_base: config.llm_api_base,
+        skip_llm_ready_check: config.skip_llm_ready_check,
         openai_api_key: config.openai_api_key,
     };
     StorageBackedState { state, pool, _db: db }

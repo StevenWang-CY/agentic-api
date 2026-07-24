@@ -179,3 +179,6 @@ spec:
 ```
 
 Mount writable storage at `/var/lib/agentic-api` only when using SQLite. PostgreSQL deployments do not need a persistent filesystem for the gateway.
+
+For a replicated PostgreSQL deployment, use the
+[Kubernetes manifests and operational guide](kubernetes.md).

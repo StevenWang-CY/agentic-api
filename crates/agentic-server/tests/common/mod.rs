@@ -41,6 +41,7 @@ pub fn test_state(config: &Config) -> AppState {
         shutdown_token: CancellationToken::new(),
         websocket_tracker: WebSocketTracker::default(),
         llm_api_base: config.llm_api_base.clone(),
+        skip_llm_ready_check: config.skip_llm_ready_check,
         openai_api_key: config.openai_api_key.clone(),
     }
 }

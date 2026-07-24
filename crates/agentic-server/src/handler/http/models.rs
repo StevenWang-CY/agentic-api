@@ -105,32 +105,54 @@ pub async fn health() -> impl IntoResponse {
     StatusCode::OK
 }
 
-pub async fn ready(State(state): State<AppState>) -> impl IntoResponse {
-    if !state.exec_ctx.storage_ready(std::time::Duration::from_secs(1)).await {
-        warn!("database persistence not ready");
-        return StatusCode::SERVICE_UNAVAILABLE;
-    }
-
+async fn upstream_is_ready(state: &AppState) -> bool {
     let base = state.llm_api_base.trim_end_matches('/');
     let url = format!("{base}/health");
 
-    match state
-        .exec_ctx
-        .client
-        .get(&url)
-        .timeout(std::time::Duration::from_secs(2))
-        .send()
-        .await
+    let mut request = state.exec_ctx.client.get(&url);
+    if let Some(key) = state
+        .openai_api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
     {
-        Ok(resp) if resp.status().is_success() => StatusCode::OK,
-        Ok(resp) => {
+        request = request.bearer_auth(key);
+    }
+
+    match tokio::time::timeout(std::time::Duration::from_secs(2), request.send()).await {
+        Ok(Ok(resp)) if resp.status().is_success() => true,
+        Ok(Ok(resp)) => {
             warn!("LLM backend not ready: {}", resp.status());
-            StatusCode::SERVICE_UNAVAILABLE
+            false
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             warn!("LLM backend unreachable: {e}");
-            StatusCode::SERVICE_UNAVAILABLE
+            false
         }
+        Err(_) => {
+            warn!("LLM backend readiness check timed out");
+            false
+        }
+    }
+}
+
+async fn configured_upstream_is_ready(state: &AppState) -> bool {
+    state.skip_llm_ready_check || upstream_is_ready(state).await
+}
+
+pub async fn ready(State(state): State<AppState>) -> impl IntoResponse {
+    let (storage_ready, upstream_ready) = tokio::join!(
+        state.exec_ctx.storage_ready(std::time::Duration::from_secs(1)),
+        configured_upstream_is_ready(&state)
+    );
+    if !storage_ready {
+        warn!("database persistence not ready");
+    }
+
+    if storage_ready && upstream_ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
     }
 }
 

@@ -161,6 +161,8 @@ pub struct AppState {
     pub websocket_tracker: WebSocketTracker,
     /// vLLM base URL — used by the `/ready` health probe.
     pub llm_api_base: String,
+    /// Whether `/ready` should omit the upstream health check.
+    pub skip_llm_ready_check: bool,
     /// Server-configured API key; used as fallback when the request carries no
     /// `Authorization` header on the executor path.
     pub openai_api_key: Option<String>,
