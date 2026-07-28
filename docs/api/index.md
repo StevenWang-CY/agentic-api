@@ -1,5 +1,45 @@
 # API Reference
 
+## Authentication
+
+Inbound authentication is optional. When the gateway starts with both `OIDC_ISSUER` and `OIDC_AUDIENCE`, every
+`/v1/*` HTTP route and the `/v1/responses` WebSocket upgrade require an OIDC `Authorization: Bearer <token>`.
+`/health` and `/ready` remain public. Supplying only one OIDC setting is a startup error.
+
+The gateway validates the token signature, issuer, audience, authorized party for multi-audience tokens, subject,
+expiration, and not-before time. It consumes the identity token at the gateway boundary instead of forwarding it to
+the inference service. WebSocket sessions reject new `response.create` messages after the validated token expires.
+
+Missing or rejected credentials return `401 Unauthorized` with `WWW-Authenticate: Bearer`. OpenAI-compatible routes
+use this envelope:
+
+```json
+{
+  "error": {
+    "message": "invalid bearer token",
+    "type": "authentication_error",
+    "param": null,
+    "code": "invalid_token"
+  }
+}
+```
+
+`/v1/messages` and `/v1/messages/count_tokens` use the Anthropic-compatible envelope:
+
+```json
+{
+  "type": "error",
+  "error": {
+    "type": "authentication_error",
+    "message": "invalid bearer token"
+  }
+}
+```
+
+A JWKS refresh failure returns `503 Service Unavailable`, without `WWW-Authenticate`, so clients can distinguish an
+identity-provider dependency failure from rejected credentials. See
+[OIDC bearer authentication](../design/oidc-bearer-authentication.md) for configuration and key-cache behavior.
+
 ## Responses
 
 ### `POST /v1/responses`

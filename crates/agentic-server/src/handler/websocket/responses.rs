@@ -1,8 +1,8 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::{Extension, State};
 use axum::http::HeaderMap;
 use axum::response::Response;
 use either::Either;
@@ -20,21 +20,45 @@ use agentic_core::utils::common::utcnow_str;
 use super::super::common::{MAX_BODY_SIZE, extract_bearer};
 use super::error::WsError;
 use crate::app::AppState;
+use crate::auth::AuthenticatedPrincipal;
 
 type WsSender = SplitSink<WebSocket, Message>;
 type WsReceiver = SplitStream<WebSocket>;
 
 pub async fn responses_ws(State(state): State<AppState>, headers: HeaderMap, ws: WebSocketUpgrade) -> Response {
+    upgrade_responses_ws(state, headers, ws, None)
+}
+
+pub(crate) async fn responses_ws_with_auth(
+    State(state): State<AppState>,
+    principal: Option<Extension<AuthenticatedPrincipal>>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Response {
+    upgrade_responses_ws(state, headers, ws, principal.map(|Extension(principal)| principal))
+}
+
+fn upgrade_responses_ws(
+    state: AppState,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+    principal: Option<AuthenticatedPrincipal>,
+) -> Response {
     let websocket_guard = state.websocket_tracker.track();
     ws.max_message_size(MAX_BODY_SIZE)
         .max_frame_size(MAX_BODY_SIZE)
         .on_upgrade(move |socket| async move {
             let _websocket_guard = websocket_guard;
-            responses_ws_loop(socket, state, headers).await;
+            responses_ws_loop(socket, state, headers, principal).await;
         })
 }
 
-async fn responses_ws_loop(socket: WebSocket, state: AppState, headers: HeaderMap) {
+async fn responses_ws_loop(
+    socket: WebSocket,
+    state: AppState,
+    headers: HeaderMap,
+    principal: Option<AuthenticatedPrincipal>,
+) {
     debug!("responses websocket session opened");
     let shutdown_token = state.shutdown_token.clone();
     let (mut sender, mut receiver) = socket.split();
@@ -78,6 +102,11 @@ async fn responses_ws_loop(socket: WebSocket, state: AppState, headers: HeaderMa
             }
         };
 
+        if let Some(error) = websocket_identity_error(principal.as_ref()) {
+            let _ = send_ws_error(&mut sender, &error).await;
+            break;
+        }
+
         match handle_ws_text(
             &mut sender,
             &mut receiver,
@@ -99,6 +128,12 @@ async fn responses_ws_loop(socket: WebSocket, state: AppState, headers: HeaderMa
     }
     close_ws(&mut sender, &mut receiver).await;
     debug!("responses websocket session closed");
+}
+
+fn websocket_identity_error(principal: Option<&AuthenticatedPrincipal>) -> Option<WsError> {
+    principal
+        .is_some_and(AuthenticatedPrincipal::is_expired)
+        .then_some(WsError::AuthenticationExpired)
 }
 
 async fn next_ws_message<Receiver>(
@@ -415,7 +450,10 @@ mod tests {
     use futures::{Sink, Stream, StreamExt, sink, stream};
     use tokio_util::sync::CancellationToken;
 
-    use super::{ShutdownInput, close_ws, keep_if_running, next_shutdown_input, next_ws_message};
+    use super::{
+        ShutdownInput, close_ws, keep_if_running, next_shutdown_input, next_ws_message, websocket_identity_error,
+    };
+    use crate::auth::AuthenticatedPrincipal;
 
     struct CloseErrorSink;
 
@@ -482,6 +520,17 @@ mod tests {
         shutdown_token.cancel();
 
         assert_eq!(keep_if_running(&shutdown_token, "unpolled stream"), None);
+    }
+
+    #[test]
+    fn websocket_identity_expiry_selects_the_unauthorized_error_event() {
+        assert!(websocket_identity_error(None).is_none());
+        let error =
+            websocket_identity_error(Some(&AuthenticatedPrincipal::expired_for_test())).expect("expired-token error");
+        let frame = error.to_ws_frame().expect("client-visible error frame");
+
+        assert_eq!(frame["status"], 401);
+        assert_eq!(frame["error"]["code"], "invalid_token");
     }
 
     #[tokio::test]
