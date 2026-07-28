@@ -214,7 +214,7 @@ async fn test_store_false_proxies_sse_to_vllm() {
 }
 
 #[tokio::test]
-async fn test_store_true_returns_error_when_persistence_fails() {
+async fn test_store_true_hides_internal_persistence_error_details() {
     // Arrange — mock vLLM returns 200, but the executor cannot persist into the disabled test store.
     let (llm_url, _h1) = spawn_mock_vllm_json().await;
     let (gw_url, _h2) = spawn_gateway(test_state(&test_config(&llm_url))).await;
@@ -230,11 +230,12 @@ async fn test_store_true_returns_error_when_persistence_fails() {
     // Assert — a stored request never reports success without durable state.
     assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     let body = resp.text().await.unwrap();
-    assert!(body.contains("storage"), "{body}");
+    assert!(body.contains("failed to persist response"), "{body}");
+    assert!(!body.contains("storage not configured or disabled"), "{body}");
 }
 
 #[tokio::test]
-async fn test_streaming_store_true_emits_error_without_completed_event_when_persistence_fails() {
+async fn test_streaming_store_true_hides_persistence_details_without_sequence_gap() {
     let (llm_url, _h1) = spawn_mock_vllm_sse().await;
     let (gw_url, _h2) = spawn_gateway(test_state(&test_config(&llm_url))).await;
 
@@ -253,7 +254,9 @@ async fn test_streaming_store_true_emits_error_without_completed_event_when_pers
     assert_eq!(resp.status(), StatusCode::OK);
     let body = resp.text().await.unwrap();
     assert!(body.contains("\"type\":\"error\""), "{body}");
-    assert!(body.contains("storage not configured or disabled"), "{body}");
+    assert!(body.contains("failed to persist response"), "{body}");
+    assert!(!body.contains("storage not configured or disabled"), "{body}");
+    assert!(body.contains("\"sequence_number\":0"), "{body}");
     assert!(body.contains("data: [DONE]"), "{body}");
     assert!(!body.contains("\"type\":\"response.completed\""), "{body}");
 }

@@ -75,9 +75,9 @@ The first PostgreSQL startup on this release widens timestamp and sequence colum
 
 Drain replicas running an older release before enabling writes through this release. Older replicas do not take the per-conversation row lock and can allocate duplicate sequence numbers if they write alongside upgraded replicas.
 
-Stored requests now fail if their response or conversation state cannot be persisted. For streaming requests, the gateway sends an error event instead of `response.completed`. This prevents clients from receiving a response ID that cannot be continued after a lock timeout or other database failure.
+Stored requests now fail if their response or conversation state cannot be persisted. For streaming requests, the gateway sends an error event instead of `response.completed`. Client responses use the generic message `failed to persist response`; the underlying database error is written only to gateway logs. This prevents clients from receiving a response ID that cannot be continued after a lock timeout or other database failure without exposing database schema or constraint details.
 
-`AGENTIC_API_SCHEMA_READY` keeps schema changes under supervisor control. Startup performs a read-only compatibility check and fails if the four persistence columns still need widening. Apply this upgrade with a DDL-capable migration role before starting the DML-only gateway role:
+`AGENTIC_API_SCHEMA_READY` keeps schema changes under supervisor control. Startup performs a read-only compatibility check and fails if required persistence tables or integer columns are missing, or if the four integer columns still need widening. Apply this upgrade with a DDL-capable migration role before starting the DML-only gateway role:
 
 ```sql
 ALTER TABLE conversations

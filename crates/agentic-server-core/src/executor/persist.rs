@@ -8,6 +8,7 @@ use crate::executor::modes::{ConversationHandler, ResponseHandler};
 use crate::executor::request::RequestContext;
 use crate::types::event::ResponseStatus;
 use crate::types::request_response::ResponsePayload;
+use tracing::error;
 
 #[must_use]
 pub(crate) fn should_persist(ctx: &RequestContext) -> bool {
@@ -23,7 +24,12 @@ pub(crate) async fn persist_if_needed(
     resp_handler: ResponseHandler,
 ) -> ExecutorResult<()> {
     if should_persist(&ctx) {
-        persist_response(payload, ctx, conv_handler, resp_handler).await
+        persist_response(payload, ctx, conv_handler, resp_handler)
+            .await
+            .map_err(|source| {
+                error!(error = ?source, "failed to persist response");
+                crate::executor::error::ExecutorError::Persistence(Box::new(source))
+            })
     } else {
         Ok(())
     }

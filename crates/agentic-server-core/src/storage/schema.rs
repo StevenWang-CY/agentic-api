@@ -14,6 +14,7 @@ use crate::config::DEFAULT_POSTGRES_MIGRATION_TIMEOUT_SECONDS;
 type DbResult<T> = Result<T, sqlx::Error>;
 
 const POSTGRES_SCHEMA_ADVISORY_LOCK: i64 = 7_194_963_546_799_751;
+const REQUIRED_POSTGRES_INTEGER_COLUMN_COUNT: i64 = 4;
 const POSTGRES_INTEGER_WIDENING_SQL: &str = "
     ALTER TABLE conversations
         ALTER COLUMN created_at TYPE BIGINT USING created_at::BIGINT;
@@ -46,7 +47,8 @@ async fn widen_postgres_integer_columns(connection: &mut sqlx::AnyConnection) ->
         .bind(POSTGRES_SCHEMA_ADVISORY_LOCK)
         .execute(&mut *transaction)
         .await?;
-    let narrow_column_count = postgres_narrow_integer_column_count(&mut *transaction).await?;
+    let (integer_column_count, narrow_column_count) = postgres_integer_column_compatibility(&mut *transaction).await?;
+    validate_required_postgres_integer_columns(integer_column_count)?;
     if narrow_column_count > 0 {
         sqlx::raw_sql(POSTGRES_INTEGER_WIDENING_SQL)
             .execute(&mut *transaction)
@@ -55,13 +57,14 @@ async fn widen_postgres_integer_columns(connection: &mut sqlx::AnyConnection) ->
     transaction.commit().await
 }
 
-async fn postgres_narrow_integer_column_count<'e, E>(executor: E) -> DbResult<i64>
+async fn postgres_integer_column_compatibility<'e, E>(executor: E) -> DbResult<(i64, i64)>
 where
     E: sqlx::Executor<'e, Database = sqlx::Any>,
 {
-    sqlx::query_scalar(
-        "SELECT COUNT(*) FROM information_schema.columns \
-         WHERE table_schema = current_schema() AND data_type <> 'bigint' \
+    sqlx::query_as(
+        "SELECT COUNT(*), COUNT(*) FILTER (WHERE data_type <> 'bigint') \
+         FROM information_schema.columns \
+         WHERE table_schema = current_schema() \
          AND ((table_name = 'conversations' AND column_name = 'created_at') \
            OR (table_name = 'items' AND column_name IN ('created_at', 'seq')) \
            OR (table_name = 'responses' AND column_name = 'created_at'))",
@@ -70,7 +73,17 @@ where
     .await
 }
 
-fn validate_supervisor_integer_width(narrow_column_count: i64) -> DbResult<()> {
+fn validate_required_postgres_integer_columns(integer_column_count: i64) -> DbResult<()> {
+    if integer_column_count == REQUIRED_POSTGRES_INTEGER_COLUMN_COUNT {
+        return Ok(());
+    }
+    Err(sqlx::Error::Configuration(
+        "database schema is missing required PostgreSQL tables or columns".into(),
+    ))
+}
+
+fn validate_supervisor_schema(integer_column_count: i64, narrow_column_count: i64) -> DbResult<()> {
+    validate_required_postgres_integer_columns(integer_column_count)?;
     if narrow_column_count == 0 {
         return Ok(());
     }
@@ -94,8 +107,10 @@ async fn verify_supervisor_managed_postgres_schema(
         let _ = connection.close().await;
         return Err(error);
     }
-    let compatibility_result = match postgres_narrow_integer_column_count(&mut *connection).await {
-        Ok(narrow_column_count) => validate_supervisor_integer_width(narrow_column_count),
+    let compatibility_result = match postgres_integer_column_compatibility(&mut *connection).await {
+        Ok((integer_column_count, narrow_column_count)) => {
+            validate_supervisor_schema(integer_column_count, narrow_column_count)
+        }
         Err(error) => Err(error),
     };
     let close_result = connection.close().await;
@@ -388,11 +403,12 @@ mod tests {
         .await
         .expect("seed response");
 
-        let narrow_column_count = postgres_narrow_integer_column_count(&mut *connection)
+        let (integer_column_count, narrow_column_count) = postgres_integer_column_compatibility(&mut *connection)
             .await
             .expect("inspect pre-upgrade PostgreSQL columns");
+        assert_eq!(integer_column_count, REQUIRED_POSTGRES_INTEGER_COLUMN_COUNT);
         assert_eq!(narrow_column_count, 4);
-        assert!(validate_supervisor_integer_width(narrow_column_count).is_err());
+        assert!(validate_supervisor_schema(integer_column_count, narrow_column_count).is_err());
 
         let supervisor_schema_name = schema.clone();
         let supervisor_pool = sqlx::any::AnyPoolOptions::new()
@@ -462,7 +478,7 @@ mod tests {
         .await
         .expect("inspect widened PostgreSQL columns");
         assert_eq!(bigint_columns, 4);
-        assert!(validate_supervisor_integer_width(4 - bigint_columns).is_ok());
+        assert!(validate_supervisor_schema(REQUIRED_POSTGRES_INTEGER_COLUMN_COUNT, 4 - bigint_columns).is_ok());
         let foreign_key_error =
             sqlx::query("INSERT INTO items (id, data, created_at, conversation_id) VALUES ($1, $2, $3, $4)")
                 .bind("item_invalid")
@@ -484,5 +500,55 @@ mod tests {
             .expect("drop isolated upgrade schema");
         drop(connection);
         pool.close().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_POSTGRES_URL pointing to an isolated PostgreSQL database"]
+    async fn supervisor_managed_postgres_schema_rejects_missing_tables() {
+        let database_url = std::env::var("TEST_POSTGRES_URL").expect("TEST_POSTGRES_URL must be set");
+        let administration_pool = crate::storage::pool::create_pool(Some(&database_url))
+            .await
+            .expect("create PostgreSQL administration pool");
+        let schema_name = format!("empty_{}", uuid::Uuid::now_v7().simple());
+        sqlx::query(&format!("CREATE SCHEMA {schema_name}"))
+            .execute(administration_pool.as_ref())
+            .await
+            .expect("create isolated empty schema");
+
+        let connection_schema_name = schema_name.clone();
+        let supervisor_pool = sqlx::any::AnyPoolOptions::new()
+            .max_connections(1)
+            .after_connect(move |connection, _metadata| {
+                let connection_schema_name = connection_schema_name.clone();
+                Box::pin(async move {
+                    sqlx::query("SELECT set_config('search_path', $1, false)")
+                        .bind(connection_schema_name)
+                        .execute(connection)
+                        .await?;
+                    Ok(())
+                })
+            })
+            .connect(&database_url)
+            .await
+            .expect("create supervisor-managed PostgreSQL pool");
+        let supervisor_schema =
+            PoolWithSchema::with_postgres_migration_timeout(Arc::new(supervisor_pool), Duration::from_secs(5));
+
+        let validation_result = supervisor_schema.ensure_schema_ready_with_marker(true).await;
+        supervisor_schema.pool.close().await;
+        sqlx::query(&format!("DROP SCHEMA {schema_name} CASCADE"))
+            .execute(administration_pool.as_ref())
+            .await
+            .expect("drop isolated empty schema");
+        administration_pool.close().await;
+
+        let error = validation_result.expect_err("empty supervisor-managed schema should fail validation");
+        assert!(
+            error
+                .to_string()
+                .contains("missing required PostgreSQL tables or columns"),
+            "{error}"
+        );
+        assert!(!supervisor_schema.schema_ready.load(Ordering::SeqCst));
     }
 }
