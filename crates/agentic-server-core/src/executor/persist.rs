@@ -3,7 +3,7 @@
 //! Writes the completed response and output items to storage, routing to the
 //! appropriate handler based on whether the turn belongs to a conversation.
 
-use crate::executor::error::ExecutorResult;
+use crate::executor::error::{ExecutorError, ExecutorResult};
 use crate::executor::modes::{ConversationHandler, ResponseHandler};
 use crate::executor::request::RequestContext;
 use crate::types::event::ResponseStatus;
@@ -28,7 +28,7 @@ pub(crate) async fn persist_if_needed(
             .await
             .map_err(|source| {
                 error!(error = ?source, "failed to persist response");
-                crate::executor::error::ExecutorError::Persistence(Box::new(source))
+                ExecutorError::Persistence(Box::new(source))
             })
     } else {
         Ok(())

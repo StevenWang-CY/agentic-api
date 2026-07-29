@@ -87,8 +87,8 @@ jobs:
             cargo-postgres-${{ runner.os }}-
             cargo-${{ runner.os }}-
 
-      - name: Verify PostgreSQL upgrade preservation
-        run: cargo test -p agentic-server-core --lib postgres_integer_widening_upgrade_preserves_existing_state -- --ignored
+      - name: Verify PostgreSQL schema upgrades and validation
+        run: cargo test -p agentic-server-core --lib -- --ignored
 
       - name: Verify PostgreSQL migrations and restart persistence
         run: cargo test -p agentic-server-core --test postgres_storage_integration -- --ignored

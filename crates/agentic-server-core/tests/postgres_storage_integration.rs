@@ -8,7 +8,7 @@ use agentic_core::storage::{
 };
 use agentic_core::types::io::{InputItem, InputMessage, InputMessageContent};
 use tokio::sync::Barrier;
-use tokio::time::{sleep, timeout};
+use tokio::time::timeout;
 
 fn input_item(text: &str) -> InOutItem {
     InOutItem::Input(InputItem::Message(InputMessage {
@@ -384,7 +384,7 @@ async fn postgres_lock_wait_is_bounded_without_blocking_other_conversations() {
 
     let blocked_store = ConversationStore::new(second_pool.clone());
     let blocked_conversation_id = locked_conversation.conversation_id.clone();
-    let blocked_write = tokio::spawn(async move {
+    let mut blocked_write = tokio::spawn(async move {
         blocked_store
             .persist(
                 &blocked_conversation_id,
@@ -395,21 +395,26 @@ async fn postgres_lock_wait_is_bounded_without_blocking_other_conversations() {
             )
             .await
     });
-    sleep(Duration::from_millis(100)).await;
-
-    timeout(
-        Duration::from_millis(500),
-        ConversationStore::new(second_pool.clone()).persist(
-            &unrelated_conversation.conversation_id,
-            &format!("resp_postgres_{}", uuid::Uuid::now_v7()),
-            None,
-            vec![input_item("unrelated turn")],
-            &ResponseMetadata::default(),
-        ),
-    )
-    .await
-    .expect("unrelated conversation write should not wait for the held lock")
-    .expect("persist unrelated conversation turn");
+    let unrelated_store = ConversationStore::new(second_pool.clone());
+    let unrelated_response_id = format!("resp_postgres_{}", uuid::Uuid::now_v7());
+    let unrelated_metadata = ResponseMetadata::default();
+    let unrelated_write = unrelated_store.persist(
+        &unrelated_conversation.conversation_id,
+        &unrelated_response_id,
+        None,
+        vec![input_item("unrelated turn")],
+        &unrelated_metadata,
+    );
+    tokio::pin!(unrelated_write);
+    tokio::select! {
+        result = &mut unrelated_write => {
+            result.expect("persist unrelated conversation turn");
+        }
+        result = &mut blocked_write => {
+            let result = result.expect("join blocked write");
+            panic!("locked write completed before unrelated conversation write: {result:?}");
+        }
+    }
 
     let blocked_result = timeout(Duration::from_secs(2), blocked_write)
         .await

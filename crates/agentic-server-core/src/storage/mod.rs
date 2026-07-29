@@ -1,5 +1,8 @@
 //! Storage layer for persistence operations.
 
+// Database URL classification and sanitization
+pub mod backend;
+
 // Strong types for storage operations (newtype pattern)
 pub mod types;
 
@@ -19,6 +22,7 @@ pub mod response;
 pub mod conversation;
 
 // Re-export commonly used types for convenience
+pub use backend::DatabaseBackend;
 pub use conversation::ConversationStore;
 pub use models::Conversation as DbConversation;
 pub use models::Item;

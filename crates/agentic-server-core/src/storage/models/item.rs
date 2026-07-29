@@ -11,6 +11,8 @@ use crate::utils::common::{deserialize_from_str_opt, utcnow_str};
 
 const ITEM_COLUMN_COUNT: usize = 5;
 const SEQUENCE_COLUMN_INDEX: usize = 4;
+const MAX_BIND_PARAMETERS: usize = 999;
+const MAX_ITEMS_PER_INSERT: usize = MAX_BIND_PARAMETERS / ITEM_COLUMN_COUNT;
 
 /// Conversation history item stored in the database.
 ///
@@ -134,17 +136,29 @@ pub async fn create_in_tx(
         return Ok(Vec::new());
     }
 
-    if let Some(conversation_id) = conversation_id {
-        return create_in_tx_with_next_conversation_seq(tx, items, conversation_id).await;
+    let mut created = Vec::with_capacity(items.len());
+    for batch in items.chunks(MAX_ITEMS_PER_INSERT) {
+        let mut rows = if let Some(conversation_id) = conversation_id {
+            create_in_tx_with_next_conversation_seq(tx, batch, conversation_id).await?
+        } else {
+            create_in_tx_without_conversation(tx, batch).await?
+        };
+        created.append(&mut rows);
     }
+    Ok(created)
+}
 
+async fn create_in_tx_without_conversation(
+    tx: &mut DbTransaction<'_>,
+    items: &[(String, String)],
+) -> DbResult<Vec<Item>> {
     let now = utcnow_str();
     let values_clause = item_values_clause(items.len(), 1, false);
     let sql =
         format!("INSERT INTO items (id, data, created_at, conversation_id, seq) VALUES {values_clause} RETURNING *");
 
     let mut query = sqlx::query_as::<_, Item>(&sql);
-    for (id, data) in &items {
+    for (id, data) in items {
         query = query.bind(id).bind(data).bind(now).bind(None::<&str>).bind(None::<i64>);
     }
 
@@ -153,7 +167,7 @@ pub async fn create_in_tx(
 
 async fn create_in_tx_with_next_conversation_seq(
     tx: &mut DbTransaction<'_>,
-    items: Vec<(String, String)>,
+    items: &[(String, String)],
     conversation_id: &str,
 ) -> DbResult<Vec<Item>> {
     let now = utcnow_str();
@@ -191,16 +205,20 @@ pub async fn get_items(pool: &DbPool, ids: &[String]) -> DbResult<Vec<Item>> {
     if ids.is_empty() {
         return Ok(vec![]);
     }
-    let placeholders = (1..=ids.len())
-        .map(|index| format!("${index}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let sql = format!("SELECT * FROM items WHERE id IN ({placeholders})");
-    let mut q = sqlx::query_as::<_, Item>(&sql);
-    for id in ids {
-        q = q.bind(id);
+    let mut rows = Vec::with_capacity(ids.len());
+    for batch in ids.chunks(MAX_BIND_PARAMETERS) {
+        let placeholders = (1..=batch.len())
+            .map(|index| format!("${index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("SELECT * FROM items WHERE id IN ({placeholders})");
+        let mut query = sqlx::query_as::<_, Item>(&sql);
+        for id in batch {
+            query = query.bind(id);
+        }
+        rows.extend(query.fetch_all(pool).await?);
     }
-    q.fetch_all(pool).await
+    Ok(rows)
 }
 
 /// Get items by conversation ID ordered by sequence.
@@ -234,6 +252,65 @@ mod tests {
             item_values_clause(2, 2, true),
             "($2, $3, $4, $5, (SELECT start + $6 FROM next_seq)), \
              ($7, $8, $9, $10, (SELECT start + $11 FROM next_seq))"
+        );
+    }
+
+    #[tokio::test]
+    async fn item_queries_chunk_above_portable_bind_limit() {
+        let pool = crate::storage::create_pool_with_schema(Some("sqlite://?mode=memory"))
+            .await
+            .expect("create in-memory database");
+        let items = (0..=MAX_BIND_PARAMETERS)
+            .map(|index| (format!("item_{index}"), "{}".to_owned()))
+            .collect::<Vec<_>>();
+        let ids = items.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>();
+        let mut transaction = pool.begin().await.expect("begin transaction");
+        let created = create_in_tx(&mut transaction, items, None)
+            .await
+            .expect("insert item batches");
+        transaction.commit().await.expect("commit item batches");
+        let loaded = get_items(&pool, &ids).await.expect("load item batches");
+
+        assert_eq!(created.len(), MAX_BIND_PARAMETERS + 1);
+        assert_eq!(loaded.len(), MAX_BIND_PARAMETERS + 1);
+    }
+
+    #[tokio::test]
+    async fn conversation_item_batches_keep_contiguous_sequences() {
+        let pool = crate::storage::create_pool_with_schema(Some("sqlite://?mode=memory"))
+            .await
+            .expect("create in-memory database");
+        let conversation_id = "conv_batch";
+        crate::storage::models::conversation::create(&pool, conversation_id)
+            .await
+            .expect("create conversation");
+        let item_count = MAX_ITEMS_PER_INSERT + 1;
+        let items = (0..item_count)
+            .map(|index| (format!("conversation_item_{index}"), "{}".to_owned()))
+            .collect::<Vec<_>>();
+        let mut transaction = pool.begin().await.expect("begin transaction");
+        let created = create_in_tx(&mut transaction, items, Some(conversation_id))
+            .await
+            .expect("insert conversation item batches");
+        transaction.commit().await.expect("commit item batches");
+        let stored = get_items_by_conversation(&pool, conversation_id)
+            .await
+            .expect("load conversation item batches");
+        let expected_sequences = (0..i64::try_from(item_count).expect("item count fits in i64")).collect::<Vec<_>>();
+
+        assert_eq!(
+            created
+                .iter()
+                .map(|item| item.seq.expect("created sequence"))
+                .collect::<Vec<_>>(),
+            expected_sequences
+        );
+        assert_eq!(
+            stored
+                .iter()
+                .map(|item| item.seq.expect("stored sequence"))
+                .collect::<Vec<_>>(),
+            expected_sequences
         );
     }
 

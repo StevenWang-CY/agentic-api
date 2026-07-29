@@ -5,6 +5,7 @@ use std::{sync::Arc, time::Duration};
 use sqlx::AnyConnection;
 use sqlx::any::AnyPoolOptions;
 
+use super::backend::{DatabaseBackend, configure_postgres_timeouts};
 use crate::config::{PostgresConfig, SqliteConfig};
 
 const SQLITE_MEMORY_MAX_CONNECTIONS: u32 = 1;
@@ -26,20 +27,27 @@ pub type DbTransaction<'a> = sqlx::Transaction<'a, sqlx::Any>;
 /// All database queries return `DbResult<T>` which is `Result<T, sqlx::Error>`.
 pub type DbResult<T> = Result<T, sqlx::Error>;
 
-/// Prepares database URL with appropriate parameters.
+struct PreparedDatabaseUrl {
+    value: String,
+    backend: DatabaseBackend,
+}
+
+/// Parses and prepares a database URL with appropriate parameters.
 ///
 /// For `SQLite` connections, adds `?mode=rwc` if not already present.
 /// This enables write mode (`rwc` = read-write-create) for file-based databases.
 ///
-/// For other database types (`PostgreSQL`, `MySQL`), returns URL as-is.
+/// For other database types (`PostgreSQL`, `MySQL`), keeps the URL as-is.
 /// Defaults to `sqlite://./agentic_api.db` if no URL is provided.
-fn prepare_db_url(url: Option<&str>) -> String {
+fn prepare_db_url(url: Option<&str>) -> DbResult<PreparedDatabaseUrl> {
     let url = url.unwrap_or("sqlite://./agentic_api.db");
-    if !url.starts_with("sqlite") || has_query_param(url, "mode") {
-        url.to_string()
+    let backend = DatabaseBackend::from_url(url).map_err(|error| sqlx::Error::Configuration(Box::new(error)))?;
+    let value = if backend != DatabaseBackend::Sqlite || has_query_param(url, "mode") {
+        url.to_owned()
     } else {
         append_query_param(url, "mode=rwc")
-    }
+    };
+    Ok(PreparedDatabaseUrl { value, backend })
 }
 
 fn has_query_param(url: &str, param: &str) -> bool {
@@ -72,8 +80,8 @@ fn sqlite_is_memory_url(url: &str) -> bool {
     query_param_value(url, "mode").is_some_and(|mode| mode.eq_ignore_ascii_case("memory")) || url.contains(":memory:")
 }
 
-fn sqlite_should_enable_wal(url: &str) -> bool {
-    url.starts_with("sqlite")
+fn sqlite_should_enable_wal(url: &str, backend: DatabaseBackend) -> bool {
+    backend == DatabaseBackend::Sqlite
         && !sqlite_is_memory_url(url)
         && !query_param_value(url, "mode").is_some_and(|mode| mode.eq_ignore_ascii_case("ro"))
 }
@@ -86,27 +94,24 @@ fn sqlite_max_connections(url: &str, config: SqliteConfig) -> u32 {
     }
 }
 
-fn is_postgres_url(url: &str) -> bool {
-    url.starts_with("postgres://") || url.starts_with("postgresql://")
-}
-
-fn pool_options(url: &str, sqlite_config: SqliteConfig, postgres_config: PostgresConfig) -> AnyPoolOptions {
-    if url.starts_with("sqlite") {
-        return AnyPoolOptions::new()
+fn pool_options(
+    url: &str,
+    backend: DatabaseBackend,
+    sqlite_config: SqliteConfig,
+    postgres_config: PostgresConfig,
+) -> AnyPoolOptions {
+    match backend {
+        DatabaseBackend::Sqlite => AnyPoolOptions::new()
             .max_connections(sqlite_max_connections(url, sqlite_config))
-            .after_connect(move |conn, _meta| Box::pin(configure_sqlite_connection(conn, sqlite_config)));
-    }
-
-    if is_postgres_url(url) {
-        return AnyPoolOptions::new()
+            .after_connect(move |conn, _meta| Box::pin(configure_sqlite_connection(conn, sqlite_config))),
+        DatabaseBackend::Postgres => AnyPoolOptions::new()
             .max_connections(postgres_config.max_connections)
             .acquire_timeout(postgres_config.acquire_timeout)
             .idle_timeout(postgres_config.idle_timeout)
             .max_lifetime(postgres_config.max_lifetime)
-            .after_connect(move |conn, _meta| Box::pin(configure_postgres_connection(conn, postgres_config)));
+            .after_connect(move |conn, _meta| Box::pin(configure_postgres_connection(conn, postgres_config))),
+        DatabaseBackend::Other => AnyPoolOptions::new().max_connections(DEFAULT_MAX_CONNECTIONS),
     }
-
-    AnyPoolOptions::new().max_connections(DEFAULT_MAX_CONNECTIONS)
 }
 
 async fn configure_sqlite_connection(conn: &mut AnyConnection, config: SqliteConfig) -> DbResult<()> {
@@ -132,17 +137,7 @@ async fn configure_sqlite_connection(conn: &mut AnyConnection, config: SqliteCon
 }
 
 async fn configure_postgres_connection(conn: &mut AnyConnection, config: PostgresConfig) -> DbResult<()> {
-    let lock_timeout_ms = format!("{}ms", config.lock_timeout.as_millis());
-    sqlx::query("SELECT set_config('lock_timeout', $1, false)")
-        .bind(lock_timeout_ms)
-        .execute(&mut *conn)
-        .await?;
-    let statement_timeout_ms = format!("{}ms", config.statement_timeout.as_millis());
-    sqlx::query("SELECT set_config('statement_timeout', $1, false)")
-        .bind(statement_timeout_ms)
-        .execute(conn)
-        .await?;
-    Ok(())
+    configure_postgres_timeouts(conn, config.lock_timeout, config.statement_timeout).await
 }
 
 async fn enable_sqlite_wal(pool: &DbPool) -> DbResult<()> {
@@ -228,11 +223,11 @@ pub async fn create_pool_with_configs(
     sqlx::any::install_default_drivers();
 
     // Prepare URL with database-specific parameters
-    let url = prepare_db_url(db_url);
+    let prepared = prepare_db_url(db_url)?;
 
-    let options = pool_options(&url, sqlite_config, postgres_config);
-    let pool = options.connect(&url).await?;
-    if sqlite_should_enable_wal(&url) {
+    let options = pool_options(&prepared.value, prepared.backend, sqlite_config, postgres_config);
+    let pool = options.connect(&prepared.value).await?;
+    if sqlite_should_enable_wal(&prepared.value, prepared.backend) {
         enable_sqlite_wal(&pool).await?;
     }
 
@@ -295,48 +290,85 @@ mod tests {
     };
     use sqlx::Connection;
 
+    fn prepared_url(url: Option<&str>) -> PreparedDatabaseUrl {
+        prepare_db_url(url).expect("valid database URL")
+    }
+
     #[test]
     fn test_prepare_sqlite_url_without_params() {
         let url = "sqlite://test.db";
-        let prepared = prepare_db_url(Some(url));
-        assert_eq!(prepared, "sqlite://test.db?mode=rwc");
+        let prepared = prepared_url(Some(url));
+        assert_eq!(prepared.value, "sqlite://test.db?mode=rwc");
+        assert_eq!(prepared.backend, DatabaseBackend::Sqlite);
+    }
+
+    #[test]
+    fn test_prepare_uppercase_sqlite_url_without_params() {
+        let url = "SQLITE://test.db";
+        let prepared = prepared_url(Some(url));
+        assert_eq!(prepared.value, "SQLITE://test.db?mode=rwc");
+        assert_eq!(prepared.backend, DatabaseBackend::Sqlite);
     }
 
     #[test]
     fn test_prepare_sqlite_url_with_params() {
         let url = "sqlite://test.db?cache=shared";
-        let prepared = prepare_db_url(Some(url));
-        assert_eq!(prepared, "sqlite://test.db?cache=shared&mode=rwc");
+        let prepared = prepared_url(Some(url));
+        assert_eq!(prepared.value, "sqlite://test.db?cache=shared&mode=rwc");
     }
 
     #[test]
     fn test_prepare_sqlite_url_with_fragment() {
         let url = "sqlite://test.db?cache=shared#frag";
-        let prepared = prepare_db_url(Some(url));
-        assert_eq!(prepared, "sqlite://test.db?cache=shared&mode=rwc#frag");
+        let prepared = prepared_url(Some(url));
+        assert_eq!(prepared.value, "sqlite://test.db?cache=shared&mode=rwc#frag");
     }
 
     #[test]
     fn test_prepare_sqlite_url_with_existing_mode() {
         let url = "sqlite://test.db?mode=ro";
-        let prepared = prepare_db_url(Some(url));
-        assert_eq!(prepared, "sqlite://test.db?mode=ro");
+        let prepared = prepared_url(Some(url));
+        assert_eq!(prepared.value, "sqlite://test.db?mode=ro");
     }
 
     #[test]
     fn test_prepare_sqlite_memory_url_keeps_memory_mode() {
         let url = "sqlite://?mode=memory";
-        let prepared = prepare_db_url(Some(url));
-        assert_eq!(prepared, "sqlite://?mode=memory");
+        let prepared = prepared_url(Some(url));
+        assert_eq!(prepared.value, "sqlite://?mode=memory");
+    }
+
+    #[test]
+    fn test_prepare_sqlite_memory_shorthand_classifies_backend() {
+        let url = "sqlite::memory:";
+        let prepared = prepared_url(Some(url));
+        assert_eq!(prepared.value, "sqlite::memory:?mode=rwc");
+        assert_eq!(prepared.backend, DatabaseBackend::Sqlite);
     }
 
     #[test]
     fn test_sqlite_wal_enabled_for_writable_file_urls_only() {
-        assert!(sqlite_should_enable_wal("sqlite://test.db?mode=rwc"));
-        assert!(sqlite_should_enable_wal("sqlite://test.db?mode=rw"));
-        assert!(!sqlite_should_enable_wal("sqlite://test.db?mode=ro"));
-        assert!(!sqlite_should_enable_wal("sqlite://?mode=memory"));
-        assert!(!sqlite_should_enable_wal("sqlite::memory:"));
+        assert!(sqlite_should_enable_wal(
+            "sqlite://test.db?mode=rwc",
+            DatabaseBackend::Sqlite
+        ));
+        assert!(sqlite_should_enable_wal(
+            "sqlite://test.db?mode=rw",
+            DatabaseBackend::Sqlite
+        ));
+        assert!(!sqlite_should_enable_wal(
+            "sqlite://test.db?mode=ro",
+            DatabaseBackend::Sqlite
+        ));
+        assert!(!sqlite_should_enable_wal(
+            "sqlite://?mode=memory",
+            DatabaseBackend::Sqlite
+        ));
+        assert!(!sqlite_should_enable_wal("sqlite::memory:", DatabaseBackend::Sqlite));
+        assert!(!sqlite_should_enable_wal(
+            "postgresql://localhost/db",
+            DatabaseBackend::Postgres
+        ));
     }
 
     #[test]
@@ -360,8 +392,9 @@ mod tests {
     #[test]
     fn test_prepare_postgres_url() {
         let url = "postgresql://user:pass@localhost/db";
-        let prepared = prepare_db_url(Some(url));
-        assert_eq!(prepared, "postgresql://user:pass@localhost/db");
+        let prepared = prepared_url(Some(url));
+        assert_eq!(prepared.value, "postgresql://user:pass@localhost/db");
+        assert_eq!(prepared.backend, DatabaseBackend::Postgres);
     }
 
     #[test]
@@ -378,6 +411,7 @@ mod tests {
 
         let options = pool_options(
             "postgresql://user:pass@localhost/db",
+            DatabaseBackend::Postgres,
             SqliteConfig::default(),
             postgres_config,
         );
@@ -389,16 +423,41 @@ mod tests {
     }
 
     #[test]
+    fn test_uppercase_postgres_pool_options_use_explicit_config() {
+        let postgres_config = PostgresConfig {
+            max_connections: 7,
+            acquire_timeout: Duration::from_secs(11),
+            lock_timeout: Duration::from_secs(13),
+            migration_timeout: Duration::from_secs(17),
+            statement_timeout: Duration::from_secs(23),
+            idle_timeout: None,
+            max_lifetime: Some(Duration::from_secs(19)),
+        };
+
+        let options = pool_options(
+            "POSTGRESQL://user:pass@localhost/db",
+            DatabaseBackend::from_url("POSTGRESQL://user:pass@localhost/db").expect("valid uppercase PostgreSQL URL"),
+            SqliteConfig::default(),
+            postgres_config,
+        );
+
+        assert_eq!(options.get_max_connections(), 7);
+        assert_eq!(options.get_acquire_timeout(), Duration::from_secs(11));
+    }
+
+    #[test]
     fn test_prepare_mysql_url() {
         let url = "mysql://user:pass@localhost/db";
-        let prepared = prepare_db_url(Some(url));
-        assert_eq!(prepared, "mysql://user:pass@localhost/db");
+        let prepared = prepared_url(Some(url));
+        assert_eq!(prepared.value, "mysql://user:pass@localhost/db");
+        assert_eq!(prepared.backend, DatabaseBackend::Other);
     }
 
     #[test]
     fn test_prepare_default_sqlite_url() {
-        let prepared = prepare_db_url(None);
-        assert_eq!(prepared, "sqlite://./agentic_api.db?mode=rwc");
+        let prepared = prepared_url(None);
+        assert_eq!(prepared.value, "sqlite://./agentic_api.db?mode=rwc");
+        assert_eq!(prepared.backend, DatabaseBackend::Sqlite);
     }
 
     #[tokio::test]

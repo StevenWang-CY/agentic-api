@@ -1,6 +1,7 @@
 //! Conversation context and history.
 
 use super::super::pool::{DbPool, DbResult, DbTransaction};
+use crate::storage::backend::DatabaseBackend;
 use crate::utils::common::utcnow_str;
 
 /// Conversation context and history.
@@ -73,7 +74,7 @@ pub async fn get(pool: &DbPool, id: &str) -> DbResult<Option<Conversation>> {
 /// # Errors
 /// Returns `DbResult::Err` if the database query fails or the conversation does not exist.
 pub async fn lock_in_tx(tx: &mut DbTransaction<'_>, id: &str) -> DbResult<()> {
-    if tx.as_mut().backend_name() == "PostgreSQL" {
+    if DatabaseBackend::from_connection(tx.as_mut()) == DatabaseBackend::Postgres {
         let locked_id = sqlx::query_scalar::<_, String>("SELECT id FROM conversations WHERE id = $1 FOR UPDATE")
             .bind(id)
             .fetch_optional(&mut **tx)

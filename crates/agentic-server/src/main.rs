@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
 
+use agentic_core::DatabaseBackend;
 use agentic_core::config::{
     Config, DEFAULT_POSTGRES_ACQUIRE_TIMEOUT_SECONDS, DEFAULT_POSTGRES_IDLE_TIMEOUT_SECONDS,
     DEFAULT_POSTGRES_LOCK_TIMEOUT_SECONDS, DEFAULT_POSTGRES_MAX_CONNECTIONS, DEFAULT_POSTGRES_MAX_LIFETIME_SECONDS,
@@ -114,22 +115,6 @@ fn parse_env_duration(name: &str, default_seconds: u64) -> Result<Duration, Erro
     parse_env_duration_value(name, std::env::var(name), default_seconds)
 }
 
-fn parse_env_nonzero_u32(name: &str, default: u32) -> Result<u32, Error> {
-    parse_env_nonzero_u32_value(name, std::env::var(name), default)
-}
-
-fn parse_env_nonzero_u32_value(
-    name: &str,
-    value: Result<String, std::env::VarError>,
-    default: u32,
-) -> Result<u32, Error> {
-    let value = parse_env_u32_value(name, value, default)?;
-    if value == 0 {
-        return Err(Error::Config(format!("{name} must be greater than 0")));
-    }
-    Ok(value)
-}
-
 fn parse_env_duration_value(
     name: &str,
     value: Result<String, std::env::VarError>,
@@ -188,7 +173,7 @@ fn sqlite_config_from_env() -> Result<SqliteConfig, Error> {
 
 fn postgres_config_from_env() -> Result<PostgresConfig, Error> {
     Ok(PostgresConfig {
-        max_connections: parse_env_nonzero_u32("POSTGRES_MAX_CONNECTIONS", DEFAULT_POSTGRES_MAX_CONNECTIONS)?,
+        max_connections: parse_env_u32("POSTGRES_MAX_CONNECTIONS", DEFAULT_POSTGRES_MAX_CONNECTIONS)?,
         acquire_timeout: parse_env_duration(
             "POSTGRES_ACQUIRE_TIMEOUT_SECONDS",
             DEFAULT_POSTGRES_ACQUIRE_TIMEOUT_SECONDS,
@@ -214,13 +199,13 @@ fn postgres_config_from_env() -> Result<PostgresConfig, Error> {
 }
 
 fn database_configs_from_env(database_url: &str) -> Result<(PostgresConfig, SqliteConfig), Error> {
-    if database_url.starts_with("postgres://") || database_url.starts_with("postgresql://") {
-        return Ok((postgres_config_from_env()?, SqliteConfig::default()));
+    let backend = DatabaseBackend::from_url(database_url)
+        .map_err(|error| Error::Config(format!("invalid DATABASE_URL: {error}")))?;
+    match backend {
+        DatabaseBackend::Postgres => Ok((postgres_config_from_env()?, SqliteConfig::default())),
+        DatabaseBackend::Sqlite => Ok((PostgresConfig::default(), sqlite_config_from_env()?)),
+        DatabaseBackend::Other => Ok((PostgresConfig::default(), SqliteConfig::default())),
     }
-    if database_url.starts_with("sqlite") {
-        return Ok((PostgresConfig::default(), sqlite_config_from_env()?));
-    }
-    Ok((PostgresConfig::default(), SqliteConfig::default()))
 }
 
 fn build_config(llm_api_base: String, common: &CommonArgs) -> Result<Config, Error> {
@@ -286,7 +271,7 @@ mod tests {
     use clap::{CommandFactory, Parser};
 
     use super::{
-        Cli, Commands, parse_env_duration_value, parse_env_nonzero_u32_value, parse_env_optional_duration_value,
+        Cli, Commands, database_configs_from_env, parse_env_duration_value, parse_env_optional_duration_value,
         parse_env_temp_store_value, parse_env_u32_value, parse_env_u64_value,
     };
     use agentic_core::config::{
@@ -500,12 +485,18 @@ mod tests {
             Duration::from_secs(DEFAULT_POSTGRES_STATEMENT_TIMEOUT_SECONDS)
         );
         assert!(
-            parse_env_nonzero_u32_value(
+            parse_env_u32_value(
                 "POSTGRES_MAX_CONNECTIONS",
                 Ok("0".to_owned()),
                 DEFAULT_POSTGRES_MAX_CONNECTIONS,
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn database_config_rejects_an_invalid_url() {
+        let error = database_configs_from_env("not a database URL").expect_err("invalid URL must be rejected");
+        assert!(error.to_string().contains("invalid DATABASE_URL"));
     }
 }

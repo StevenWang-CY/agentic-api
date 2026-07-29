@@ -8,12 +8,15 @@ use std::time::Duration;
 use sqlx::Connection;
 use tracing::{debug, info};
 
+use super::backend::{DatabaseBackend, configure_postgres_timeouts};
 use super::pool::DbPool;
 use crate::config::DEFAULT_POSTGRES_MIGRATION_TIMEOUT_SECONDS;
 
 type DbResult<T> = Result<T, sqlx::Error>;
 
 const POSTGRES_SCHEMA_ADVISORY_LOCK: i64 = 7_194_963_546_799_751;
+const REQUIRED_POSTGRES_SCHEMA_COLUMN_COUNT: i64 = 19;
+const REQUIRED_POSTGRES_CONSTRAINT_COUNT: i64 = 6;
 const REQUIRED_POSTGRES_INTEGER_COLUMN_COUNT: i64 = 4;
 const POSTGRES_INTEGER_WIDENING_SQL: &str = "
     ALTER TABLE conversations
@@ -29,16 +32,7 @@ async fn configure_postgres_migration_timeout(
     connection: &mut sqlx::AnyConnection,
     migration_timeout: Duration,
 ) -> DbResult<()> {
-    let timeout_ms = format!("{}ms", migration_timeout.as_millis());
-    sqlx::query("SELECT set_config('lock_timeout', $1, false)")
-        .bind(&timeout_ms)
-        .execute(&mut *connection)
-        .await?;
-    sqlx::query("SELECT set_config('statement_timeout', $1, false)")
-        .bind(timeout_ms)
-        .execute(connection)
-        .await?;
-    Ok(())
+    configure_postgres_timeouts(connection, migration_timeout, migration_timeout).await
 }
 
 async fn widen_postgres_integer_columns(connection: &mut sqlx::AnyConnection) -> DbResult<()> {
@@ -47,14 +41,97 @@ async fn widen_postgres_integer_columns(connection: &mut sqlx::AnyConnection) ->
         .bind(POSTGRES_SCHEMA_ADVISORY_LOCK)
         .execute(&mut *transaction)
         .await?;
+    let schema_column_count = postgres_required_schema_column_count(&mut *transaction).await?;
+    let constraint_count = postgres_required_constraint_count(&mut *transaction).await?;
     let (integer_column_count, narrow_column_count) = postgres_integer_column_compatibility(&mut *transaction).await?;
-    validate_required_postgres_integer_columns(integer_column_count)?;
+    let sequence_index_ready = postgres_sequence_index_ready(&mut *transaction).await?;
+    validate_required_postgres_schema(
+        schema_column_count,
+        constraint_count,
+        integer_column_count,
+        sequence_index_ready,
+    )?;
     if narrow_column_count > 0 {
         sqlx::raw_sql(POSTGRES_INTEGER_WIDENING_SQL)
             .execute(&mut *transaction)
             .await?;
     }
     transaction.commit().await
+}
+
+async fn postgres_required_schema_column_count<'e, E>(executor: E) -> DbResult<i64>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Any>,
+{
+    sqlx::query_scalar(
+        "WITH required(table_name, column_name, data_type, is_nullable) AS ( \
+             VALUES \
+                 ('conversations', 'id', 'text', 'NO'), \
+                 ('conversations', 'created_at', 'integer', 'NO'), \
+                 ('conversations', 'tenant_id', 'text', 'YES'), \
+                 ('conversations', 'metadata', 'text', 'YES'), \
+                 ('items', 'id', 'text', 'NO'), \
+                 ('items', 'data', 'text', 'NO'), \
+                 ('items', 'created_at', 'integer', 'NO'), \
+                 ('items', 'conversation_id', 'text', 'YES'), \
+                 ('items', 'seq', 'integer', 'YES'), \
+                 ('items', 'tenant_id', 'text', 'YES'), \
+                 ('items', 'raw_tokens', 'text', 'YES'), \
+                 ('responses', 'id', 'text', 'NO'), \
+                 ('responses', 'conversation_id', 'text', 'YES'), \
+                 ('responses', 'previous_response_id', 'text', 'YES'), \
+                 ('responses', 'history_item_ids', 'text', 'YES'), \
+                 ('responses', 'metadata', 'text', 'YES'), \
+                 ('responses', 'created_at', 'integer', 'NO'), \
+                 ('responses', 'tenant_id', 'text', 'YES'), \
+                 ('responses', 'raw_tokens', 'text', 'YES') \
+         ) \
+         SELECT COUNT(*) \
+         FROM required \
+         JOIN information_schema.columns actual \
+           ON actual.table_schema = current_schema() \
+          AND actual.table_name = required.table_name \
+          AND actual.column_name = required.column_name \
+          AND actual.is_nullable = required.is_nullable \
+          AND (actual.data_type = required.data_type \
+               OR (required.data_type = 'integer' AND actual.data_type = 'bigint'))",
+    )
+    .fetch_one(executor)
+    .await
+}
+
+async fn postgres_required_constraint_count<'e, E>(executor: E) -> DbResult<i64>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Any>,
+{
+    sqlx::query_scalar(
+        "WITH required(table_name, constraint_type, definition) AS ( \
+             VALUES \
+                 ('conversations', 'p', 'PRIMARY KEY (id)'), \
+                 ('items', 'p', 'PRIMARY KEY (id)'), \
+                 ('responses', 'p', 'PRIMARY KEY (id)'), \
+                 ('items', 'f', \
+                  'FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE'), \
+                 ('responses', 'f', \
+                  'FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE SET NULL'), \
+                 ('responses', 'f', \
+                  'FOREIGN KEY (previous_response_id) REFERENCES responses(id) ON DELETE SET NULL') \
+         ) \
+         SELECT COUNT(*) \
+         FROM required \
+         WHERE EXISTS ( \
+             SELECT 1 \
+             FROM pg_constraint constraint_metadata \
+             JOIN pg_class table_relation ON table_relation.oid = constraint_metadata.conrelid \
+             JOIN pg_namespace table_namespace ON table_namespace.oid = table_relation.relnamespace \
+             WHERE table_namespace.nspname = current_schema() \
+             AND table_relation.relname = required.table_name \
+             AND constraint_metadata.contype::text = required.constraint_type \
+             AND pg_get_constraintdef(constraint_metadata.oid) = required.definition \
+         )",
+    )
+    .fetch_one(executor)
+    .await
 }
 
 async fn postgres_integer_column_compatibility<'e, E>(executor: E) -> DbResult<(i64, i64)>
@@ -73,17 +150,60 @@ where
     .await
 }
 
-fn validate_required_postgres_integer_columns(integer_column_count: i64) -> DbResult<()> {
-    if integer_column_count == REQUIRED_POSTGRES_INTEGER_COLUMN_COUNT {
+async fn postgres_sequence_index_ready<'e, E>(executor: E) -> DbResult<bool>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Any>,
+{
+    sqlx::query_scalar(
+        "SELECT EXISTS ( \
+             SELECT 1 \
+             FROM pg_index index_metadata \
+             JOIN pg_class index_relation ON index_relation.oid = index_metadata.indexrelid \
+             JOIN pg_class table_relation ON table_relation.oid = index_metadata.indrelid \
+             JOIN pg_namespace table_namespace ON table_namespace.oid = table_relation.relnamespace \
+             WHERE table_namespace.nspname = current_schema() \
+             AND table_relation.relname = 'items' \
+             AND index_relation.relname = 'idx_items_conversation_id' \
+             AND index_metadata.indisvalid \
+             AND index_metadata.indisready \
+             AND pg_get_indexdef(index_metadata.indexrelid) LIKE '%(conversation_id, seq)' \
+         )",
+    )
+    .fetch_one(executor)
+    .await
+}
+
+fn validate_required_postgres_schema(
+    schema_column_count: i64,
+    constraint_count: i64,
+    integer_column_count: i64,
+    sequence_index_ready: bool,
+) -> DbResult<()> {
+    if schema_column_count == REQUIRED_POSTGRES_SCHEMA_COLUMN_COUNT
+        && constraint_count == REQUIRED_POSTGRES_CONSTRAINT_COUNT
+        && integer_column_count == REQUIRED_POSTGRES_INTEGER_COLUMN_COUNT
+        && sequence_index_ready
+    {
         return Ok(());
     }
     Err(sqlx::Error::Configuration(
-        "database schema is missing required PostgreSQL tables or columns".into(),
+        "database schema is missing required PostgreSQL tables, columns, constraints, or indexes".into(),
     ))
 }
 
-fn validate_supervisor_schema(integer_column_count: i64, narrow_column_count: i64) -> DbResult<()> {
-    validate_required_postgres_integer_columns(integer_column_count)?;
+fn validate_supervisor_schema(
+    schema_column_count: i64,
+    constraint_count: i64,
+    integer_column_count: i64,
+    narrow_column_count: i64,
+    sequence_index_ready: bool,
+) -> DbResult<()> {
+    validate_required_postgres_schema(
+        schema_column_count,
+        constraint_count,
+        integer_column_count,
+        sequence_index_ready,
+    )?;
     if narrow_column_count == 0 {
         return Ok(());
     }
@@ -99,7 +219,7 @@ async fn verify_supervisor_managed_postgres_schema(
     postgres_migration_timeout: Duration,
 ) -> DbResult<()> {
     let mut connection = pool.acquire().await?;
-    if connection.backend_name() != "PostgreSQL" {
+    if DatabaseBackend::from_connection(&connection) != DatabaseBackend::Postgres {
         return Ok(());
     }
 
@@ -107,12 +227,21 @@ async fn verify_supervisor_managed_postgres_schema(
         let _ = connection.close().await;
         return Err(error);
     }
-    let compatibility_result = match postgres_integer_column_compatibility(&mut *connection).await {
-        Ok((integer_column_count, narrow_column_count)) => {
-            validate_supervisor_schema(integer_column_count, narrow_column_count)
-        }
-        Err(error) => Err(error),
-    };
+    let compatibility_result = async {
+        let schema_column_count = postgres_required_schema_column_count(&mut *connection).await?;
+        let constraint_count = postgres_required_constraint_count(&mut *connection).await?;
+        let (integer_column_count, narrow_column_count) =
+            postgres_integer_column_compatibility(&mut *connection).await?;
+        let sequence_index_ready = postgres_sequence_index_ready(&mut *connection).await?;
+        validate_supervisor_schema(
+            schema_column_count,
+            constraint_count,
+            integer_column_count,
+            narrow_column_count,
+            sequence_index_ready,
+        )
+    }
+    .await;
     let close_result = connection.close().await;
     compatibility_result?;
     close_result
@@ -126,9 +255,13 @@ async fn apply_postgres_compatibility(
     widen_postgres_integer_columns(connection).await
 }
 
+fn migration_error(error: sqlx::migrate::MigrateError) -> sqlx::Error {
+    error.into()
+}
+
 async fn run_embedded_migrations(pool: &DbPool, postgres_migration_timeout: Duration) -> DbResult<()> {
     let mut connection = pool.acquire().await?;
-    let is_postgres = connection.backend_name() == "PostgreSQL";
+    let is_postgres = DatabaseBackend::from_connection(&connection) == DatabaseBackend::Postgres;
     if is_postgres {
         if let Err(error) = configure_postgres_migration_timeout(&mut connection, postgres_migration_timeout).await {
             let _ = connection.close().await;
@@ -139,7 +272,7 @@ async fn run_embedded_migrations(pool: &DbPool, postgres_migration_timeout: Dura
     let migration_result = sqlx::migrate!("./migrations")
         .run(&mut *connection)
         .await
-        .map_err(|error| sqlx::Error::Configuration(error.to_string().into()));
+        .map_err(migration_error);
     let postgres_result = if migration_result.is_ok() && is_postgres {
         apply_postgres_compatibility(&mut connection, postgres_migration_timeout).await
     } else {
@@ -268,6 +401,49 @@ impl<'a> SchemaManager<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn migration_errors_preserve_their_type_and_source() {
+        use std::error::Error as _;
+
+        let error = migration_error(sqlx::migrate::MigrateError::VersionMissing(7));
+        assert!(matches!(error, sqlx::Error::Migrate(_)));
+        assert!(error.source().is_some());
+    }
+
+    #[test]
+    fn supervisor_schema_validation_requires_columns_constraints_and_sequence_index() {
+        assert!(
+            validate_supervisor_schema(
+                REQUIRED_POSTGRES_SCHEMA_COLUMN_COUNT - 1,
+                REQUIRED_POSTGRES_CONSTRAINT_COUNT,
+                REQUIRED_POSTGRES_INTEGER_COLUMN_COUNT,
+                0,
+                true,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_supervisor_schema(
+                REQUIRED_POSTGRES_SCHEMA_COLUMN_COUNT,
+                REQUIRED_POSTGRES_CONSTRAINT_COUNT,
+                REQUIRED_POSTGRES_INTEGER_COLUMN_COUNT,
+                0,
+                false,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_supervisor_schema(
+                REQUIRED_POSTGRES_SCHEMA_COLUMN_COUNT,
+                REQUIRED_POSTGRES_CONSTRAINT_COUNT - 1,
+                REQUIRED_POSTGRES_INTEGER_COLUMN_COUNT,
+                0,
+                true,
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn test_env_var_pattern() {
@@ -403,12 +579,33 @@ mod tests {
         .await
         .expect("seed response");
 
+        let schema_column_count = postgres_required_schema_column_count(&mut *connection)
+            .await
+            .expect("inspect pre-upgrade PostgreSQL schema");
+        let constraint_count = postgres_required_constraint_count(&mut *connection)
+            .await
+            .expect("inspect pre-upgrade PostgreSQL constraints");
         let (integer_column_count, narrow_column_count) = postgres_integer_column_compatibility(&mut *connection)
             .await
             .expect("inspect pre-upgrade PostgreSQL columns");
+        let sequence_index_ready = postgres_sequence_index_ready(&mut *connection)
+            .await
+            .expect("inspect pre-upgrade PostgreSQL sequence index");
+        assert_eq!(schema_column_count, REQUIRED_POSTGRES_SCHEMA_COLUMN_COUNT);
+        assert_eq!(constraint_count, REQUIRED_POSTGRES_CONSTRAINT_COUNT);
         assert_eq!(integer_column_count, REQUIRED_POSTGRES_INTEGER_COLUMN_COUNT);
         assert_eq!(narrow_column_count, 4);
-        assert!(validate_supervisor_schema(integer_column_count, narrow_column_count).is_err());
+        assert!(sequence_index_ready);
+        assert!(
+            validate_supervisor_schema(
+                schema_column_count,
+                constraint_count,
+                integer_column_count,
+                narrow_column_count,
+                sequence_index_ready,
+            )
+            .is_err()
+        );
 
         let supervisor_schema_name = schema.clone();
         let supervisor_pool = sqlx::any::AnyPoolOptions::new()
@@ -478,7 +675,16 @@ mod tests {
         .await
         .expect("inspect widened PostgreSQL columns");
         assert_eq!(bigint_columns, 4);
-        assert!(validate_supervisor_schema(REQUIRED_POSTGRES_INTEGER_COLUMN_COUNT, 4 - bigint_columns).is_ok());
+        assert!(
+            validate_supervisor_schema(
+                REQUIRED_POSTGRES_SCHEMA_COLUMN_COUNT,
+                REQUIRED_POSTGRES_CONSTRAINT_COUNT,
+                REQUIRED_POSTGRES_INTEGER_COLUMN_COUNT,
+                4 - bigint_columns,
+                true,
+            )
+            .is_ok()
+        );
         let foreign_key_error =
             sqlx::query("INSERT INTO items (id, data, created_at, conversation_id) VALUES ($1, $2, $3, $4)")
                 .bind("item_invalid")
@@ -488,6 +694,27 @@ mod tests {
                 .execute(&mut *connection)
                 .await;
         assert!(foreign_key_error.is_err());
+
+        sqlx::raw_sql(
+            "ALTER TABLE items DROP CONSTRAINT items_conversation_id_fkey; \
+             ALTER TABLE responses ADD CONSTRAINT responses_conversation_id_duplicate_fkey \
+             FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE SET NULL;",
+        )
+        .execute(&mut *connection)
+        .await
+        .expect("replace one required foreign key with a duplicate");
+        let invalid_constraint_schema =
+            PoolWithSchema::with_postgres_migration_timeout(supervisor_schema.pool.clone(), Duration::from_secs(5));
+        let constraint_error = invalid_constraint_schema
+            .ensure_schema_ready_with_marker(true)
+            .await
+            .expect_err("a duplicate foreign key must not compensate for a missing required constraint");
+        assert!(
+            constraint_error
+                .to_string()
+                .contains("missing required PostgreSQL tables, columns, constraints, or indexes"),
+            "{constraint_error}"
+        );
 
         sqlx::query("SET search_path TO public")
             .execute(&mut *connection)
@@ -546,7 +773,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("missing required PostgreSQL tables or columns"),
+                .contains("missing required PostgreSQL tables, columns, constraints, or indexes"),
             "{error}"
         );
         assert!(!supervisor_schema.schema_ready.load(Ordering::SeqCst));

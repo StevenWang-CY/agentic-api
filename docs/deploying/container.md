@@ -77,9 +77,14 @@ Drain replicas running an older release before enabling writes through this rele
 
 Stored requests now fail if their response or conversation state cannot be persisted. For streaming requests, the gateway sends an error event instead of `response.completed`. Client responses use the generic message `failed to persist response`; the underlying database error is written only to gateway logs. This prevents clients from receiving a response ID that cannot be continued after a lock timeout or other database failure without exposing database schema or constraint details.
 
-`AGENTIC_API_SCHEMA_READY` keeps schema changes under supervisor control. Startup performs a read-only compatibility check and fails if required persistence tables or integer columns are missing, or if the four integer columns still need widening. Apply this upgrade with a DDL-capable migration role before starting the DML-only gateway role:
+`AGENTIC_API_SCHEMA_READY` keeps schema changes under supervisor control. Startup performs a read-only compatibility
+check and fails if required persistence columns, types, nullability, primary/foreign-key constraints, or the conversation
+sequence index are missing, or if the four integer columns still need widening. Apply this upgrade in one transaction
+with a DDL-capable migration role before starting the DML-only gateway role. When using `psql`, pass
+`-v ON_ERROR_STOP=1` so any statement failure stops the script:
 
 ```sql
+BEGIN;
 ALTER TABLE conversations
     ALTER COLUMN created_at TYPE BIGINT USING created_at::BIGINT;
 ALTER TABLE items
@@ -87,13 +92,17 @@ ALTER TABLE items
     ALTER COLUMN seq TYPE BIGINT USING seq::BIGINT;
 ALTER TABLE responses
     ALTER COLUMN created_at TYPE BIGINT USING created_at::BIGINT;
+DROP INDEX IF EXISTS idx_items_conversation_id;
+CREATE INDEX idx_items_conversation_id ON items (conversation_id, seq);
+COMMIT;
 ```
 
 Enable automated backups and point-in-time recovery in the managed database service according to the deployment's recovery-point and recovery-time requirements. Test restores separately; gateway replicas do not create database backups.
 
 ## Smoke test
 
-The liveness probe reports whether the gateway process is serving traffic. Readiness also checks the upstream inference service.
+The liveness probe reports whether the gateway process is serving traffic. Readiness also checks the upstream inference
+service and runs a one-second persistence query when a database pool is configured.
 
 ```console
 curl --fail http://127.0.0.1:9000/health
