@@ -255,6 +255,9 @@ async fn test_streaming_store_true_hides_persistence_details_without_sequence_ga
     let body = resp.text().await.unwrap();
     assert!(body.contains("\"type\":\"error\""), "{body}");
     assert!(body.contains("failed to persist response"), "{body}");
+    assert!(body.contains("\"status\":500"), "{body}");
+    assert!(body.contains("\"type\":\"server_error\""), "{body}");
+    assert!(body.contains("\"code\":\"server_error\""), "{body}");
     assert!(!body.contains("storage not configured or disabled"), "{body}");
     assert!(body.contains("\"sequence_number\":0"), "{body}");
     assert!(body.contains("data: [DONE]"), "{body}");

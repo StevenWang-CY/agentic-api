@@ -111,8 +111,8 @@ impl ExecutionContext {
             return true;
         };
         matches!(
-            tokio::time::timeout(timeout, sqlx::query("SELECT 1").execute(pool.as_ref())).await,
-            Ok(Ok(_))
+            tokio::time::timeout(timeout, crate::storage::schema::verify_persistence_ready(pool.as_ref())).await,
+            Ok(Ok(()))
         )
     }
 
@@ -136,6 +136,9 @@ impl ExecutionContext {
         let database_backend = DatabaseBackend::from_url(db_url)
             .map_err(|error| Error::Config(format!("invalid DATABASE_URL: {error}")))?;
         let pool = create_pool_with_schema_and_configs(Some(db_url), cfg.sqlite, cfg.postgres)
+            .await
+            .map_err(|error| database_open_error(database_backend, &error))?;
+        crate::storage::schema::verify_persistence_writable(pool.as_ref())
             .await
             .map_err(|error| database_open_error(database_backend, &error))?;
 
@@ -198,7 +201,7 @@ mod tests {
 
     use super::{ExecutionContext, database_open_error};
     use crate::executor::{ConversationHandler, ResponseHandler};
-    use crate::storage::{ConversationStore, DatabaseBackend, ResponseStore, create_pool};
+    use crate::storage::{ConversationStore, DatabaseBackend, ResponseStore, create_pool_with_schema};
 
     #[test]
     fn database_errors_are_actionable_without_exposing_credentials() {
@@ -254,7 +257,7 @@ mod tests {
 
     #[tokio::test]
     async fn storage_readiness_is_bounded_by_the_probe_timeout() {
-        let pool = create_pool(Some("sqlite://?mode=memory"))
+        let pool = create_pool_with_schema(Some("sqlite://?mode=memory"))
             .await
             .expect("create single-connection pool");
         let held_connection = pool.acquire().await.expect("hold the only connection");
@@ -269,5 +272,67 @@ mod tests {
         assert!(!context.storage_ready(Duration::from_millis(10)).await);
         drop(held_connection);
         assert!(context.storage_ready(Duration::from_secs(1)).await);
+    }
+
+    #[tokio::test]
+    async fn storage_readiness_rejects_missing_persistence_tables() {
+        let pool = create_pool_with_schema(Some("sqlite://?mode=memory"))
+            .await
+            .expect("create persistence pool");
+        let mut context = ExecutionContext::new(
+            ConversationHandler::new(ConversationStore::disabled()),
+            ResponseHandler::new(ResponseStore::disabled()),
+            Arc::new(reqwest::Client::new()),
+            "http://localhost:8000".to_owned(),
+        );
+        context.storage_pool = Some(pool.clone());
+        assert!(context.storage_ready(Duration::from_secs(1)).await);
+
+        sqlx::query("DROP TABLE responses")
+            .execute(pool.as_ref())
+            .await
+            .expect("drop persistence table");
+
+        assert!(!context.storage_ready(Duration::from_secs(1)).await);
+    }
+
+    #[tokio::test]
+    async fn storage_readiness_rejects_read_only_persistence() {
+        let pool = create_pool_with_schema(Some("sqlite://?mode=memory"))
+            .await
+            .expect("create persistence pool");
+        let mut context = ExecutionContext::new(
+            ConversationHandler::new(ConversationStore::disabled()),
+            ResponseHandler::new(ResponseStore::disabled()),
+            Arc::new(reqwest::Client::new()),
+            "http://localhost:8000".to_owned(),
+        );
+        context.storage_pool = Some(pool.clone());
+        assert!(context.storage_ready(Duration::from_secs(1)).await);
+
+        sqlx::query("PRAGMA query_only = ON")
+            .execute(pool.as_ref())
+            .await
+            .expect("make persistence read-only");
+
+        assert!(!context.storage_ready(Duration::from_secs(1)).await);
+    }
+
+    #[tokio::test]
+    async fn storage_readiness_rolls_back_probe_rows() {
+        let pool = create_pool_with_schema(Some("sqlite://?mode=memory"))
+            .await
+            .expect("create persistence pool");
+
+        crate::storage::schema::verify_persistence_writable(pool.as_ref())
+            .await
+            .expect("run functional persistence probe");
+        for table in ["conversations", "items", "responses"] {
+            let row_count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+                .fetch_one(pool.as_ref())
+                .await
+                .expect("count persistence rows");
+            assert_eq!(row_count, 0, "readiness probe leaked a row into {table}");
+        }
     }
 }

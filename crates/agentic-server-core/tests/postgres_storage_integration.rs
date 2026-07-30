@@ -120,6 +120,19 @@ async fn postgres_index_upgrade_preserves_existing_state() {
     .await
     .expect("inspect conversation sequence index");
     assert!(conversation_index.contains("(conversation_id, seq)"));
+    let duplicate_sequence_error =
+        sqlx::query("INSERT INTO items (id, data, created_at, conversation_id, seq) VALUES ($1, $2, $3, $4, $5)")
+            .bind("item_duplicate_sequence")
+            .bind("{}")
+            .bind(1_704_067_200_i64)
+            .bind("conv_upgrade")
+            .bind(0_i64)
+            .execute(&mut *connection)
+            .await;
+    assert!(
+        duplicate_sequence_error.is_err(),
+        "conversation sequences must be database-unique"
+    );
     let foreign_key_error =
         sqlx::query("INSERT INTO items (id, data, created_at, conversation_id) VALUES ($1, $2, $3, $4)")
             .bind("item_invalid")

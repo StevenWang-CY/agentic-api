@@ -68,8 +68,9 @@ pub async fn get(pool: &DbPool, id: &str) -> DbResult<Option<Conversation>> {
 /// Locks an existing conversation for the lifetime of the transaction.
 ///
 /// `PostgreSQL` takes a row lock without writing the row. `SQLite` uses a no-op
-/// update to acquire its write lock. Both serialize per-conversation sequence
-/// allocation when multiple gateway replicas persist turns concurrently.
+/// update to acquire its database-wide write lock, which serializes persistence
+/// across all conversations. Both protect sequence allocation when multiple
+/// gateway replicas persist turns concurrently, but with different lock granularity.
 ///
 /// # Errors
 /// Returns `DbResult::Err` if the database query fails or the conversation does not exist.

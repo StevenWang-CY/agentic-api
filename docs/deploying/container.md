@@ -69,9 +69,27 @@ DATABASE_URL='postgresql://agentic-api:password@postgres.example.com/agentic_api
 
 Size the pool across the whole deployment, not one process. Keep `replicas * POSTGRES_MAX_CONNECTIONS` below the managed database connection limit, with capacity reserved for migrations, administration, and failover. The acquire timeout bounds how long a request waits when the pool is exhausted. Lock and statement timeouts prevent a stalled transaction, slow query, or hot conversation from holding a connection indefinitely. Idle and lifetime recycling protect against stale connections and can be disabled with `0` only when the provider recommends it.
 
+Connect directly to PostgreSQL or use a session-pooling proxy. Transaction-pooling proxies are unsupported because the
+gateway configures `search_path`, lock timeouts, and statement timeouts for the lifetime of each pooled session.
+
 Each gateway replica runs the embedded SQLx migrations during startup. PostgreSQL advisory locking serializes concurrent migration attempts, so replica startup is repeatable and only proceeds after the schema is ready. Migration lock waits and statements use the finite migration timeout rather than the shorter application lock timeout. A migration failure or timeout prevents that replica from serving traffic.
 
-The first PostgreSQL startup on this release widens timestamp and sequence columns in place to 64-bit integers. PostgreSQL takes exclusive table locks for these changes, which prevents concurrent writes from being lost but can briefly pause older replicas. It also rebuilds the conversation sequence index. For an existing large database, schedule the first upgraded replica during a maintenance window and set the migration timeout for the expected lock, rewrite, and index duration.
+The gateway pins every PostgreSQL pool connection to the single schema on `search_path` that already contains the
+persistence tables or SQLx migration history. This prevents an earlier empty schema from receiving shadow tables or
+capturing runtime queries. Startup fails instead of guessing when persistence objects exist in more than one
+`search_path` schema. Do not grant untrusted roles `CREATE` on any schema in the gateway role's `search_path`.
+
+The first PostgreSQL startup on this release widens timestamp and sequence columns in place to 64-bit integers. PostgreSQL takes exclusive table locks for these changes, which prevents concurrent writes from being lost but can briefly pause older replicas. It also rebuilds the conversation sequence index as unique, so duplicate non-null `(conversation_id, seq)` values stop the migration instead of leaving conversation order ambiguous. Check for duplicates before the upgrade and resolve them according to the deployment's data-retention policy:
+
+```sql
+SELECT conversation_id, seq, COUNT(*)
+FROM items
+WHERE conversation_id IS NOT NULL AND seq IS NOT NULL
+GROUP BY conversation_id, seq
+HAVING COUNT(*) > 1;
+```
+
+For an existing large database, schedule the first upgraded replica during a maintenance window and set the migration timeout for the expected lock, rewrite, and index duration.
 
 Drain replicas running an older release before enabling writes through this release. Older replicas do not take the per-conversation row lock and can allocate duplicate sequence numbers if they write alongside upgraded replicas.
 
@@ -93,7 +111,7 @@ ALTER TABLE items
 ALTER TABLE responses
     ALTER COLUMN created_at TYPE BIGINT USING created_at::BIGINT;
 DROP INDEX IF EXISTS idx_items_conversation_id;
-CREATE INDEX idx_items_conversation_id ON items (conversation_id, seq);
+CREATE UNIQUE INDEX idx_items_conversation_id ON items (conversation_id, seq);
 COMMIT;
 ```
 
@@ -101,8 +119,10 @@ Enable automated backups and point-in-time recovery in the managed database serv
 
 ## Smoke test
 
-The liveness probe reports whether the gateway process is serving traffic. Readiness also checks the upstream inference
-service and runs a one-second persistence query when a database pool is configured.
+The liveness probe reports whether the gateway process is serving traffic. Startup performs one rollback-only functional
+write through the conversation, item, and response tables to verify the configured role and persistence policies.
+Readiness then checks the upstream inference service and runs a one-second read-only database, schema, and privilege
+probe, avoiding write amplification from orchestrator polling.
 
 ```console
 curl --fail http://127.0.0.1:9000/health

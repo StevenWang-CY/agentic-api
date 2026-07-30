@@ -89,12 +89,18 @@ where
          SELECT COUNT(*) \
          FROM required \
          JOIN information_schema.columns actual \
-           ON actual.table_schema = current_schema() \
-          AND actual.table_name = required.table_name \
+           ON actual.table_name = required.table_name \
           AND actual.column_name = required.column_name \
           AND actual.is_nullable = required.is_nullable \
           AND (actual.data_type = required.data_type \
-               OR (required.data_type = 'integer' AND actual.data_type = 'bigint'))",
+               OR (required.data_type = 'integer' AND actual.data_type = 'bigint')) \
+         JOIN pg_class table_relation \
+           ON table_relation.relname = actual.table_name \
+          AND table_relation.relkind IN ('r', 'p') \
+          AND pg_table_is_visible(table_relation.oid) \
+         JOIN pg_namespace table_namespace \
+           ON table_namespace.oid = table_relation.relnamespace \
+          AND table_namespace.nspname = actual.table_schema",
     )
     .fetch_one(executor)
     .await
@@ -123,9 +129,8 @@ where
              SELECT 1 \
              FROM pg_constraint constraint_metadata \
              JOIN pg_class table_relation ON table_relation.oid = constraint_metadata.conrelid \
-             JOIN pg_namespace table_namespace ON table_namespace.oid = table_relation.relnamespace \
-             WHERE table_namespace.nspname = current_schema() \
-             AND table_relation.relname = required.table_name \
+             WHERE table_relation.relname = required.table_name \
+             AND pg_table_is_visible(table_relation.oid) \
              AND constraint_metadata.contype::text = required.constraint_type \
              AND pg_get_constraintdef(constraint_metadata.oid) = required.definition \
          )",
@@ -139,12 +144,18 @@ where
     E: sqlx::Executor<'e, Database = sqlx::Any>,
 {
     sqlx::query_as(
-        "SELECT COUNT(*), COUNT(*) FILTER (WHERE data_type <> 'bigint') \
-         FROM information_schema.columns \
-         WHERE table_schema = current_schema() \
-         AND ((table_name = 'conversations' AND column_name = 'created_at') \
-           OR (table_name = 'items' AND column_name IN ('created_at', 'seq')) \
-           OR (table_name = 'responses' AND column_name = 'created_at'))",
+        "SELECT COUNT(*), COUNT(*) FILTER (WHERE actual.data_type <> 'bigint') \
+         FROM information_schema.columns actual \
+         JOIN pg_class table_relation \
+           ON table_relation.relname = actual.table_name \
+          AND table_relation.relkind IN ('r', 'p') \
+          AND pg_table_is_visible(table_relation.oid) \
+         JOIN pg_namespace table_namespace \
+           ON table_namespace.oid = table_relation.relnamespace \
+          AND table_namespace.nspname = actual.table_schema \
+         WHERE (actual.table_name = 'conversations' AND actual.column_name = 'created_at') \
+            OR (actual.table_name = 'items' AND actual.column_name IN ('created_at', 'seq')) \
+            OR (actual.table_name = 'responses' AND actual.column_name = 'created_at')",
     )
     .fetch_one(executor)
     .await
@@ -160,12 +171,12 @@ where
              FROM pg_index index_metadata \
              JOIN pg_class index_relation ON index_relation.oid = index_metadata.indexrelid \
              JOIN pg_class table_relation ON table_relation.oid = index_metadata.indrelid \
-             JOIN pg_namespace table_namespace ON table_namespace.oid = table_relation.relnamespace \
-             WHERE table_namespace.nspname = current_schema() \
-             AND table_relation.relname = 'items' \
+             WHERE table_relation.relname = 'items' \
+             AND pg_table_is_visible(table_relation.oid) \
              AND index_relation.relname = 'idx_items_conversation_id' \
              AND index_metadata.indisvalid \
              AND index_metadata.indisready \
+             AND index_metadata.indisunique \
              AND pg_get_indexdef(index_metadata.indexrelid) LIKE '%(conversation_id, seq)' \
          )",
     )
@@ -257,6 +268,138 @@ async fn apply_postgres_compatibility(
 
 fn migration_error(error: sqlx::migrate::MigrateError) -> sqlx::Error {
     error.into()
+}
+
+pub(crate) async fn pin_postgres_persistence_schema(connection: &mut sqlx::AnyConnection) -> DbResult<()> {
+    let populated_search_path_schemas: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT table_namespace.nspname::text \
+         FROM pg_class table_relation \
+         JOIN pg_namespace table_namespace ON table_namespace.oid = table_relation.relnamespace \
+         WHERE table_namespace.nspname = ANY(current_schemas(false)) \
+         AND table_relation.relkind IN ('r', 'p', 'v', 'm', 'f') \
+         AND table_relation.relname IN ('_sqlx_migrations', 'conversations', 'items', 'responses') \
+         ORDER BY table_namespace.nspname::text",
+    )
+    .fetch_all(&mut *connection)
+    .await?;
+    let target_schema = match populated_search_path_schemas.as_slice() {
+        [] => sqlx::query_scalar::<_, Option<String>>("SELECT current_schema()::text")
+            .fetch_one(&mut *connection)
+            .await?
+            .ok_or_else(|| {
+                sqlx::Error::Configuration(
+                    "PostgreSQL search_path does not contain an existing schema for migrations".into(),
+                )
+            })?,
+        [schema] => schema.clone(),
+        _ => {
+            return Err(sqlx::Error::Configuration(
+                "PostgreSQL persistence tables or migration history exist in multiple search_path schemas".into(),
+            ));
+        }
+    };
+    sqlx::query("SELECT set_config('search_path', quote_ident($1), false)")
+        .bind(target_schema)
+        .execute(&mut *connection)
+        .await?;
+    Ok(())
+}
+
+pub(crate) async fn verify_persistence_writable(pool: &DbPool) -> DbResult<()> {
+    let mut transaction = pool.begin().await?;
+    let probe_result = async {
+        let suffix = uuid::Uuid::now_v7().simple();
+        let conversation_id = format!("conv_readiness_{suffix}");
+        let item_id = format!("item_readiness_{suffix}");
+        let response_id = format!("resp_readiness_{suffix}");
+        let created_at = crate::utils::common::utcnow_str();
+        sqlx::query("INSERT INTO conversations (id, created_at) VALUES ($1, $2)")
+            .bind(&conversation_id)
+            .bind(created_at)
+            .execute(&mut *transaction)
+            .await?;
+        crate::storage::models::conversation::lock_in_tx(&mut transaction, &conversation_id).await?;
+        crate::storage::models::item::create_in_tx(
+            &mut transaction,
+            vec![(item_id.clone(), "{}".to_owned())],
+            Some(&conversation_id),
+        )
+        .await?;
+        crate::storage::models::response::create_in_tx(
+            &mut transaction,
+            &response_id,
+            Some(&conversation_id),
+            None,
+            Some(&format!("[\"{item_id}\"]")),
+            Some("{}"),
+        )
+        .await?;
+        Ok(())
+    }
+    .await;
+    match probe_result {
+        Ok(()) => transaction.rollback().await,
+        Err(error) => {
+            let _ = transaction.rollback().await;
+            Err(error)
+        }
+    }
+}
+
+pub(crate) async fn verify_persistence_ready(pool: &DbPool) -> DbResult<()> {
+    let mut connection = pool.acquire().await?;
+    match DatabaseBackend::from_connection(&connection) {
+        DatabaseBackend::Postgres => {
+            let ready: bool = sqlx::query_scalar(
+                "WITH required(table_name, privilege) AS ( \
+                     VALUES \
+                         ('conversations', 'SELECT'), \
+                         ('conversations', 'INSERT'), \
+                         ('conversations', 'UPDATE'), \
+                         ('items', 'SELECT'), \
+                         ('items', 'INSERT'), \
+                         ('responses', 'SELECT'), \
+                         ('responses', 'INSERT') \
+                 ) \
+                 SELECT current_setting('transaction_read_only') = 'off' \
+                    AND COUNT(table_relation.oid) = 7 \
+                    AND COALESCE(BOOL_AND( \
+                        has_table_privilege(current_user, table_relation.oid, required.privilege) \
+                    ), false) \
+                 FROM required \
+                 LEFT JOIN pg_class table_relation \
+                   ON table_relation.relname = required.table_name \
+                  AND table_relation.relkind IN ('r', 'p') \
+                  AND pg_table_is_visible(table_relation.oid)",
+            )
+            .fetch_one(&mut *connection)
+            .await?;
+            if !ready {
+                return Err(sqlx::Error::Configuration(
+                    "PostgreSQL persistence tables are unavailable, read-only, or missing required privileges".into(),
+                ));
+            }
+        }
+        DatabaseBackend::Sqlite => {
+            let query_only: i64 = sqlx::query_scalar("PRAGMA query_only")
+                .fetch_one(&mut *connection)
+                .await?;
+            if query_only != 0 {
+                return Err(sqlx::Error::Configuration("SQLite persistence is read-only".into()));
+            }
+            for statement in [
+                "SELECT id FROM conversations LIMIT 0",
+                "SELECT id FROM items LIMIT 0",
+                "SELECT id FROM responses LIMIT 0",
+            ] {
+                sqlx::query(statement).execute(&mut *connection).await?;
+            }
+        }
+        DatabaseBackend::Other => {
+            sqlx::query("SELECT 1").execute(&mut *connection).await?;
+        }
+    }
+    Ok(())
 }
 
 async fn run_embedded_migrations(pool: &DbPool, postgres_migration_timeout: Duration) -> DbResult<()> {
@@ -727,6 +870,135 @@ mod tests {
             .expect("drop isolated upgrade schema");
         drop(connection);
         pool.close().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_POSTGRES_URL pointing to an isolated PostgreSQL database"]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "keeps the complete multi-schema migration and runtime connection lifecycle together"
+    )]
+    async fn postgres_migrations_use_visible_tables_when_current_schema_is_empty() {
+        let database_url = std::env::var("TEST_POSTGRES_URL").expect("TEST_POSTGRES_URL must be set");
+        let pool = crate::storage::pool::create_pool(Some(&database_url))
+            .await
+            .expect("create PostgreSQL schema-visibility test pool");
+        let table_schema = format!("visible_{}", uuid::Uuid::now_v7().simple());
+        let empty_schema = format!("empty_{}", uuid::Uuid::now_v7().simple());
+        let mut connection = pool.acquire().await.expect("acquire PostgreSQL test connection");
+
+        sqlx::query(&format!("CREATE SCHEMA {table_schema}"))
+            .execute(&mut *connection)
+            .await
+            .expect("create table schema");
+        sqlx::query(&format!("CREATE SCHEMA {empty_schema}"))
+            .execute(&mut *connection)
+            .await
+            .expect("create empty schema");
+        sqlx::query("SELECT set_config('search_path', $1, false)")
+            .bind(&table_schema)
+            .execute(&mut *connection)
+            .await
+            .expect("select table schema");
+        sqlx::migrate!("./migrations")
+            .run(&mut *connection)
+            .await
+            .expect("apply portable migrations to table schema");
+        sqlx::query("INSERT INTO conversations (id, created_at) VALUES ($1, $2)")
+            .bind("conv_visible_schema")
+            .bind(1_704_067_200_i64)
+            .execute(&mut *connection)
+            .await
+            .expect("seed visible-schema conversation");
+
+        sqlx::query("SELECT set_config('search_path', $1, false)")
+            .bind(format!("{empty_schema},{table_schema}"))
+            .execute(&mut *connection)
+            .await
+            .expect("put empty schema first in search path");
+        let current_schema: String = sqlx::query_scalar("SELECT current_schema()::text")
+            .fetch_one(&mut *connection)
+            .await
+            .expect("inspect current schema");
+        assert_eq!(current_schema, empty_schema);
+
+        pin_postgres_persistence_schema(&mut connection)
+            .await
+            .expect("pin visible PostgreSQL migration schema");
+        let migration_result = sqlx::migrate!("./migrations").run(&mut *connection).await;
+        let compatibility_result = apply_postgres_compatibility(&mut connection, Duration::from_secs(5)).await;
+        let bigint_columns: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM information_schema.columns \
+             WHERE table_schema = $1 AND data_type = 'bigint' \
+             AND ((table_name = 'conversations' AND column_name = 'created_at') \
+               OR (table_name = 'items' AND column_name IN ('created_at', 'seq')) \
+               OR (table_name = 'responses' AND column_name = 'created_at'))",
+        )
+        .bind(&table_schema)
+        .fetch_one(&mut *connection)
+        .await
+        .expect("inspect visible PostgreSQL columns");
+        let shadow_table_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM information_schema.tables \
+             WHERE table_schema = $1 AND table_name IN ('conversations', 'items', 'responses')",
+        )
+        .bind(&empty_schema)
+        .fetch_one(&mut *connection)
+        .await
+        .expect("inspect empty schema for shadow tables");
+        let seeded_conversation_count: i64 = sqlx::query_scalar(&format!(
+            "SELECT COUNT(*) FROM {table_schema}.conversations WHERE id = $1"
+        ))
+        .bind("conv_visible_schema")
+        .fetch_one(&mut *connection)
+        .await
+        .expect("inspect seeded conversation");
+        let query_separator = if database_url.contains('?') { '&' } else { '?' };
+        let runtime_database_url =
+            format!("{database_url}{query_separator}options=-csearch_path%3D{empty_schema}%2C{table_schema}");
+        let runtime_pool = crate::storage::pool::create_pool(Some(&runtime_database_url))
+            .await
+            .expect("create runtime pool with multi-schema search path");
+        let runtime_schema: String = sqlx::query_scalar("SELECT current_schema()::text")
+            .fetch_one(runtime_pool.as_ref())
+            .await
+            .expect("inspect runtime pool schema");
+        let runtime_seeded_conversation_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM conversations WHERE id = $1")
+                .bind("conv_visible_schema")
+                .fetch_one(runtime_pool.as_ref())
+                .await
+                .expect("load seeded conversation through runtime pool");
+        verify_persistence_writable(runtime_pool.as_ref())
+            .await
+            .expect("run PostgreSQL functional persistence probe");
+        verify_persistence_ready(runtime_pool.as_ref())
+            .await
+            .expect("run PostgreSQL read-only persistence probe");
+        runtime_pool.close().await;
+
+        sqlx::query("SET search_path TO public")
+            .execute(&mut *connection)
+            .await
+            .expect("restore public schema");
+        sqlx::query(&format!("DROP SCHEMA {empty_schema} CASCADE"))
+            .execute(&mut *connection)
+            .await
+            .expect("drop empty schema");
+        sqlx::query(&format!("DROP SCHEMA {table_schema} CASCADE"))
+            .execute(&mut *connection)
+            .await
+            .expect("drop table schema");
+        drop(connection);
+        pool.close().await;
+
+        migration_result.expect("visible PostgreSQL schema should accept repeated migrations");
+        compatibility_result.expect("visible PostgreSQL schema should pass compatibility check");
+        assert_eq!(shadow_table_count, 0);
+        assert_eq!(seeded_conversation_count, 1);
+        assert_eq!(runtime_schema, table_schema);
+        assert_eq!(runtime_seeded_conversation_count, 1);
+        assert_eq!(bigint_columns, REQUIRED_POSTGRES_INTEGER_COLUMN_COUNT);
     }
 
     #[tokio::test]

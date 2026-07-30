@@ -137,7 +137,8 @@ async fn configure_sqlite_connection(conn: &mut AnyConnection, config: SqliteCon
 }
 
 async fn configure_postgres_connection(conn: &mut AnyConnection, config: PostgresConfig) -> DbResult<()> {
-    configure_postgres_timeouts(conn, config.lock_timeout, config.statement_timeout).await
+    configure_postgres_timeouts(conn, config.lock_timeout, config.statement_timeout).await?;
+    super::schema::pin_postgres_persistence_schema(conn).await
 }
 
 async fn enable_sqlite_wal(pool: &DbPool) -> DbResult<()> {
