@@ -39,6 +39,8 @@ use this envelope:
 A JWKS refresh failure returns `503 Service Unavailable`, without `WWW-Authenticate`, so clients can distinguish an
 identity-provider dependency failure from rejected credentials. See
 [OIDC bearer authentication](../design/oidc-bearer-authentication.md) for configuration and key-cache behavior.
+For a complete GitHub-backed deployment example, see
+[GitHub authentication with Dex](../deploying/github-oidc.md).
 
 ## Responses
 

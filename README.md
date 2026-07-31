@@ -145,6 +145,8 @@ provider bearer token. See the
 [Codex custom-provider authentication reference](https://developers.openai.com/codex/config-advanced#custom-model-providers).
 Keep the inference credential in the gateway's `OPENAI_API_KEY`; do not print that service credential from the token
 command.
+See [GitHub authentication with Dex](docs/deploying/github-oidc.md) for a complete GitHub login, token-helper, and
+gateway setup.
 
 ## 🧑‍💻 Claude Code on your own GPUs
 
@@ -171,6 +173,8 @@ claude -p "summarize the files in this directory"
 
 Refresh `ANTHROPIC_AUTH_TOKEN` before it expires. For supported dynamic credential helpers, see Anthropic's
 [LLM gateway authentication guide](https://docs.anthropic.com/en/docs/claude-code/llm-gateway).
+The same [GitHub authentication with Dex](docs/deploying/github-oidc.md) guide shows how to obtain the ID token
+without embedding a client secret in Claude Code.
 
 Claude Code's own tools (Bash, Edit, Read, …) stay **client-owned** — Claude Code runs them, as usual.
 

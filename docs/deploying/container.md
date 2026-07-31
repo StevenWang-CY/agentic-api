@@ -74,6 +74,7 @@ The gateway discovers the provider and its JSON Web Key Set before listening. `/
 all `/v1/*` routes then require an OIDC `Authorization: Bearer` token. The identity token is consumed by the gateway,
 and `OPENAI_API_KEY` supplies the upstream inference credential. See
 [OIDC bearer authentication](../design/oidc-bearer-authentication.md) for the validation and key-rotation contract.
+For a runnable GitHub-backed setup, follow [GitHub authentication with Dex](github-oidc.md).
 
 If the upstream is running on the Docker host, use `http://host.docker.internal:<port>` on Docker Desktop. On Linux, add `--add-host host.docker.internal:host-gateway`.
 
