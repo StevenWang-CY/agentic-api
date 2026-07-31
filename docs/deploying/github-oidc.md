@@ -9,7 +9,8 @@ GitHub OAuth → Dex OIDC ID token → agentic-api bearer validation
 
 GitHub's API and OAuth access tokens are not OIDC ID tokens, so callers cannot send them directly to agentic-api.
 Dex is the tested provider in this walkthrough, but any OIDC provider can be used when its issuer, audience,
-asymmetric signing keys, and claims satisfy the gateway's [validation contract](../design/oidc-bearer-authentication.md).
+asymmetric signing keys, and claims satisfy the gateway's
+[validation contract](../design/oidc-bearer-authentication.md).
 
 !!! warning "Security boundary"
 
