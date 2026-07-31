@@ -458,21 +458,22 @@ git commit -s -m "docs: link GitHub OIDC deployment guide"
 
 - [ ] **Step 1: Apply the Rust guidance during self-review**
 
-Read `/Users/farceo/.agents/skills/rust-skills/SKILL.md` completely. Although this slice is documentation-only,
-confirm the tutorial matches the implemented Rust configuration, authentication boundary, error behavior, and
-credential forwarding behavior. Do not change Rust unless the documentation exposes an in-scope correctness defect.
+Read the `rust-skills` instructions from the available skills catalog completely. Although this slice is
+documentation-only, confirm the tutorial matches the implemented Rust configuration, authentication boundary, error
+behavior, and credential forwarding behavior. Do not change Rust unless the documentation exposes an in-scope
+correctness defect.
 
 - [ ] **Step 2: Run the read-only Claude review**
 
-Read `/Users/farceo/.codex/skills/claude-review/SKILL.md` completely and run its worktree review against the diff from
-`origin/main`. Record every finding and classify it as actionable, already addressed, out of scope, or incorrect with
-specific evidence.
+Read the `claude-review` instructions from the available skills catalog completely and run its worktree review against
+the diff from `origin/main`. Record every finding and classify it as actionable, already addressed, out of scope, or
+incorrect with specific evidence.
 
 - [ ] **Step 3: Run the gstack pre-landing review**
 
-Read `/Users/farceo/.agents/skills/gstack/review/SKILL.md` completely and run the prescribed pre-landing review against
-the same diff. Pay particular attention to credential leakage, misleading production advice, broken commands, broken
-links, and scope expansion into issue #107.
+Read the `review` instructions from the available skills catalog completely and run the prescribed pre-landing review
+against the same diff. Pay particular attention to credential leakage, misleading production advice, broken commands,
+broken links, and scope expansion into issue #107.
 
 - [ ] **Step 4: Resolve all actionable review feedback**
 
