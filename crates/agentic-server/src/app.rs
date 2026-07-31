@@ -137,7 +137,8 @@ pub fn build_router_with_auth(
         .route("/v1/models", get(models))
         .route(ANTHROPIC_MESSAGES_PATH, post(messages))
         .route(ANTHROPIC_COUNT_TOKENS_PATH, post(count_tokens))
-        .route("/v1/responses", post(responses).get(responses_ws_with_auth));
+        .route("/v1/responses", post(responses).get(responses_ws_with_auth))
+        .route("/v1/responses/compact", post(compact_response));
     let protected_routes = match authenticator {
         Some(authenticator) => {
             protected_routes.route_layer(middleware::from_fn_with_state(authenticator, require_oidc))

@@ -863,6 +863,7 @@ async fn every_v1_route_rejects_missing_credentials() {
         "/v1/messages",
         "/v1/messages/count_tokens",
         "/v1/responses",
+        "/v1/responses/compact",
     ] {
         let response = client
             .post(format!("http://{}{path}", gateway.address))
