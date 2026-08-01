@@ -26,12 +26,12 @@ responses are limited to 1 MiB and JWKS documents to 100 keys.
 
 Verification keys are cached for the provider's `Cache-Control: max-age` duration, capped at one hour, or five minutes
 when no cache lifetime is supplied. A stale cache is refreshed before a cached key is accepted, so a provider can
-remove a compromised key without requiring a gateway restart. Unknown key IDs can trigger at most one refresh per
-30-second cooldown after a completed fetch. Refreshes are single-flight, and every successfully fetched key set is
-installed even when it does not contain the key requested by the triggering token.
+remove a compromised key without requiring a gateway restart. While cached keys remain fresh, unknown key IDs can
+trigger at most one refresh per 30-second cooldown after a completed fetch. Refreshes are single-flight, and every
+successfully fetched key set is installed even when it does not contain the key requested by the triggering token.
 Concurrent refresh waiters reuse the completed result. After a refresh failure, another provider request is suppressed
 for 30 seconds and callers receive `503 Service Unavailable`; a one-second coalescing window also prevents a
-provider-supplied zero-second cache lifetime from causing one fetch per concurrent request.
+provider-supplied zero-second cache lifetime from causing one fetch per concurrent request after the cache expires.
 
 ## Request boundary
 
