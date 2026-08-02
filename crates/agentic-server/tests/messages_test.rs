@@ -14,6 +14,9 @@ use tokio::sync::Mutex;
 
 use common::{spawn_gateway, test_config, test_state};
 
+const CLAUDE_CODE_CACHE_CONTROL_REQUEST: &[u8] =
+    include_bytes!("../../agentic-server-core/tests/fixtures/claude-code-cache-control-request.json");
+
 #[derive(Clone, Debug)]
 struct RecordedRequest {
     uri: String,
@@ -26,26 +29,38 @@ async fn spawn_recording_upstream(
     content_type: &'static str,
     response_body: &'static str,
 ) -> (String, Arc<Mutex<Vec<RecordedRequest>>>, tokio::task::JoinHandle<()>) {
+    spawn_recording_upstream_with_headers(status, content_type, response_body, HeaderMap::new()).await
+}
+
+async fn spawn_recording_upstream_with_headers(
+    status: StatusCode,
+    content_type: &'static str,
+    response_body: &'static str,
+    response_headers: HeaderMap,
+) -> (String, Arc<Mutex<Vec<RecordedRequest>>>, tokio::task::JoinHandle<()>) {
     let requests = Arc::new(Mutex::new(Vec::new()));
     let route_requests = Arc::clone(&requests);
     let count_tokens_requests = Arc::clone(&requests);
+    let route_response_headers = response_headers.clone();
     let app = Router::new()
         .route(
             "/v1/messages",
             post(move |OriginalUri(uri), headers: HeaderMap, body: Bytes| {
                 let route_requests = Arc::clone(&route_requests);
+                let response_headers = route_response_headers.clone();
                 async move {
                     route_requests.lock().await.push(RecordedRequest {
                         uri: uri.to_string(),
                         headers,
                         body,
                     });
-                    Response::builder()
+                    let mut response = Response::builder()
                         .status(status)
                         .header("content-type", content_type)
                         .body(axum::body::Body::from(response_body))
-                        .unwrap()
-                        .into_response()
+                        .unwrap();
+                    response.headers_mut().extend(response_headers);
+                    response.into_response()
                 }
             }),
         )
@@ -53,18 +68,20 @@ async fn spawn_recording_upstream(
             "/v1/messages/count_tokens",
             post(move |OriginalUri(uri), headers: HeaderMap, body: Bytes| {
                 let route_requests = Arc::clone(&count_tokens_requests);
+                let response_headers = response_headers.clone();
                 async move {
                     route_requests.lock().await.push(RecordedRequest {
                         uri: uri.to_string(),
                         headers,
                         body,
                     });
-                    Response::builder()
+                    let mut response = Response::builder()
                         .status(status)
                         .header("content-type", content_type)
                         .body(axum::body::Body::from(response_body))
-                        .unwrap()
-                        .into_response()
+                        .unwrap();
+                    response.headers_mut().extend(response_headers);
+                    response.into_response()
                 }
             }),
         );
@@ -137,6 +154,25 @@ async fn messages_forwards_system_attribution_blocks_verbatim() {
 }
 
 #[tokio::test]
+async fn messages_proxy_preserves_claude_code_cache_control_body_verbatim() {
+    let (llm_url, requests, _upstream) =
+        spawn_recording_upstream(StatusCode::OK, "application/json", r#"{"id":"msg_cache"}"#).await;
+    let (gateway_url, _gateway) = spawn_gateway(test_state(&test_config(&llm_url))).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/v1/messages"))
+        .body(CLAUDE_CODE_CACHE_CONTROL_REQUEST.to_vec())
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let requests = requests.lock().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].body.as_ref(), CLAUDE_CODE_CACHE_CONTROL_REQUEST);
+}
+
+#[tokio::test]
 async fn messages_forwards_sse_bytes_unchanged() {
     let sse = "event: message_start\ndata: {\"type\":\"message_start\"}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
     let (llm_url, _requests, _upstream) = spawn_recording_upstream(StatusCode::OK, "text/event-stream", sse).await;
@@ -197,6 +233,55 @@ async fn messages_preserves_upstream_error_status_and_body() {
 }
 
 #[tokio::test]
+async fn messages_gateway_loop_preserves_upstream_error_status_and_body() {
+    let upstream_error = r#"{"type":"error","error":{"type":"invalid_request_error","message":"bad thinking field"}}"#;
+    let mut upstream_headers = HeaderMap::new();
+    upstream_headers.insert("request-id", "req_error".parse().unwrap());
+    upstream_headers.insert("retry-after", "7".parse().unwrap());
+    let (llm_url, _requests, _upstream) = spawn_recording_upstream_with_headers(
+        StatusCode::BAD_REQUEST,
+        "application/json",
+        upstream_error,
+        upstream_headers,
+    )
+    .await;
+    let (gateway_url, _gateway) = spawn_gateway(test_state(&test_config(&llm_url))).await;
+    let body = br#"{"model":"qwen3","max_tokens":256,"stream":false,"messages":[{"role":"user","content":"search"}],"tools":[{"name":"web_search","input_schema":{"type":"object"}}]}"#;
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/v1/messages"))
+        .body(body.to_vec())
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response.headers()["request-id"], "req_error");
+    assert_eq!(response.headers()["retry-after"], "7");
+    assert_eq!(response.text().await.unwrap(), upstream_error);
+}
+
+#[tokio::test]
+async fn messages_gateway_stream_preserves_initial_upstream_error_status_and_body() {
+    let upstream_error =
+        r#"{"type":"error","error":{"type":"invalid_request_error","message":"unsupported adaptive thinking"}}"#;
+    let (llm_url, _requests, _upstream) =
+        spawn_recording_upstream(StatusCode::BAD_REQUEST, "application/json", upstream_error).await;
+    let (gateway_url, _gateway) = spawn_gateway(test_state(&test_config(&llm_url))).await;
+    let body = br#"{"model":"qwen3","max_tokens":256,"stream":true,"messages":[{"role":"user","content":"search"}],"tools":[{"name":"web_search","input_schema":{"type":"object"}}]}"#;
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/v1/messages"))
+        .body(body.to_vec())
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response.text().await.unwrap(), upstream_error);
+}
+
+#[tokio::test]
 async fn messages_returns_anthropic_error_for_unreachable_upstream() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let dead_addr = listener.local_addr().unwrap();
@@ -214,6 +299,34 @@ async fn messages_returns_anthropic_error_for_unreachable_upstream() {
     let body: serde_json::Value = response.json().await.unwrap();
     assert_eq!(
         body,
+        serde_json::json!({
+            "type": "error",
+            "error": {
+                "type": "api_error",
+                "message": "LLM unavailable",
+            },
+        })
+    );
+}
+
+#[tokio::test]
+async fn messages_gateway_loop_returns_anthropic_error_for_unreachable_upstream() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dead_addr = listener.local_addr().unwrap();
+    drop(listener);
+    let (gateway_url, _gateway) = spawn_gateway(test_state(&test_config(&format!("http://{dead_addr}")))).await;
+    let body = br#"{"model":"qwen3","max_tokens":256,"stream":false,"messages":[{"role":"user","content":"search"}],"tools":[{"name":"web_search","input_schema":{"type":"object"}}]}"#;
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/v1/messages"))
+        .body(body.to_vec())
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        response.json::<serde_json::Value>().await.unwrap(),
         serde_json::json!({
             "type": "error",
             "error": {
@@ -275,6 +388,94 @@ async fn messages_with_web_search_tool_routes_to_native_loop() {
     assert_eq!(json["role"], "assistant");
     assert_eq!(json["content"][0]["text"], "Rust 1.89.0.");
     assert_eq!(json["stop_reason"], "end_turn");
+}
+
+#[tokio::test]
+async fn messages_gateway_loop_forwards_query_and_open_headers() {
+    let final_msg = r#"{"id":"m","type":"message","role":"assistant","model":"qwen3","content":[{"type":"text","text":"done"}],"stop_reason":"end_turn","usage":{"input_tokens":5,"output_tokens":1}}"#;
+    let mut upstream_headers = HeaderMap::new();
+    upstream_headers.insert("request-id", "req_terminal".parse().unwrap());
+    upstream_headers.insert("anthropic-ratelimit-requests-remaining", "41".parse().unwrap());
+    let (llm_url, requests, _upstream) =
+        spawn_recording_upstream_with_headers(StatusCode::OK, "application/json", final_msg, upstream_headers).await;
+    let (gateway_url, _gateway) = spawn_gateway(test_state(&test_config(&llm_url))).await;
+    let body = br#"{"model":"qwen3","max_tokens":256,"stream":false,"messages":[{"role":"user","content":"search"}],"tools":[{"name":"web_search","input_schema":{"type":"object"}}]}"#;
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/v1/messages?beta=true"))
+        .header("anthropic-version", "2023-06-01")
+        .header("anthropic-beta", "future-beta-unknown,interleaved-thinking-2025-05-14")
+        .header("x-claude-code-session-id", "session-loop")
+        .header("x-claude-code-agent-id", "agent-loop")
+        .header("x-api-key", "anthropic-key")
+        .body(body.to_vec())
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["request-id"], "req_terminal");
+    assert_eq!(response.headers()["anthropic-ratelimit-requests-remaining"], "41");
+    let requests = requests.lock().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].uri, "/v1/messages?beta=true");
+    assert_eq!(requests[0].headers["anthropic-version"], "2023-06-01");
+    assert_eq!(
+        requests[0].headers["anthropic-beta"],
+        "future-beta-unknown,interleaved-thinking-2025-05-14"
+    );
+    assert_eq!(requests[0].headers["x-claude-code-session-id"], "session-loop");
+    assert_eq!(requests[0].headers["x-claude-code-agent-id"], "agent-loop");
+    assert_eq!(requests[0].headers["x-api-key"], "anthropic-key");
+    assert!(!requests[0].headers.contains_key("authorization"));
+}
+
+#[tokio::test]
+async fn messages_gateway_stream_forwards_query_and_open_headers() {
+    let final_sse = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"qwen3\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"done\"}}\n\n",
+        "event: content_block_stop\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "event: message_delta\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":1}}\n\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n\n",
+    );
+    let mut upstream_headers = HeaderMap::new();
+    upstream_headers.insert("request-id", "req_stream".parse().unwrap());
+    upstream_headers.insert("anthropic-ratelimit-tokens-remaining", "900".parse().unwrap());
+    let (llm_url, requests, _upstream) =
+        spawn_recording_upstream_with_headers(StatusCode::OK, "text/event-stream", final_sse, upstream_headers).await;
+    let (gateway_url, _gateway) = spawn_gateway(test_state(&test_config(&llm_url))).await;
+    let body = br#"{"model":"qwen3","max_tokens":256,"stream":true,"messages":[{"role":"user","content":"search"}],"tools":[{"name":"web_search","input_schema":{"type":"object"}}]}"#;
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/v1/messages?beta=true"))
+        .header("anthropic-version", "2023-06-01")
+        .header("anthropic-beta", "future-beta-unknown")
+        .header("x-claude-code-session-id", "session-stream")
+        .header("x-api-key", "anthropic-key")
+        .body(body.to_vec())
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["request-id"], "req_stream");
+    assert_eq!(response.headers()["anthropic-ratelimit-tokens-remaining"], "900");
+    assert!(response.text().await.unwrap().contains("done"));
+    let requests = requests.lock().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].uri, "/v1/messages?beta=true");
+    assert_eq!(requests[0].headers["anthropic-version"], "2023-06-01");
+    assert_eq!(requests[0].headers["anthropic-beta"], "future-beta-unknown");
+    assert_eq!(requests[0].headers["x-claude-code-session-id"], "session-stream");
+    assert_eq!(requests[0].headers["x-api-key"], "anthropic-key");
 }
 
 // A request with NO gateway-owned tool stays on the transparent proxy — the
