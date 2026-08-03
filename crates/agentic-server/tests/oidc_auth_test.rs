@@ -4,10 +4,10 @@ mod common;
 use axum::body::{Body, Bytes};
 use axum::http::{HeaderMap, HeaderValue, Response, StatusCode};
 use axum::response::IntoResponse;
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Extension, Json, Router, middleware};
 use common::{test_config, test_state};
-use futures::stream;
+use futures::{SinkExt, StreamExt, stream};
 use jsonwebtoken::jwk::{Jwk, KeyAlgorithm, PublicKeyUse};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use rand::rngs::OsRng;
@@ -18,6 +18,8 @@ use serde_json::{Value, json};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::protocol::Message as TungsteniteMessage;
 
 use agentic_server::app::{ServerConfig, build_router_with_auth};
 use agentic_server::auth::{AuthenticatedPrincipal, OidcAuthError, OidcAuthenticator, OidcConfig, require_oidc};
@@ -330,6 +332,28 @@ fn identity_token_with_audiences(
     .expect("encode multi-audience identity token")
 }
 
+fn identity_token_with_authorized_party(
+    issuer: &str,
+    audience: &str,
+    authorized_party: &str,
+    private_key_der: &[u8],
+) -> String {
+    let mut header = Header::new(Algorithm::RS256);
+    header.kid = Some("test-key".to_owned());
+    encode(
+        &header,
+        &json!({
+            "iss": issuer,
+            "sub": "github-user-123",
+            "aud": audience,
+            "azp": authorized_party,
+            "exp": jsonwebtoken::get_current_timestamp() + 300
+        }),
+        &EncodingKey::from_rsa_der(private_key_der),
+    )
+    .expect("encode identity token with authorized party")
+}
+
 fn custom_identity_token(header: &Header, claims: &Value, private_key_der: &[u8]) -> String {
     encode(header, claims, &EncodingKey::from_rsa_der(private_key_der)).expect("encode custom identity token")
 }
@@ -372,6 +396,40 @@ async fn spawn_models_upstream() -> (
             async move {
                 *captured_headers.lock().expect("capture headers") = Some(headers);
                 Json(json!({"object": "list", "data": []}))
+            }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind upstream");
+    let address = listener.local_addr().expect("upstream address");
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, upstream).await.expect("serve upstream");
+    });
+    (format!("http://{address}"), observed_headers, handle)
+}
+
+async fn spawn_anthropic_upstream() -> (
+    String,
+    std::sync::Arc<std::sync::Mutex<Option<HeaderMap>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let observed_headers = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let captured_headers = std::sync::Arc::clone(&observed_headers);
+    let upstream = Router::new().route(
+        "/v1/messages",
+        post(move |headers: HeaderMap| {
+            let captured_headers = std::sync::Arc::clone(&captured_headers);
+            async move {
+                *captured_headers.lock().expect("capture headers") = Some(headers);
+                Json(json!({
+                    "id": "msg_test",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [],
+                    "model": "test-model",
+                    "stop_reason": "end_turn",
+                    "stop_sequence": null,
+                    "usage": {"input_tokens": 0, "output_tokens": 0}
+                }))
             }
         }),
     );
@@ -488,10 +546,6 @@ async fn configured_oidc_accepts_valid_identity_and_uses_service_upstream_creden
     );
     let mut identity_headers = HeaderMap::new();
     identity_headers.append("x-api-key", HeaderValue::from_static("distinct-upstream-key"));
-    identity_headers.append(
-        "x-api-key",
-        HeaderValue::from_str(&identity_token).expect("identity header value"),
-    );
 
     let response = reqwest::Client::new()
         .get(format!("http://{}/v1/models", gateway.address))
@@ -517,8 +571,44 @@ async fn configured_oidc_accepts_valid_identity_and_uses_service_upstream_creden
     );
     assert!(
         headers.get("x-api-key").is_none(),
-        "duplicate identity credential must not reach the upstream"
+        "caller-supplied OpenAI API key must not reach the upstream"
     );
+}
+
+#[tokio::test]
+async fn configured_oidc_preserves_distinct_anthropic_upstream_credential() {
+    let (issuer, private_key_der, _public_jwk, _jwks_requests, _provider) = spawn_oidc_provider().await;
+    let authenticator = discover_test_authenticator(&issuer).await;
+    let (upstream_url, observed_headers, _upstream) = spawn_anthropic_upstream().await;
+    let gateway = spawn_gateway(authenticator, &upstream_url).await;
+    let identity_token = identity_token(
+        &issuer,
+        TEST_AUDIENCE,
+        jsonwebtoken::get_current_timestamp() + 300,
+        "test-key",
+        &private_key_der,
+    );
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{}/v1/messages", gateway.address))
+        .bearer_auth(identity_token)
+        .header("x-api-key", "distinct-upstream-key")
+        .json(&json!({"model": "test-model", "max_tokens": 1, "messages": []}))
+        .send()
+        .await
+        .expect("request gateway");
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let headers = observed_headers
+        .lock()
+        .expect("read captured headers")
+        .clone()
+        .expect("upstream request");
+    assert_eq!(
+        headers.get("x-api-key"),
+        Some(&HeaderValue::from_static("distinct-upstream-key"))
+    );
+    assert!(headers.get(reqwest::header::AUTHORIZATION).is_none());
 }
 
 #[tokio::test]
@@ -786,22 +876,36 @@ async fn jwks_refresh_failure_returns_protocol_specific_service_errors() {
 }
 
 #[tokio::test]
-async fn multi_audience_tokens_require_the_expected_authorized_party() {
+async fn tokens_require_only_trusted_audiences_and_matching_authorized_party() {
     let (issuer, private_key, _public_jwk, _jwks_requests, _provider) = spawn_oidc_provider().await;
     let authenticator = discover_test_authenticator(&issuer).await;
     let (upstream_url, _observed_headers, _upstream) = spawn_models_upstream().await;
     let gateway = spawn_gateway(authenticator, &upstream_url).await;
 
-    for (authorized_party, expected_status) in [
-        (Some("other-client"), reqwest::StatusCode::UNAUTHORIZED),
-        (None, reqwest::StatusCode::UNAUTHORIZED),
-        (Some("agentic-api"), reqwest::StatusCode::OK),
+    for (audiences, authorized_party, expected_status) in [
+        (&["agentic-api"][..], None, reqwest::StatusCode::OK),
+        (&["agentic-api"][..], Some("agentic-api"), reqwest::StatusCode::OK),
+        (
+            &["agentic-api"][..],
+            Some("other-client"),
+            reqwest::StatusCode::UNAUTHORIZED,
+        ),
+        (
+            &["agentic-api", "other-client"][..],
+            Some("agentic-api"),
+            reqwest::StatusCode::UNAUTHORIZED,
+        ),
+        (
+            &["agentic-api", "other-client"][..],
+            None,
+            reqwest::StatusCode::UNAUTHORIZED,
+        ),
     ] {
         let response = reqwest::Client::new()
             .get(format!("http://{}/v1/models", gateway.address))
             .bearer_auth(identity_token_with_audiences(
                 &issuer,
-                &["agentic-api", "other-client"],
+                audiences,
                 authorized_party,
                 &private_key,
             ))
@@ -810,6 +914,22 @@ async fn multi_audience_tokens_require_the_expected_authorized_party() {
             .expect("multi-audience request");
         assert_eq!(response.status(), expected_status);
     }
+
+    let scalar_audience_with_conflicting_party = reqwest::Client::new()
+        .get(format!("http://{}/v1/models", gateway.address))
+        .bearer_auth(identity_token_with_authorized_party(
+            &issuer,
+            TEST_AUDIENCE,
+            "other-client",
+            &private_key,
+        ))
+        .send()
+        .await
+        .expect("scalar-audience request");
+    assert_eq!(
+        scalar_audience_with_conflicting_party.status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
 }
 
 #[tokio::test]
@@ -895,4 +1015,84 @@ async fn every_v1_route_rejects_missing_credentials() {
         .await
         .expect("public readiness request");
     assert_ne!(ready.status(), reqwest::StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn authenticated_websocket_rejects_requests_after_identity_expiry() {
+    let (issuer, private_key, _public_jwk, _jwks_requests, _provider) = spawn_oidc_provider().await;
+    let authenticator = discover_test_authenticator(&issuer).await;
+    let gateway = spawn_gateway(authenticator, "http://127.0.0.1:9").await;
+    let expires_at = jsonwebtoken::get_current_timestamp().saturating_sub(50);
+    let token = identity_token(&issuer, TEST_AUDIENCE, expires_at, "test-key", &private_key);
+    let mut request = format!("ws://{}/v1/responses", gateway.address)
+        .into_client_request()
+        .expect("WebSocket request");
+    request.headers_mut().insert(
+        reqwest::header::AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {token}")).expect("identity header"),
+    );
+    let (mut websocket, _response) = tokio_tungstenite::connect_async(request)
+        .await
+        .expect("authenticated WebSocket upgrade");
+
+    while jsonwebtoken::get_current_timestamp() <= expires_at.saturating_add(60) {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    websocket
+        .send(TungsteniteMessage::Text(
+            json!({"type": "response.create", "response": {"input": "must not run"}})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .expect("send post-expiry request");
+    let event = tokio::time::timeout(std::time::Duration::from_secs(2), websocket.next())
+        .await
+        .expect("expiry event must arrive promptly")
+        .expect("expiry event")
+        .expect("valid expiry frame")
+        .into_text()
+        .expect("text expiry frame");
+    assert_eq!(
+        serde_json::from_str::<Value>(&event).expect("expiry event JSON"),
+        json!({
+            "type": "error",
+            "code": "invalid_token",
+            "message": "OIDC bearer token expired",
+            "param": null,
+            "sequence_number": 0
+        })
+    );
+    assert!(matches!(
+        tokio::time::timeout(std::time::Duration::from_secs(2), websocket.next())
+            .await
+            .expect("WebSocket must close promptly after expiry"),
+        Some(Ok(TungsteniteMessage::Close(_))) | None
+    ));
+}
+
+#[tokio::test]
+async fn anthropic_authentication_errors_include_matching_request_id() {
+    let (issuer, _private_key, _public_jwk, _jwks_requests, _provider) = spawn_oidc_provider().await;
+    let authenticator = discover_test_authenticator(&issuer).await;
+    let gateway = spawn_gateway(authenticator, "http://127.0.0.1:9").await;
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{}/v1/messages", gateway.address))
+        .send()
+        .await
+        .expect("missing-credential Anthropic request");
+    assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let request_id = response
+        .headers()
+        .get("request-id")
+        .expect("Anthropic request-id header")
+        .to_str()
+        .expect("request ID must be ASCII")
+        .to_owned();
+    let body = response.json::<Value>().await.expect("Anthropic authentication error");
+
+    assert!(request_id.starts_with("req_"));
+    assert_eq!(body["request_id"], request_id);
+    assert_eq!(body["error"]["type"], "authentication_error");
 }

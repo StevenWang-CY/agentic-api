@@ -21,9 +21,6 @@ pub(super) enum WsError {
     #[error("websocket messages must be JSON text frames")]
     BinaryFrame,
 
-    #[error("OIDC bearer token expired")]
-    AuthenticationExpired,
-
     #[error("websocket send failed")]
     SendFailed,
 
@@ -39,7 +36,6 @@ impl WsError {
         match self {
             Self::Executor(err) => err.http_status(),
             Self::InvalidJson(_) | Self::UnexpectedType | Self::BinaryFrame => StatusCode::BAD_REQUEST,
-            Self::AuthenticationExpired => StatusCode::UNAUTHORIZED,
             Self::SerializeJson(_) | Self::SendFailed | Self::ClientDisconnected | Self::Receive(_) => {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
@@ -51,7 +47,6 @@ impl WsError {
             Self::Executor(err) => err.error_code(),
             Self::InvalidJson(_) => "invalid_json",
             Self::UnexpectedType | Self::BinaryFrame => "invalid_request_error",
-            Self::AuthenticationExpired => "invalid_token",
             Self::SerializeJson(_) | Self::SendFailed | Self::ClientDisconnected | Self::Receive(_) => "server_error",
         }
     }

@@ -29,9 +29,11 @@ when no cache lifetime is supplied. A stale cache is refreshed before a cached k
 remove a compromised key without requiring a gateway restart. While cached keys remain fresh, unknown key IDs can
 trigger at most one refresh per 30-second cooldown after a completed fetch. Refreshes are single-flight, and every
 successfully fetched key set is installed even when it does not contain the key requested by the triggering token.
-Concurrent refresh waiters reuse the completed result. After a refresh failure, another provider request is suppressed
-for 30 seconds and callers receive `503 Service Unavailable`; a one-second coalescing window also prevents a
-provider-supplied zero-second cache lifetime from causing one fetch per concurrent request after the cache expires.
+Concurrent refresh waiters reuse a result that completes within one second; longer waits return `503 Service
+Unavailable` so stalled provider fetches cannot accumulate unbounded request waiters. After a refresh failure, another
+provider request is suppressed for 30 seconds and callers receive `503 Service Unavailable`; a one-second coalescing
+window also prevents a provider-supplied zero-second cache lifetime from causing one fetch per concurrent request
+after the cache expires.
 
 ## Request boundary
 
@@ -46,7 +48,7 @@ The gateway verifies:
 - an asymmetric token signing algorithm and a signature from the provider JWKS;
 - a signing key whose `kid`, `alg`, `use`, and `key_ops` permit verification;
 - required `iss`, `aud`, `sub`, and `exp` claims;
-- issuer and audience equality, plus `azp` equality when a token has multiple audiences;
+- issuer equality; every `aud` value equal to the configured audience; and any present `azp` value equal to it;
 - expiration and, when present, the not-before time.
 
 Successful authentication inserts the stable issuer and subject pair into request extensions as the authenticated

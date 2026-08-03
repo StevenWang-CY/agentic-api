@@ -16,14 +16,28 @@ use tokio::sync::RwLock;
 use tracing::{debug, warn};
 use url::{Host, Url};
 
+use agentic_core::utils::common::uuid7_str;
+
 const OIDC_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 const JWKS_REFRESH_COOLDOWN: Duration = Duration::from_secs(30);
 const JWKS_REFRESH_COALESCE_WINDOW: Duration = Duration::from_secs(1);
+const JWKS_REFRESH_WAIT_TIMEOUT: Duration = Duration::from_secs(1);
 const DEFAULT_JWKS_TTL: Duration = Duration::from_secs(300);
 const MAX_JWKS_TTL: Duration = Duration::from_secs(3600);
 const MAX_PROVIDER_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_JWKS_KEYS: usize = 100;
 const JWT_CLOCK_SKEW_SECONDS: u64 = 60;
+const SUPPORTED_VERIFICATION_ALGORITHMS: [Algorithm; 9] = [
+    Algorithm::ES256,
+    Algorithm::ES384,
+    Algorithm::RS256,
+    Algorithm::RS384,
+    Algorithm::RS512,
+    Algorithm::PS256,
+    Algorithm::PS384,
+    Algorithm::PS512,
+    Algorithm::EdDSA,
+];
 
 pub(crate) const ANTHROPIC_MESSAGES_PATH: &str = "/v1/messages";
 pub(crate) const ANTHROPIC_COUNT_TOKENS_PATH: &str = "/v1/messages/count_tokens";
@@ -99,6 +113,48 @@ struct RefreshState {
     last_completed: Instant,
     retry_after: Option<Instant>,
     coalesce_until: Option<Instant>,
+}
+
+struct RefreshAttempt {
+    refresh_state: Arc<std::sync::Mutex<RefreshState>>,
+    retry_after: Instant,
+    clear_on_drop: bool,
+}
+
+impl RefreshAttempt {
+    fn begin(refresh_state: Arc<std::sync::Mutex<RefreshState>>) -> Result<Self, OidcAuthError> {
+        let retry_after = Instant::now() + JWKS_REFRESH_COOLDOWN;
+        refresh_state
+            .lock()
+            .map_err(|_| OidcAuthError::RefreshStateUnavailable)?
+            .retry_after = Some(retry_after);
+        Ok(Self {
+            refresh_state,
+            retry_after,
+            clear_on_drop: true,
+        })
+    }
+
+    fn retain_backoff(mut self) {
+        self.clear_on_drop = false;
+    }
+
+    fn complete(mut self) {
+        self.clear_on_drop = false;
+    }
+}
+
+impl Drop for RefreshAttempt {
+    fn drop(&mut self) {
+        if !self.clear_on_drop {
+            return;
+        }
+        if let Ok(mut refresh_state) = self.refresh_state.lock()
+            && refresh_state.retry_after == Some(self.retry_after)
+        {
+            refresh_state.retry_after = None;
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -200,10 +256,9 @@ impl OidcAuthenticator {
             }
         }
 
-        let _refresh_permit = self
-            .refresh_gate
-            .acquire()
+        let _refresh_permit = tokio::time::timeout(JWKS_REFRESH_WAIT_TIMEOUT, self.refresh_gate.acquire())
             .await
+            .map_err(|_| OidcAuthError::JwksRefreshBackoff)?
             .map_err(|_| OidcAuthError::RefreshStateUnavailable)?;
         {
             let keys = self.keys.read().await;
@@ -228,11 +283,14 @@ impl OidcAuthenticator {
             }
         }
 
-        self.refresh_state
-            .lock()
-            .map_err(|_| OidcAuthError::RefreshStateUnavailable)?
-            .retry_after = Some(Instant::now() + JWKS_REFRESH_COOLDOWN);
-        let refreshed = fetch_jwks(&self.client, self.jwks_uri.clone()).await?;
+        let refresh_attempt = RefreshAttempt::begin(Arc::clone(&self.refresh_state))?;
+        let refreshed = match fetch_jwks(&self.client, self.jwks_uri.clone()).await {
+            Ok(refreshed) => refreshed,
+            Err(error) => {
+                refresh_attempt.retain_backoff();
+                return Err(error);
+            }
+        };
         let key = refreshed.keys.get(kid).cloned();
         *self.keys.write().await = refreshed;
         let refresh_completed = Instant::now();
@@ -243,6 +301,8 @@ impl OidcAuthenticator {
         refresh_state.last_completed = refresh_completed;
         refresh_state.retry_after = None;
         refresh_state.coalesce_until = Some(refresh_completed + JWKS_REFRESH_COALESCE_WINDOW);
+        drop(refresh_state);
+        refresh_attempt.complete();
         key.ok_or(OidcAuthError::UnknownKeyId)
     }
 }
@@ -306,7 +366,7 @@ pub async fn require_oidc(
     match authenticator.authenticate(token).await {
         Ok(principal) => {
             request.headers_mut().remove(header::AUTHORIZATION);
-            if duplicate_identity_api_key {
+            if duplicate_identity_api_key || !error_format.allows_upstream_api_key() {
                 request.headers_mut().remove("x-api-key");
             }
             request.extensions_mut().insert(principal);
@@ -350,6 +410,10 @@ impl AuthErrorFormat {
             Self::OpenAi
         }
     }
+
+    fn allows_upstream_api_key(self) -> bool {
+        matches!(self, Self::Anthropic)
+    }
 }
 
 fn authentication_error(format: AuthErrorFormat, code: &'static str, message: &'static str) -> Response {
@@ -385,26 +449,39 @@ fn protocol_error(
     message: &'static str,
     challenge: bool,
 ) -> Response {
-    let body = match format {
-        AuthErrorFormat::OpenAi => json!({
-            "error": {
-                "message": message,
-                "type": openai_error_type,
-                "param": null,
-                "code": code
-            }
-        }),
-        AuthErrorFormat::Anthropic => json!({
-            "type": "error",
-            "error": {
-                "type": anthropic_error_type,
-                "message": message
-            }
-        }),
+    let (body, request_id) = match format {
+        AuthErrorFormat::OpenAi => (
+            json!({
+                "error": {
+                    "message": message,
+                    "type": openai_error_type,
+                    "param": null,
+                    "code": code
+                }
+            }),
+            None,
+        ),
+        AuthErrorFormat::Anthropic => {
+            let request_id = uuid7_str("req_");
+            (
+                json!({
+                    "type": "error",
+                    "error": {
+                        "type": anthropic_error_type,
+                        "message": message
+                    },
+                    "request_id": &request_id
+                }),
+                Some(request_id),
+            )
+        }
     };
     let mut builder = Response::builder()
         .status(status)
         .header(header::CONTENT_TYPE, "application/json");
+    if let Some(request_id) = request_id.as_deref() {
+        builder = builder.header("request-id", request_id);
+    }
     if challenge {
         builder = builder.header(header::WWW_AUTHENTICATE, "Bearer");
     }
@@ -540,51 +617,48 @@ fn verification_algorithm(key: &Jwk) -> VerificationAlgorithm {
     }
 
     match key.common.key_algorithm {
-        Some(key_algorithm) => VerificationAlgorithm::Exact(match key_algorithm {
-            KeyAlgorithm::ES256 => Algorithm::ES256,
-            KeyAlgorithm::ES384 => Algorithm::ES384,
-            KeyAlgorithm::RS256 => Algorithm::RS256,
-            KeyAlgorithm::RS384 => Algorithm::RS384,
-            KeyAlgorithm::RS512 => Algorithm::RS512,
-            KeyAlgorithm::PS256 => Algorithm::PS256,
-            KeyAlgorithm::PS384 => Algorithm::PS384,
-            KeyAlgorithm::PS512 => Algorithm::PS512,
-            KeyAlgorithm::EdDSA => Algorithm::EdDSA,
-            KeyAlgorithm::HS256
-            | KeyAlgorithm::HS384
-            | KeyAlgorithm::HS512
-            | KeyAlgorithm::RSA1_5
-            | KeyAlgorithm::RSA_OAEP
-            | KeyAlgorithm::RSA_OAEP_256
-            | KeyAlgorithm::UNKNOWN_ALGORITHM => return VerificationAlgorithm::Skip,
-        }),
+        Some(key_algorithm) => {
+            let algorithm = match key_algorithm {
+                KeyAlgorithm::ES256 => Algorithm::ES256,
+                KeyAlgorithm::ES384 => Algorithm::ES384,
+                KeyAlgorithm::RS256 => Algorithm::RS256,
+                KeyAlgorithm::RS384 => Algorithm::RS384,
+                KeyAlgorithm::RS512 => Algorithm::RS512,
+                KeyAlgorithm::PS256 => Algorithm::PS256,
+                KeyAlgorithm::PS384 => Algorithm::PS384,
+                KeyAlgorithm::PS512 => Algorithm::PS512,
+                KeyAlgorithm::EdDSA => Algorithm::EdDSA,
+                KeyAlgorithm::HS256
+                | KeyAlgorithm::HS384
+                | KeyAlgorithm::HS512
+                | KeyAlgorithm::RSA1_5
+                | KeyAlgorithm::RSA_OAEP
+                | KeyAlgorithm::RSA_OAEP_256
+                | KeyAlgorithm::UNKNOWN_ALGORITHM => return VerificationAlgorithm::Skip,
+            };
+            if SUPPORTED_VERIFICATION_ALGORITHMS.contains(&algorithm) {
+                VerificationAlgorithm::Exact(algorithm)
+            } else {
+                VerificationAlgorithm::Skip
+            }
+        }
         None => VerificationAlgorithm::AnyAsymmetric,
     }
 }
 
 fn build_validations(issuer: &str, audience: &str) -> Vec<(Algorithm, Validation)> {
-    [
-        Algorithm::ES256,
-        Algorithm::ES384,
-        Algorithm::RS256,
-        Algorithm::RS384,
-        Algorithm::RS512,
-        Algorithm::PS256,
-        Algorithm::PS384,
-        Algorithm::PS512,
-        Algorithm::EdDSA,
-    ]
-    .into_iter()
-    .map(|algorithm| {
-        let mut validation = Validation::new(algorithm);
-        validation.leeway = JWT_CLOCK_SKEW_SECONDS;
-        validation.set_audience(&[audience]);
-        validation.set_issuer(&[issuer]);
-        validation.set_required_spec_claims(&["exp", "iss", "aud", "sub"]);
-        validation.validate_nbf = true;
-        (algorithm, validation)
-    })
-    .collect()
+    SUPPORTED_VERIFICATION_ALGORITHMS
+        .into_iter()
+        .map(|algorithm| {
+            let mut validation = Validation::new(algorithm);
+            validation.leeway = JWT_CLOCK_SKEW_SECONDS;
+            validation.set_audience(&[audience]);
+            validation.set_issuer(&[issuer]);
+            validation.set_required_spec_claims(&["exp", "iss", "aud", "sub"]);
+            validation.validate_nbf = true;
+            (algorithm, validation)
+        })
+        .collect()
 }
 
 fn jwks_ttl(headers: &HeaderMap) -> Duration {
@@ -639,13 +713,17 @@ struct IdentityClaims {
 
 impl IdentityClaims {
     fn audience_allows(&self, expected: &str) -> bool {
-        match &self.aud {
+        let audiences_match = match &self.aud {
             AudienceClaim::One(audience) => audience == expected,
-            AudienceClaim::Many(audiences) if audiences.len() == 1 => audiences[0] == expected,
             AudienceClaim::Many(audiences) => {
-                audiences.iter().any(|audience| audience == expected) && self.azp.as_deref() == Some(expected)
+                !audiences.is_empty() && audiences.iter().all(|audience| audience == expected)
             }
-        }
+        };
+        audiences_match
+            && self
+                .azp
+                .as_deref()
+                .is_none_or(|authorized_party| authorized_party == expected)
     }
 }
 
@@ -730,16 +808,23 @@ impl OidcAuthError {
 #[cfg(test)]
 mod tests {
     use super::{
-        AuthenticatedPrincipal, MAX_JWKS_KEYS, MAX_JWKS_TTL, OidcAuthError, VerificationAlgorithm, compile_jwks,
-        jwks_ttl, verification_algorithm,
+        AuthenticatedPrincipal, JWKS_REFRESH_COOLDOWN, MAX_JWKS_KEYS, MAX_JWKS_TTL, OidcAuthError, OidcAuthenticator,
+        OidcConfig, VerificationAlgorithm, compile_jwks, jwks_ttl, verification_algorithm,
     };
     use axum::http::{HeaderMap, HeaderValue, header};
+    use axum::routing::get;
+    use axum::{Json, Router};
     use jsonwebtoken::jwk::{Jwk, JwkSet, KeyAlgorithm, KeyOperations, PublicKeyUse};
-    use jsonwebtoken::{Algorithm, EncodingKey};
+    use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
     use rand::rngs::OsRng;
     use rsa::RsaPrivateKey;
     use rsa::pkcs1::EncodeRsaPrivateKey;
-    use std::time::Duration;
+    use serde_json::json;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+    use tokio::net::TcpListener;
+    use tokio::sync::Semaphore;
 
     fn test_jwk() -> Jwk {
         let private_key = RsaPrivateKey::new(&mut OsRng, 2048).expect("generate test RSA key");
@@ -750,6 +835,107 @@ mod tests {
         jwk.common.key_algorithm = Some(KeyAlgorithm::RS256);
         jwk.common.public_key_use = Some(PublicKeyUse::Signature);
         jwk
+    }
+
+    fn test_key_with_id(kid: &str) -> (Vec<u8>, Jwk) {
+        let private_key = RsaPrivateKey::new(&mut OsRng, 2048).expect("generate test RSA key");
+        let private_key = private_key.to_pkcs1_der().expect("encode test RSA key");
+        let private_key = private_key.as_bytes().to_vec();
+        let mut jwk =
+            Jwk::from_encoding_key(&EncodingKey::from_rsa_der(&private_key), Algorithm::RS256).expect("test JWK");
+        jwk.common.key_id = Some(kid.to_owned());
+        jwk.common.key_algorithm = Some(KeyAlgorithm::RS256);
+        jwk.common.public_key_use = Some(PublicKeyUse::Signature);
+        (private_key, jwk)
+    }
+
+    async fn cancellation_test_authenticator() -> (
+        OidcAuthenticator,
+        String,
+        Arc<AtomicUsize>,
+        Arc<Semaphore>,
+        Arc<Semaphore>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind cancellation test provider");
+        let issuer = format!("http://{}", listener.local_addr().expect("provider address"));
+        let discovery_issuer = issuer.clone();
+        let discovery_jwks_uri = format!("{issuer}/jwks");
+        let (_old_private_key, old_jwk) = test_key_with_id("old-key");
+        let (new_private_key, new_jwk) = test_key_with_id("new-key");
+        let requests = Arc::new(AtomicUsize::new(0));
+        let observed_requests = Arc::clone(&requests);
+        let refresh_started = Arc::new(Semaphore::new(0));
+        let observed_refresh_started = Arc::clone(&refresh_started);
+        let release_refresh = Arc::new(Semaphore::new(0));
+        let observed_release_refresh = Arc::clone(&release_refresh);
+
+        let provider = Router::new()
+            .route(
+                "/.well-known/openid-configuration",
+                get(move || {
+                    let issuer = discovery_issuer.clone();
+                    let jwks_uri = discovery_jwks_uri.clone();
+                    async move { Json(json!({"issuer": issuer, "jwks_uri": jwks_uri})) }
+                }),
+            )
+            .route(
+                "/jwks",
+                get(move || {
+                    let old_jwk = old_jwk.clone();
+                    let new_jwk = new_jwk.clone();
+                    let requests = Arc::clone(&observed_requests);
+                    let refresh_started = Arc::clone(&observed_refresh_started);
+                    let release_refresh = Arc::clone(&observed_release_refresh);
+                    async move {
+                        let request = requests.fetch_add(1, Ordering::Relaxed);
+                        let jwk = if request == 0 {
+                            old_jwk
+                        } else {
+                            refresh_started.add_permits(1);
+                            release_refresh
+                                .acquire()
+                                .await
+                                .expect("release semaphore remains open")
+                                .forget();
+                            new_jwk
+                        };
+                        ([(header::CACHE_CONTROL, "max-age=0")], Json(json!({"keys": [jwk]})))
+                    }
+                }),
+            );
+        let provider_handle = tokio::spawn(async move {
+            axum::serve(listener, provider)
+                .await
+                .expect("serve cancellation test provider");
+        });
+        let authenticator = OidcAuthenticator::discover(OidcConfig::new(&issuer, "agentic-api").expect("OIDC config"))
+            .await
+            .expect("discover cancellation test provider");
+        let mut token_header = Header::new(Algorithm::RS256);
+        token_header.kid = Some("new-key".to_owned());
+        let token = encode(
+            &token_header,
+            &json!({
+                "iss": issuer,
+                "sub": "subject",
+                "aud": "agentic-api",
+                "exp": jsonwebtoken::get_current_timestamp() + 300
+            }),
+            &EncodingKey::from_rsa_der(&new_private_key),
+        )
+        .expect("encode cancellation test token");
+
+        (
+            authenticator,
+            token,
+            requests,
+            refresh_started,
+            release_refresh,
+            provider_handle,
+        )
     }
 
     #[test]
@@ -795,6 +981,97 @@ mod tests {
         assert!(principal.is_expired_at(161));
     }
 
+    #[tokio::test]
+    async fn cancelled_jwks_refresh_does_not_install_backoff() {
+        let (authenticator, token, requests, refresh_started, release_refresh, _provider) =
+            cancellation_test_authenticator().await;
+        let cancelled_authenticator = authenticator.clone();
+        let cancelled_token = token.clone();
+        let cancelled_refresh =
+            tokio::spawn(async move { cancelled_authenticator.authenticate(&cancelled_token).await });
+
+        tokio::time::timeout(Duration::from_secs(2), refresh_started.acquire())
+            .await
+            .expect("refresh must start")
+            .expect("refresh semaphore remains open")
+            .forget();
+        cancelled_refresh.abort();
+        assert!(
+            cancelled_refresh
+                .await
+                .expect_err("refresh task must be cancelled")
+                .is_cancelled()
+        );
+        release_refresh.add_permits(2);
+
+        let principal = tokio::time::timeout(Duration::from_secs(2), authenticator.authenticate(&token))
+            .await
+            .expect("replacement refresh must finish")
+            .expect("replacement refresh must authenticate");
+        assert_eq!(principal.subject(), "subject");
+        assert_eq!(requests.load(Ordering::Relaxed), 3);
+    }
+
+    #[tokio::test]
+    async fn stalled_jwks_refresh_bounds_waiters() {
+        let (authenticator, token, _requests, refresh_started, release_refresh, _provider) =
+            cancellation_test_authenticator().await;
+        let refreshing_authenticator = authenticator.clone();
+        let refreshing_token = token.clone();
+        let refreshing = tokio::spawn(async move { refreshing_authenticator.authenticate(&refreshing_token).await });
+        tokio::time::timeout(Duration::from_secs(2), refresh_started.acquire())
+            .await
+            .expect("refresh must start")
+            .expect("refresh semaphore remains open")
+            .forget();
+
+        let waiting = tokio::time::timeout(Duration::from_secs(2), authenticator.authenticate(&token))
+            .await
+            .expect("refresh waiter must be bounded");
+        assert!(matches!(waiting, Err(OidcAuthError::JwksRefreshBackoff)));
+
+        refreshing.abort();
+        assert!(
+            refreshing
+                .await
+                .expect_err("refresh task must be cancelled")
+                .is_cancelled()
+        );
+        release_refresh.add_permits(1);
+    }
+
+    #[tokio::test]
+    async fn fresh_cache_unknown_key_refreshes_once_after_cooldown() {
+        let (authenticator, token, requests, _refresh_started, release_refresh, _provider) =
+            cancellation_test_authenticator().await;
+        authenticator.keys.write().await.expires_at = Instant::now() + Duration::from_secs(60);
+        authenticator
+            .refresh_state
+            .lock()
+            .expect("refresh state")
+            .last_completed = Instant::now()
+            .checked_sub(JWKS_REFRESH_COOLDOWN + Duration::from_secs(1))
+            .expect("test cooldown instant");
+        release_refresh.add_permits(1);
+
+        let first_authenticator = authenticator.clone();
+        let first_token = token.clone();
+        let first = tokio::spawn(async move { first_authenticator.authenticate(&first_token).await });
+        let second_authenticator = authenticator.clone();
+        let second = tokio::spawn(async move { second_authenticator.authenticate(&token).await });
+        let (first, second) = tokio::join!(first, second);
+
+        assert_eq!(
+            first.expect("first task").expect("first authentication").subject(),
+            "subject"
+        );
+        assert_eq!(
+            second.expect("second task").expect("second authentication").subject(),
+            "subject"
+        );
+        assert_eq!(requests.load(Ordering::Relaxed), 2);
+    }
+
     #[test]
     fn jwks_limits_and_signature_metadata_are_enforced() {
         let mut encryption_key = test_jwk();
@@ -832,6 +1109,18 @@ mod tests {
         assert!(matches!(
             compile_jwks(JwkSet { keys: too_many_keys }, Duration::from_secs(60)),
             Err(OidcAuthError::TooManyJwksKeys)
+        ));
+
+        let duplicate_key = test_jwk();
+        let duplicate_key_id = duplicate_key.common.key_id.clone().expect("test key ID");
+        assert!(matches!(
+            compile_jwks(
+                JwkSet {
+                    keys: vec![duplicate_key.clone(), duplicate_key]
+                },
+                Duration::from_secs(60)
+            ),
+            Err(OidcAuthError::DuplicateKeyId(key_id)) if key_id == duplicate_key_id
         ));
     }
 }

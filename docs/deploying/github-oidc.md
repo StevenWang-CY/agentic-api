@@ -255,8 +255,9 @@ claude -p "summarize the files in this directory"
   [Dex GitHub connector documentation](https://dexidp.io/docs/connectors/github/).
 - **Discovery or startup fails:** Dex discovery's `issuer` must exactly equal `OIDC_ISSUER`, including scheme, host,
   port, and path. See the [OIDC validation contract](../design/oidc-bearer-authentication.md).
-- **Token is rejected:** the ID token `aud` must include `OIDC_AUDIENCE`; a GitHub access token is not a substitute.
-  See the [OIDC validation contract](../design/oidc-bearer-authentication.md).
+- **Token is rejected:** every ID-token `aud` value must equal `OIDC_AUDIENCE`, and any present `azp` must also equal
+  it; a GitHub access token is not a substitute. See the
+  [OIDC validation contract](../design/oidc-bearer-authentication.md).
 - **HTTP issuer is rejected:** HTTP is allowed only for literal loopback issuers; use HTTPS elsewhere. See the
   [OIDC validation contract](../design/oidc-bearer-authentication.md).
 - **Upstream sees the identity token:** configure `OPENAI_API_KEY` separately and stop forwarding the identity token.

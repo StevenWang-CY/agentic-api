@@ -102,8 +102,8 @@ async fn responses_ws_loop(
             }
         };
 
-        if let Some(error) = websocket_identity_error(principal.as_ref()) {
-            let _ = send_ws_error(&mut sender, &error).await;
+        if let Some(event) = websocket_identity_error_event(principal.as_ref()) {
+            let _ = send_ws_json(&mut sender, event).await;
             break;
         }
 
@@ -130,10 +130,16 @@ async fn responses_ws_loop(
     debug!("responses websocket session closed");
 }
 
-fn websocket_identity_error(principal: Option<&AuthenticatedPrincipal>) -> Option<WsError> {
-    principal
-        .is_some_and(AuthenticatedPrincipal::is_expired)
-        .then_some(WsError::AuthenticationExpired)
+fn websocket_identity_error_event(principal: Option<&AuthenticatedPrincipal>) -> Option<Value> {
+    principal.is_some_and(AuthenticatedPrincipal::is_expired).then(|| {
+        serde_json::json!({
+            "type": "error",
+            "code": "invalid_token",
+            "message": "OIDC bearer token expired",
+            "param": null,
+            "sequence_number": 0,
+        })
+    })
 }
 
 async fn next_ws_message<Receiver>(
@@ -448,10 +454,12 @@ mod tests {
 
     use axum::extract::ws::Message;
     use futures::{Sink, Stream, StreamExt, sink, stream};
+    use serde_json::json;
     use tokio_util::sync::CancellationToken;
 
     use super::{
-        ShutdownInput, close_ws, keep_if_running, next_shutdown_input, next_ws_message, websocket_identity_error,
+        ShutdownInput, WsError, close_ws, keep_if_running, next_shutdown_input, next_ws_message,
+        websocket_identity_error_event,
     };
     use crate::auth::AuthenticatedPrincipal;
 
@@ -523,14 +531,27 @@ mod tests {
     }
 
     #[test]
-    fn websocket_identity_expiry_selects_the_unauthorized_error_event() {
-        assert!(websocket_identity_error(None).is_none());
-        let error =
-            websocket_identity_error(Some(&AuthenticatedPrincipal::expired_for_test())).expect("expired-token error");
-        let frame = error.to_ws_frame().expect("client-visible error frame");
+    fn websocket_identity_expiry_uses_responses_error_event() {
+        assert!(websocket_identity_error_event(None).is_none());
+        let frame = websocket_identity_error_event(Some(&AuthenticatedPrincipal::expired_for_test()))
+            .expect("expired-token error event");
 
-        assert_eq!(frame["status"], 401);
-        assert_eq!(frame["error"]["code"], "invalid_token");
+        assert_eq!(
+            frame,
+            json!({
+                "type": "error",
+                "code": "invalid_token",
+                "message": "OIDC bearer token expired",
+                "param": null,
+                "sequence_number": 0,
+            })
+        );
+
+        let generic_frame = WsError::UnexpectedType
+            .to_ws_frame()
+            .expect("generic client-visible error frame");
+        assert_eq!(generic_frame["status"], 400);
+        assert_eq!(generic_frame["error"]["code"], "invalid_request_error");
     }
 
     #[tokio::test]
