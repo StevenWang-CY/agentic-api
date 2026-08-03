@@ -30,6 +30,7 @@ criterion.workspace = true
 futures.workspace = true
 reqwest = { workspace = true, features = ["json"] }
 serde_json.workspace = true
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "any", "sqlite"] }
 tokio = { workspace = true, features = ["test-util"] }
 tokio-tungstenite.workspace = true
 uuid = { version = "1", features = ["v7"] }
