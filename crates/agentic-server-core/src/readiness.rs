@@ -52,14 +52,14 @@ pub async fn probe_llm_readiness(
     }
 
     Ok(match tokio::time::timeout(timeout, request.send()).await {
-        Ok(Ok(response)) if response.status() == reqwest::StatusCode::OK => LlmReadiness::Ready,
+        Ok(Ok(response)) if response.status().is_success() => LlmReadiness::Ready,
         Ok(Ok(response)) => LlmReadiness::Rejected(response.status()),
         Ok(Err(error)) => LlmReadiness::Unreachable(error),
         Err(_) => LlmReadiness::TimedOut,
     })
 }
 
-/// Poll LLM `/health` until it responds 200 or the timeout is reached.
+/// Poll LLM `/health` until it responds successfully or the timeout is reached.
 ///
 /// # Errors
 ///

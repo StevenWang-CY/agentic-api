@@ -72,6 +72,21 @@ async fn test_ready_returns_503_when_llm_rejects_health_check() {
 }
 
 #[tokio::test]
+async fn test_ready_accepts_any_successful_llm_health_status() {
+    let app = Router::new().route("/health", get(|| async { StatusCode::NO_CONTENT }));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let upstream = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let (gw_url, gateway) = spawn_gateway(test_state(&test_config_no_key(&format!("http://{addr}")))).await;
+
+    let resp = reqwest::get(format!("{gw_url}/ready")).await.unwrap();
+
+    assert_eq!(resp.status(), 200);
+    upstream.abort();
+    gateway.abort();
+}
+
+#[tokio::test]
 async fn test_ready_returns_503_when_llm_health_check_times_out() {
     let app = Router::new().route(
         "/health",
