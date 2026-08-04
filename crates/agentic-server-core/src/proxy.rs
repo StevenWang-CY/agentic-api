@@ -22,7 +22,7 @@ const HOP_BY_HOP: &[&str] = &[
     "upgrade",
 ];
 
-const REQUEST_DROP_EXTRA: &[&str] = &["host", "content-length"];
+const REQUEST_DROP_EXTRA: &[&str] = &["host", "content-length", "accept-encoding"];
 const PROCESSED_RESPONSE_DROP_EXTRA: &[&str] = &["content-length", "content-encoding"];
 
 fn is_hop_by_hop(name: &str) -> bool {
@@ -369,6 +369,7 @@ mod tests {
     fn request_drop_includes_host_and_content_length() {
         assert!(is_request_drop("host"));
         assert!(is_request_drop("content-length"));
+        assert!(is_request_drop("accept-encoding"));
         assert!(is_request_drop("connection"));
         assert!(!is_request_drop("content-type"));
     }

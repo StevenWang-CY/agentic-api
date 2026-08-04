@@ -408,6 +408,7 @@ async fn messages_gateway_loop_forwards_query_and_open_headers() {
         .header("x-claude-code-session-id", "session-loop")
         .header("x-claude-code-agent-id", "agent-loop")
         .header("x-api-key", "anthropic-key")
+        .header("accept-encoding", "gzip")
         .body(body.to_vec())
         .send()
         .await
@@ -427,6 +428,7 @@ async fn messages_gateway_loop_forwards_query_and_open_headers() {
     assert_eq!(requests[0].headers["x-claude-code-session-id"], "session-loop");
     assert_eq!(requests[0].headers["x-claude-code-agent-id"], "agent-loop");
     assert_eq!(requests[0].headers["x-api-key"], "anthropic-key");
+    assert!(!requests[0].headers.contains_key("accept-encoding"));
     assert!(!requests[0].headers.contains_key("authorization"));
 }
 
