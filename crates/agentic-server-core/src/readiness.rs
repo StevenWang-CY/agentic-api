@@ -22,6 +22,43 @@ fn timeout_error(url: &str, timeout_s: f64) -> Error {
     }
 }
 
+/// Result of a single bounded inference-service health probe.
+#[derive(Debug)]
+pub enum LlmReadiness {
+    Ready,
+    Rejected(reqwest::StatusCode),
+    Unreachable(reqwest::Error),
+    TimedOut,
+}
+
+/// Probe the inference service's `/health` endpoint once.
+///
+/// # Errors
+///
+/// Returns an error when the configured bearer credential cannot be represented
+/// as an HTTP header.
+pub async fn probe_llm_readiness(
+    client: &reqwest::Client,
+    llm_api_base: &str,
+    openai_api_key: Option<&str>,
+    timeout: Duration,
+) -> Result<LlmReadiness, Error> {
+    let base = llm_api_base.trim_end_matches('/');
+    let url = format!("{base}/health");
+    let mut request = client.get(url);
+    if let Some(key) = openai_api_key.map(str::trim).filter(|key| !key.is_empty()) {
+        let value = reqwest::header::HeaderValue::from_str(&format!("Bearer {key}"))?;
+        request = request.header(reqwest::header::AUTHORIZATION, value);
+    }
+
+    Ok(match tokio::time::timeout(timeout, request.send()).await {
+        Ok(Ok(response)) if response.status() == reqwest::StatusCode::OK => LlmReadiness::Ready,
+        Ok(Ok(response)) => LlmReadiness::Rejected(response.status()),
+        Ok(Err(error)) => LlmReadiness::Unreachable(error),
+        Err(_) => LlmReadiness::TimedOut,
+    })
+}
+
 /// Poll LLM `/health` until it responds 200 or the timeout is reached.
 ///
 /// # Errors
@@ -31,22 +68,7 @@ pub async fn wait_llm_ready(config: &Config) -> Result<(), Error> {
     let base = config.llm_api_base.trim_end_matches('/');
     let url = format!("{base}/health");
 
-    let mut headers = reqwest::header::HeaderMap::new();
-    if let Some(key) = config.openai_api_key.as_deref() {
-        let trimmed = key.trim();
-        if !trimmed.is_empty() {
-            headers.insert(
-                reqwest::header::AUTHORIZATION,
-                reqwest::header::HeaderValue::from_str(&format!("Bearer {trimmed}"))?,
-            );
-        }
-    }
-
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(2))
-        .default_headers(headers)
-        .build()
-        .map_err(Error::HttpClient)?;
+    let client = reqwest::Client::builder().build().map_err(Error::HttpClient)?;
 
     let timeout = checked_duration_seconds("llm_ready_timeout_s", config.llm_ready_timeout_s)?;
     let interval = checked_duration_seconds("llm_ready_interval_s", config.llm_ready_interval_s)?;
@@ -61,9 +83,17 @@ pub async fn wait_llm_ready(config: &Config) -> Result<(), Error> {
             return Err(timeout_error(&url, config.llm_ready_timeout_s));
         }
 
-        match tokio::time::timeout(remaining, client.get(&url).send()).await {
-            Ok(Ok(resp)) if resp.status().as_u16() == 200 => return Ok(()),
-            _ => {}
+        if matches!(
+            probe_llm_readiness(
+                &client,
+                &config.llm_api_base,
+                config.openai_api_key.as_deref(),
+                Duration::from_secs(2).min(remaining),
+            )
+            .await?,
+            LlmReadiness::Ready
+        ) {
+            return Ok(());
         }
 
         let elapsed = start.elapsed();
@@ -87,7 +117,7 @@ pub async fn wait_llm_ready(config: &Config) -> Result<(), Error> {
 mod tests {
     use std::time::Duration;
 
-    use super::{checked_duration_seconds, timeout_error};
+    use super::{checked_duration_seconds, probe_llm_readiness, timeout_error};
 
     #[test]
     fn checked_duration_rejects_non_positive() {
@@ -133,5 +163,19 @@ mod tests {
         let interval = Duration::from_secs(2);
         let remaining = Duration::from_millis(100);
         assert_eq!(interval.min(remaining), Duration::from_millis(100));
+    }
+
+    #[tokio::test]
+    async fn probe_rejects_invalid_bearer_header_before_network_io() {
+        let error = probe_llm_readiness(
+            &reqwest::Client::new(),
+            "http://127.0.0.1:1",
+            Some("invalid\nkey"),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, crate::error::Error::InvalidHeader(_)));
     }
 }

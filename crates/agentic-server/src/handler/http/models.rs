@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 use tracing::warn;
 
 use agentic_core::proxy::{ProxyBody, ProxyResponse, error_response, proxy_get};
+use agentic_core::readiness::{LlmReadiness, probe_llm_readiness};
 
 use super::super::common::convert_response;
 use crate::app::AppState;
@@ -106,31 +107,29 @@ pub async fn health() -> impl IntoResponse {
 }
 
 async fn upstream_is_ready(state: &AppState) -> bool {
-    let base = state.llm_api_base.trim_end_matches('/');
-    let url = format!("{base}/health");
-
-    let mut request = state.exec_ctx.client.get(&url);
-    if let Some(key) = state
-        .openai_api_key
-        .as_deref()
-        .map(str::trim)
-        .filter(|key| !key.is_empty())
+    match probe_llm_readiness(
+        &state.exec_ctx.client,
+        &state.llm_api_base,
+        state.openai_api_key.as_deref(),
+        std::time::Duration::from_secs(2),
+    )
+    .await
     {
-        request = request.bearer_auth(key);
-    }
-
-    match tokio::time::timeout(std::time::Duration::from_secs(2), request.send()).await {
-        Ok(Ok(resp)) if resp.status().is_success() => true,
-        Ok(Ok(resp)) => {
-            warn!("LLM backend not ready: {}", resp.status());
+        Ok(LlmReadiness::Ready) => true,
+        Ok(LlmReadiness::Rejected(status)) => {
+            warn!("LLM backend not ready: {status}");
             false
         }
-        Ok(Err(e)) => {
-            warn!("LLM backend unreachable: {e}");
+        Ok(LlmReadiness::Unreachable(error)) => {
+            warn!("LLM backend unreachable: {error}");
             false
         }
-        Err(_) => {
+        Ok(LlmReadiness::TimedOut) => {
             warn!("LLM backend readiness check timed out");
+            false
+        }
+        Err(error) => {
+            warn!("LLM backend readiness configuration invalid: {error}");
             false
         }
     }
@@ -141,15 +140,33 @@ async fn configured_upstream_is_ready(state: &AppState) -> bool {
 }
 
 pub async fn ready(State(state): State<AppState>) -> impl IntoResponse {
-    let (storage_ready, upstream_ready) = tokio::join!(
-        state.exec_ctx.storage_ready(std::time::Duration::from_secs(1)),
-        configured_upstream_is_ready(&state)
-    );
-    if !storage_ready {
-        warn!("database persistence not ready");
-    }
+    let storage_ready = state.exec_ctx.storage_ready(std::time::Duration::from_secs(1));
+    let upstream_ready = configured_upstream_is_ready(&state);
+    tokio::pin!(storage_ready, upstream_ready);
 
-    if storage_ready && upstream_ready {
+    let dependencies_ready = tokio::select! {
+        storage_ready = &mut storage_ready => {
+            if storage_ready {
+                upstream_ready.await
+            } else {
+                warn!("database persistence not ready");
+                false
+            }
+        }
+        upstream_ready = &mut upstream_ready => {
+            if upstream_ready {
+                let storage_ready = storage_ready.await;
+                if !storage_ready {
+                    warn!("database persistence not ready");
+                }
+                storage_ready
+            } else {
+                false
+            }
+        }
+    };
+
+    if dependencies_ready {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE

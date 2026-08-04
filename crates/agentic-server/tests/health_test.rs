@@ -1,6 +1,7 @@
 mod common;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use agentic_core::config::Config;
 use agentic_core::executor::ExecutionContext;
@@ -56,6 +57,48 @@ async fn test_ready_returns_503_when_llm_unreachable() {
 }
 
 #[tokio::test]
+async fn test_ready_returns_503_when_llm_rejects_health_check() {
+    let app = Router::new().route("/health", get(|| async { StatusCode::UNAUTHORIZED }));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let upstream = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let (gw_url, gateway) = spawn_gateway(test_state(&test_config_no_key(&format!("http://{addr}")))).await;
+
+    let resp = reqwest::get(format!("{gw_url}/ready")).await.unwrap();
+
+    assert_eq!(resp.status(), 503);
+    upstream.abort();
+    gateway.abort();
+}
+
+#[tokio::test]
+async fn test_ready_returns_503_when_llm_health_check_times_out() {
+    let app = Router::new().route(
+        "/health",
+        get(|| async {
+            std::future::pending::<()>().await;
+            StatusCode::OK
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let upstream = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let (gw_url, gateway) = spawn_gateway(test_state(&test_config_no_key(&format!("http://{addr}")))).await;
+
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        reqwest::get(format!("{gw_url}/ready")),
+    )
+    .await
+    .expect("readiness response must respect the two-second upstream timeout")
+    .unwrap();
+
+    assert_eq!(response.status(), 503);
+    upstream.abort();
+    gateway.abort();
+}
+
+#[tokio::test]
 async fn test_ready_returns_503_when_database_pool_is_exhausted() {
     let (llm_url, _h1) = spawn_mock_llm().await;
     let mut config = test_config(&llm_url);
@@ -82,19 +125,106 @@ async fn test_ready_returns_503_when_database_pool_is_exhausted() {
 }
 
 #[tokio::test]
-async fn test_ready_skips_upstream_when_configured() {
+async fn test_ready_fails_fast_when_database_is_unready() {
+    let app = Router::new().route(
+        "/health",
+        get(|| async {
+            std::future::pending::<()>().await;
+            StatusCode::OK
+        }),
+    );
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let dead_addr = listener.local_addr().unwrap();
-    drop(listener);
+    let addr = listener.local_addr().unwrap();
+    let upstream = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let mut config = test_config_no_key(&format!("http://{addr}"));
+    config.db_url = Some("sqlite://?mode=memory".to_owned());
+    let exec_ctx = Arc::new(
+        ExecutionContext::from_config(&config)
+            .await
+            .expect("create execution context"),
+    );
+    let held_connection = exec_ctx
+        .storage_pool()
+        .expect("configured storage pool")
+        .acquire()
+        .await
+        .expect("hold only database connection");
+    let mut state = test_state(&config);
+    state.exec_ctx = exec_ctx;
+    let (gw_url, gateway) = spawn_gateway(state).await;
+
+    let response = tokio::time::timeout(
+        std::time::Duration::from_millis(1_500),
+        reqwest::get(format!("{gw_url}/ready")),
+    )
+    .await
+    .expect("database failure should not wait for the upstream timeout")
+    .unwrap();
+
+    assert_eq!(response.status(), 503);
+    drop(held_connection);
+    upstream.abort();
+    gateway.abort();
+}
+
+#[tokio::test]
+async fn test_ready_skips_upstream_when_configured() {
+    let requests = Arc::new(AtomicUsize::new(0));
+    let app = Router::new().route(
+        "/health",
+        get({
+            let requests = Arc::clone(&requests);
+            move || {
+                let requests = Arc::clone(&requests);
+                async move {
+                    requests.fetch_add(1, Ordering::SeqCst);
+                    StatusCode::OK
+                }
+            }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let upstream = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let config = Config {
         skip_llm_ready_check: true,
-        ..test_config_no_key(&format!("http://{dead_addr}"))
+        ..test_config_no_key(&format!("http://{addr}"))
     };
-    let (gw_url, _gateway) = spawn_gateway(test_state(&config)).await;
+    let (gw_url, gateway) = spawn_gateway(test_state(&config)).await;
 
     let resp = reqwest::get(format!("{gw_url}/ready")).await.unwrap();
 
     assert_eq!(resp.status(), 200);
+    assert_eq!(requests.load(Ordering::SeqCst), 0);
+    upstream.abort();
+    gateway.abort();
+}
+
+#[tokio::test]
+async fn test_ready_skip_still_requires_database() {
+    let mut config = test_config("http://127.0.0.1:1");
+    config.skip_llm_ready_check = true;
+    config.db_url = Some("sqlite://?mode=memory".to_owned());
+    let exec_ctx = Arc::new(
+        ExecutionContext::from_config(&config)
+            .await
+            .expect("create execution context"),
+    );
+    let held_connection = exec_ctx
+        .storage_pool()
+        .expect("configured storage pool")
+        .acquire()
+        .await
+        .expect("hold only database connection");
+    let mut state = test_state(&config);
+    state.exec_ctx = exec_ctx;
+    let (gw_url, gateway) = spawn_gateway(state).await;
+
+    let resp = reqwest::get(format!("{gw_url}/ready")).await.unwrap();
+
+    assert_eq!(resp.status(), 503);
+    drop(held_connection);
+    gateway.abort();
 }
 
 #[tokio::test]

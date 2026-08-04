@@ -78,6 +78,7 @@ fn deployment_is_replicated_hardened_and_probe_driven() {
         pod_spec["securityContext"]["seccompProfile"]["type"].as_str(),
         Some("RuntimeDefault")
     );
+    assert_eq!(pod_spec["securityContext"]["runAsNonRoot"].as_bool(), Some(true));
     assert!(pod_spec["securityContext"]["runAsUser"].is_null());
     assert_eq!(
         pod_spec["affinity"]["podAntiAffinity"]["preferredDuringSchedulingIgnoredDuringExecution"][0]
@@ -99,8 +100,8 @@ fn deployment_is_replicated_hardened_and_probe_driven() {
     assert!(
         manifest["spec"]["progressDeadlineSeconds"]
             .as_u64()
-            .is_some_and(|deadline| deadline > startup_budget_seconds),
-        "deployment progress deadline must exceed the startup probe budget"
+            .is_some_and(|deadline| deadline >= startup_budget_seconds + 300),
+        "deployment progress deadline must leave five minutes beyond the startup probe budget"
     );
     assert_eq!(
         container["envFrom"][0]["configMapRef"]["name"].as_str(),

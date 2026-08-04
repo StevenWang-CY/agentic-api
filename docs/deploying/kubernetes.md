@@ -2,8 +2,8 @@
 
 The repository includes a Kustomize-compatible base in `deploy/kubernetes`. It runs two stateless gateway replicas
 against managed PostgreSQL and an external OpenAI-compatible inference service. The Service is `ClusterIP` because the
-gateway does not authenticate inbound callers yet. Put an authenticated application boundary in front of it before
-allowing traffic from outside the cluster.
+portable base does not choose an identity provider or expose an Ingress. Enable the gateway's native OIDC validation
+or put an authenticated application boundary in front of it before allowing traffic from outside the cluster.
 
 ## Prepare the image and configuration
 
@@ -73,15 +73,37 @@ The base defines:
 
 The startup probe allows up to eleven minutes. The Deployment bounds the upstream startup wait at five minutes,
 leaving about six minutes for the database connection and embedded migrations before Kubernetes restarts the pod. The
-process does not bind its port until both steps succeed. `/health` then reports process liveness without depending on
+sixteen-minute rollout progress deadline leaves another five minutes for scheduling and a cold image pull. The process
+does not bind its port until both startup steps succeed. `/health` then reports process liveness without depending on
 remote services. `/ready` runs bounded PostgreSQL and inference checks concurrently and removes a pod from Service
 endpoints when either required dependency fails.
+
+The base's CPU and memory requests are lower than its limits, so pods use Kubernetes' `Burstable` quality-of-service
+class and can be evicted before `Guaranteed` pods under node pressure. Tune both values from measurements; set requests
+equal to limits in a production overlay when eviction priority is more important than burst capacity.
 
 ## Choose a migration policy
 
 By default, every new pod applies the embedded SQLx migrations before starting the HTTP server. PostgreSQL migration
 locking serializes concurrent migration attempts, and a failed migration keeps the pod out of service. Keep migrations
 backward-compatible with the previous gateway version so a rolling update can run old and new replicas together.
+
+The first upgrade from a release that used 32-bit timestamp and sequence columns is an exception: do not use the base
+rolling strategy for that upgrade. Older replicas do not take the per-conversation row lock and can allocate duplicate
+sequence values while an upgraded replica is serving. During a maintenance window:
+
+1. stop or drain inbound writers, scale every older gateway replica to zero, and verify that no old pod remains;
+2. run the duplicate `(conversation_id, seq)` query in the
+   [PostgreSQL upgrade notes](container.md#postgresql-production-settings), resolving any rows according to the
+   deployment's data-retention policy;
+3. apply the compatibility migration with a dedicated migration role, or start exactly one upgraded replica and wait
+   for its embedded migration to finish;
+4. verify that the integer columns and unique conversation-sequence index are present; and
+5. start the upgraded Deployment, restore the desired replica count, and reopen inbound traffic only after `/ready`
+   succeeds.
+
+Ordinary rolling updates are appropriate only after every migration in the target release has been verified as
+expand/contract compatible with the previously deployed gateway.
 
 For a supervisor-managed schema:
 
@@ -94,15 +116,20 @@ The runtime image intentionally contains no shell database client, and the gatew
 the base does not pretend to provide an in-image migration Job. Use a trusted database migration image or deployment
 controller. Never set `AGENTIC_API_SCHEMA_READY` merely to bypass a failed migration.
 
-## Put an authenticated edge in front
+## Authenticate inbound callers
 
 Do not use `OPENAI_API_KEY` as a caller password. It is an upstream inference credential. Exposing the gateway directly
 would let anonymous callers spend that credential and read or write unscoped stored state.
 
-The repository deliberately does not include a ready-to-apply Ingress while inbound caller authentication remains
-deployment-specific. Create the Ingress in an environment overlay only after an identity-aware proxy or authenticated
-application service protects every `/v1/*` HTTP and WebSocket route. For ingress-nginx, configure external
-authentication and include settings equivalent to:
+The gateway can validate inbound OIDC bearer tokens itself. Add `OIDC_ISSUER` and `OIDC_AUDIENCE` to an
+environment-specific ConfigMap patch; both values are required together. The issuer must use HTTPS outside loopback
+development. Every `/v1/*` HTTP and WebSocket route then requires a valid bearer token, while `/health` and `/ready`
+remain available to Kubernetes probes. Follow the [OIDC validation contract](../design/oidc-bearer-authentication.md)
+and the [GitHub and Dex tutorial](github-oidc.md) when configuring the provider and clients.
+
+Alternatively, put an identity-aware proxy or authenticated application service in front of the gateway. In that
+mode, leave the gateway's OIDC variables unset and ensure the trusted edge protects every `/v1/*` HTTP and WebSocket
+route. For ingress-nginx, configure external authentication and include settings equivalent to:
 
 ```yaml
 metadata:
@@ -114,11 +141,11 @@ metadata:
     nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
 ```
 
-Use TLS and appropriate connection and request limits. The authentication boundary must consume and strip caller
-`Authorization` and `x-api-key` headers before forwarding to the gateway; otherwise the gateway treats them as
-upstream inference credentials instead of using its configured fallback. Use mTLS, a trusted non-forwarded identity
-mechanism, or another platform control between the edge and gateway until inbound and upstream credentials are
-separated in the gateway.
+Use TLS and appropriate connection and request limits. With external authentication, the boundary must consume and
+strip caller `Authorization` and `x-api-key` headers before forwarding to a gateway whose native OIDC validation is
+disabled; otherwise those values are treated as upstream inference credentials instead of using the configured
+fallback. Use mTLS or another platform control between the edge and gateway so only the trusted boundary can reach
+the Service.
 
 The base NetworkPolicy denies all pod-network ingress to the gateway. When the authenticated boundary is an
 ingress-nginx controller, copy `network-policy-ingress.example.yaml` into the overlay with the authenticated Ingress.
@@ -156,6 +183,10 @@ curl --fail http://127.0.0.1:9000/health
 curl --fail http://127.0.0.1:9000/ready
 ```
 
+The `/v1/*` examples below include an OIDC bearer header. When native OIDC validation is enabled, set `OIDC_TOKEN` to
+a valid ID token. When an external boundary supplies authentication instead, remove that header. Health and readiness
+requests do not require it.
+
 Send a stored Responses request, save its response ID, restart the Deployment, and continue with
 `previous_response_id`. A successful continuation after the rollout verifies that PostgreSQL, rather than a pod
 filesystem, owns the state:
@@ -163,6 +194,7 @@ filesystem, owns the state:
 ```console
 first_response_id=$(
   curl --fail --silent --show-error http://127.0.0.1:9000/v1/responses \
+    --header "Authorization: Bearer $OIDC_TOKEN" \
     --header "Content-Type: application/json" \
     --data '{"model":"Qwen/Qwen3-30B-A3B-FP8","input":"Reply with READY","store":true}' |
     jq --exit-status --raw-output .id
@@ -177,6 +209,7 @@ rollout, then continue the request:
 
 ```console
 curl --fail --silent --show-error http://127.0.0.1:9000/v1/responses \
+  --header "Authorization: Bearer $OIDC_TOKEN" \
   --header "Content-Type: application/json" \
   --data "$(jq --null-input --arg id "$first_response_id" '{
     model: "Qwen/Qwen3-30B-A3B-FP8",
