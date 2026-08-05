@@ -30,14 +30,22 @@ uses `OPENAI_API_KEY` as a bearer credential when configured. For a provider wit
 `SKIP_LLM_READY_CHECK=true`; `/ready` will continue checking PostgreSQL but will omit the upstream check. Add a small
 Responses API request as an external monitor in that configuration.
 
-Create the namespace and Secret before applying the workload:
+Create the namespace and Secret before applying the workload. Prefer an external secret manager in production. For a
+manual deployment, write the values to a mode-`0600` file outside the repository so credentials do not enter shell
+history or process arguments:
 
 ```console
 kubectl apply -f deploy/kubernetes/namespace.yaml
+install -m 600 /dev/null /tmp/agentic-api-secret.env
+$EDITOR /tmp/agentic-api-secret.env
 kubectl --namespace agentic-api create secret generic agentic-api \
-  --from-literal=DATABASE_URL='postgresql://agentic-api:replace-me@postgres.example.com:5432/agentic_api?sslmode=require' \
-  --from-literal=OPENAI_API_KEY='replace-me'
+  --from-env-file=/tmp/agentic-api-secret.env \
+  --dry-run=client --output=yaml |
+  kubectl apply --server-side --field-manager=agentic-api-operator --filename=-
 ```
+
+The protected file contains `DATABASE_URL=postgresql://...?...` and, when needed, `OPENAI_API_KEY=...`. Remove it
+securely after the Secret has been created.
 
 Omit `OPENAI_API_KEY` when the inference service does not require a fallback credential. The request's
 `Authorization` or Anthropic-compatible `x-api-key` header still takes precedence where the protocol requires it.
@@ -45,7 +53,23 @@ Omit `OPENAI_API_KEY` when the inference service does not require a fallback cre
 real credentials to that file or commit a generated Secret. Kubernetes Secrets are only base64-encoded by default;
 enable encryption at rest and restrict Secret access in the cluster.
 
+The PostgreSQL example requires TLS certificate and hostname verification. When the database uses a private CA, append
+`&sslrootcert=/path/to/postgres-ca.pem` to the example `DATABASE_URL` and mount that read-only CA file through a
+production overlay.
+
 ## Deploy and inspect the gateway
+
+Render and schema-check the base before applying it. CI runs the same validation with pinned kubectl and kubeconform
+releases against the Kubernetes 1.36 schema:
+
+```console
+kubectl kustomize deploy/kubernetes |
+  kubeconform -kubernetes-version 1.36.0 -strict -summary
+```
+
+This catches Kustomize build failures, unknown Kubernetes fields, duplicate keys, and schema type errors. It does not
+replace admission-policy or server-side validation in the target cluster, so validate environment overlays against a
+representative cluster before production rollout.
 
 Apply the base or the environment overlay:
 
@@ -127,6 +151,10 @@ development. Every `/v1/*` HTTP and WebSocket route then requires a valid bearer
 remain available to Kubernetes probes. Follow the [OIDC validation contract](../design/oidc-bearer-authentication.md)
 and the [GitHub and Dex tutorial](github-oidc.md) when configuring the provider and clients.
 
+Route only the authenticated `/v1/*` paths through a public Ingress; Kubernetes can probe `/health` and `/ready`
+directly through the pod network. If platform constraints expose either probe path, restrict or rate-limit it
+separately.
+
 Alternatively, put an identity-aware proxy or authenticated application service in front of the gateway. In that
 mode, leave the gateway's OIDC variables unset and ensure the trusted edge protects every `/v1/*` HTTP and WebSocket
 route. For ingress-nginx, configure external authentication and include settings equivalent to:
@@ -153,6 +181,10 @@ Its selectors
 admit only pods labeled `app.kubernetes.io/name=ingress-nginx` in the `ingress-nginx` namespace. Patch both selectors
 when the controller uses different labels or a different namespace. Keep the default-deny policy in place, and verify
 that the cluster's network plugin enforces NetworkPolicy before relying on it as a security boundary.
+
+Those selectors trust the whole matching ingress controller, not one Ingress object. In a shared or multi-tenant
+controller, use admission policy and RBAC to prevent untrusted routes from selecting this Service, or deploy a dedicated
+controller. Prefer mTLS or workload identity between the boundary and gateway when controller tenancy is not exclusive.
 
 The portable base does not restrict egress because the DNS resolver, managed PostgreSQL addresses, ports, and external
 inference destinations are environment-specific. Add a default-deny egress policy and explicit DNS, database, and

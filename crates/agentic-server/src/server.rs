@@ -7,8 +7,8 @@ use agentic_core::config::Config;
 use agentic_core::error::Error as CoreError;
 use agentic_core::executor::ExecutionContext;
 use agentic_core::proxy::ProxyState;
-use agentic_core::readiness::wait_llm_ready;
-use agentic_server::app::{AppState, ServerConfig, WebSocketTracker, build_router_with_auth};
+use agentic_core::readiness::{llm_readiness_client, wait_llm_ready};
+use agentic_server::app::{AppState, ReadinessTracker, ServerConfig, WebSocketTracker, build_router_with_auth};
 use agentic_server::auth::{OidcAuthError, OidcAuthenticator, OidcConfig};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
@@ -39,6 +39,8 @@ async fn build_state(config: &Config, shutdown_token: CancellationToken) -> Resu
     Ok(AppState {
         proxy_state,
         exec_ctx,
+        llm_readiness_client: llm_readiness_client()?,
+        readiness_tracker: ReadinessTracker::default(),
         shutdown_token,
         websocket_tracker: WebSocketTracker::default(),
         llm_api_base: config.llm_api_base.clone(),

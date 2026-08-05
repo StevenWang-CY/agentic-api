@@ -273,6 +273,8 @@ fn persistence_disabled_state(llm_url: &str) -> AppState {
     AppState {
         proxy_state,
         exec_ctx,
+        llm_readiness_client: agentic_core::readiness::llm_readiness_client().expect("readiness client"),
+        readiness_tracker: agentic_server::app::ReadinessTracker::default(),
         shutdown_token: CancellationToken::new(),
         websocket_tracker: WebSocketTracker::default(),
         llm_api_base: config.llm_api_base,
@@ -306,6 +308,8 @@ async fn storage_backed_state_with_web_search(llm_url: &str, web_search_base_url
     let state = AppState {
         proxy_state,
         exec_ctx,
+        llm_readiness_client: agentic_core::readiness::llm_readiness_client().expect("readiness client"),
+        readiness_tracker: agentic_server::app::ReadinessTracker::default(),
         shutdown_token: CancellationToken::new(),
         websocket_tracker: WebSocketTracker::default(),
         llm_api_base: config.llm_api_base,

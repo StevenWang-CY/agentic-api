@@ -5,6 +5,9 @@ use tracing::info;
 use crate::config::Config;
 use crate::error::Error;
 
+/// Maximum duration of one inference-service readiness probe.
+pub const LLM_READINESS_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
 fn checked_duration_seconds(name: &str, value: f64) -> Result<Duration, Error> {
     if !value.is_finite() || value <= 0.0 {
         return Err(Error::Config(format!(
@@ -24,11 +27,27 @@ fn timeout_error(url: &str, timeout_s: f64) -> Error {
 
 /// Result of a single bounded inference-service health probe.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum LlmReadiness {
     Ready,
     Rejected(reqwest::StatusCode),
     Unreachable(reqwest::Error),
     TimedOut,
+}
+
+/// Build the dedicated HTTP client used for inference-service health probes.
+///
+/// The client rejects redirects so an authentication page or generic UI cannot
+/// turn an unsuccessful `/health` response into a false-positive readiness result.
+///
+/// # Errors
+///
+/// Returns an error when the HTTP client cannot be constructed.
+pub fn llm_readiness_client() -> Result<reqwest::Client, Error> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(Error::HttpClient)
 }
 
 /// Probe the inference service's `/health` endpoint once.
@@ -68,7 +87,7 @@ pub async fn wait_llm_ready(config: &Config) -> Result<(), Error> {
     let base = config.llm_api_base.trim_end_matches('/');
     let url = format!("{base}/health");
 
-    let client = reqwest::Client::builder().build().map_err(Error::HttpClient)?;
+    let client = llm_readiness_client()?;
 
     let timeout = checked_duration_seconds("llm_ready_timeout_s", config.llm_ready_timeout_s)?;
     let interval = checked_duration_seconds("llm_ready_interval_s", config.llm_ready_interval_s)?;
@@ -88,7 +107,7 @@ pub async fn wait_llm_ready(config: &Config) -> Result<(), Error> {
                 &client,
                 &config.llm_api_base,
                 config.openai_api_key.as_deref(),
-                Duration::from_secs(2).min(remaining),
+                LLM_READINESS_PROBE_TIMEOUT.min(remaining),
             )
             .await?,
             LlmReadiness::Ready
@@ -115,9 +134,38 @@ pub async fn wait_llm_ready(config: &Config) -> Result<(), Error> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
-    use super::{checked_duration_seconds, probe_llm_readiness, timeout_error};
+    use axum::Router;
+    use axum::http::HeaderMap;
+    use axum::response::{IntoResponse, Redirect};
+    use axum::routing::get;
+    use http::StatusCode;
+    use tokio::net::TcpListener;
+
+    use super::{checked_duration_seconds, probe_llm_readiness, timeout_error, wait_llm_ready};
+
+    fn test_config(llm_api_base: String) -> crate::config::Config {
+        crate::config::Config {
+            llm_api_base,
+            openai_api_key: Some("test-key".to_owned()),
+            llm_ready_timeout_s: 0.5,
+            llm_ready_interval_s: 0.01,
+            skip_llm_ready_check: false,
+            db_url: None,
+            postgres: crate::config::PostgresConfig::default(),
+            sqlite: crate::config::SqliteConfig::default(),
+        }
+    }
+
+    async fn spawn_upstream(app: Router) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), handle)
+    }
 
     #[test]
     fn checked_duration_rejects_non_positive() {
@@ -177,5 +225,60 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(error, crate::error::Error::InvalidHeader(_)));
+    }
+
+    #[tokio::test]
+    async fn wait_llm_ready_retries_with_authentication_until_success() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let app = Router::new().route(
+            "/health",
+            get({
+                let requests = Arc::clone(&requests);
+                move |headers: HeaderMap| {
+                    let requests = Arc::clone(&requests);
+                    async move {
+                        if headers.get("authorization").and_then(|value| value.to_str().ok()) != Some("Bearer test-key")
+                        {
+                            return StatusCode::UNAUTHORIZED;
+                        }
+                        if requests.fetch_add(1, Ordering::SeqCst) == 0 {
+                            StatusCode::SERVICE_UNAVAILABLE
+                        } else {
+                            StatusCode::NO_CONTENT
+                        }
+                    }
+                }
+            }),
+        );
+        let (url, upstream) = spawn_upstream(app).await;
+
+        wait_llm_ready(&test_config(url)).await.unwrap();
+
+        assert!(requests.load(Ordering::SeqCst) >= 2);
+        upstream.abort();
+    }
+
+    #[tokio::test]
+    async fn wait_llm_ready_rejects_redirects_until_final_timeout() {
+        let app = Router::new()
+            .route("/health", get(|| async { Redirect::temporary("/login") }))
+            .route("/login", get(|| async { StatusCode::OK.into_response() }));
+        let (url, upstream) = spawn_upstream(app).await;
+        let mut config = test_config(url.clone());
+        config.llm_ready_timeout_s = 0.05;
+
+        let error = wait_llm_ready(&config).await.unwrap_err();
+
+        match error {
+            crate::error::Error::LlmTimeout {
+                url: timed_out_url,
+                timeout_s,
+            } => {
+                assert_eq!(timed_out_url, format!("{url}/health"));
+                assert!((timeout_s - 0.05).abs() < f64::EPSILON);
+            }
+            other => panic!("expected timeout error, got {other:?}"),
+        }
+        upstream.abort();
     }
 }

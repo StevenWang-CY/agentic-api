@@ -173,6 +173,8 @@ async fn spawn_gateway(llm_url: &str) -> (Arc<reqwest::Client>, String) {
     let state = AppState {
         proxy_state,
         exec_ctx,
+        llm_readiness_client: agentic_core::readiness::llm_readiness_client().expect("readiness client"),
+        readiness_tracker: agentic_server::app::ReadinessTracker::default(),
         shutdown_token: CancellationToken::new(),
         websocket_tracker: WebSocketTracker::default(),
         llm_api_base: config.llm_api_base,

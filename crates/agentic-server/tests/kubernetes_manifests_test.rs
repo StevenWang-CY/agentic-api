@@ -33,6 +33,14 @@ fn string_list(value: &Value) -> Vec<&str> {
         .collect()
 }
 
+fn assert_string_map_is_subset(selector: &Value, labels: &Value) {
+    let selector = selector.as_mapping().expect("selector must be a mapping");
+    let labels = labels.as_mapping().expect("labels must be a mapping");
+    for (key, value) in selector {
+        assert_eq!(labels.get(key), Some(value), "selector entry must match pod labels");
+    }
+}
+
 #[test]
 fn kustomization_includes_only_non_secret_base_resources() {
     let manifest = parse_manifest("kustomization.yaml");
@@ -167,12 +175,13 @@ fn deployment_is_replicated_hardened_and_probe_driven() {
 
 #[test]
 fn service_config_and_disruption_budget_match_the_workload() {
+    let deployment = parse_manifest("deployment.yaml");
+    let workload_selector = &deployment["spec"]["selector"]["matchLabels"];
+    let pod_labels = &deployment["spec"]["template"]["metadata"]["labels"];
     let service = parse_manifest("service.yaml");
     assert_eq!(service["spec"]["type"].as_str(), Some("ClusterIP"));
-    assert_eq!(
-        service["spec"]["selector"]["app.kubernetes.io/name"].as_str(),
-        Some("agentic-api")
-    );
+    assert_eq!(&service["spec"]["selector"], workload_selector);
+    assert_string_map_is_subset(&service["spec"]["selector"], pod_labels);
     assert_eq!(service["spec"]["ports"][0]["targetPort"].as_str(), Some("http"));
 
     let config = parse_manifest("configmap.yaml");
@@ -195,10 +204,8 @@ fn service_config_and_disruption_budget_match_the_workload() {
     let budget = parse_manifest("pod-disruption-budget.yaml");
     assert_eq!(budget["apiVersion"].as_str(), Some("policy/v1"));
     assert_eq!(budget["spec"]["minAvailable"].as_u64(), Some(1));
-    assert_eq!(
-        budget["spec"]["selector"]["matchLabels"]["app.kubernetes.io/name"].as_str(),
-        Some("agentic-api")
-    );
+    assert_eq!(&budget["spec"]["selector"]["matchLabels"], workload_selector);
+    assert_string_map_is_subset(&budget["spec"]["selector"]["matchLabels"], pod_labels);
 }
 
 #[test]
@@ -209,7 +216,7 @@ fn secret_example_documents_required_credentials() {
     assert!(
         secret["stringData"]["DATABASE_URL"]
             .as_str()
-            .is_some_and(|url| url.starts_with("postgresql://"))
+            .is_some_and(|url| url.starts_with("postgresql://") && url.contains("sslmode=verify-full"))
     );
     assert!(secret["stringData"]["OPENAI_API_KEY"].as_str().is_some());
 }
@@ -219,14 +226,17 @@ fn network_access_is_denied_by_default_and_ingress_is_opt_in() {
     let default_deny = parse_manifest("network-policy.yaml");
     assert_eq!(default_deny["apiVersion"].as_str(), Some("networking.k8s.io/v1"));
     assert_eq!(default_deny["kind"].as_str(), Some("NetworkPolicy"));
-    assert_eq!(
-        default_deny["spec"]["podSelector"]["matchLabels"]["app.kubernetes.io/name"].as_str(),
-        Some("agentic-api")
-    );
+    let deployment = parse_manifest("deployment.yaml");
+    let workload_selector = &deployment["spec"]["selector"]["matchLabels"];
+    let pod_labels = &deployment["spec"]["template"]["metadata"]["labels"];
+    assert_eq!(&default_deny["spec"]["podSelector"]["matchLabels"], workload_selector);
+    assert_string_map_is_subset(&default_deny["spec"]["podSelector"]["matchLabels"], pod_labels);
     assert_eq!(string_list(&default_deny["spec"]["policyTypes"]), ["Ingress"]);
     assert!(default_deny["spec"]["ingress"].as_sequence().is_some_and(Vec::is_empty));
 
     let ingress_access = parse_manifest("network-policy-ingress.example.yaml");
+    assert_eq!(&ingress_access["spec"]["podSelector"]["matchLabels"], workload_selector);
+    assert_string_map_is_subset(&ingress_access["spec"]["podSelector"]["matchLabels"], pod_labels);
     let ingress_rule = &ingress_access["spec"]["ingress"][0];
     assert_eq!(
         ingress_rule["from"][0]["namespaceSelector"]["matchLabels"]["kubernetes.io/metadata.name"].as_str(),

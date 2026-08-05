@@ -7,7 +7,7 @@ use agentic_core::config::Config;
 use agentic_core::executor::ExecutionContext;
 use axum::Router;
 use axum::http::HeaderMap;
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Redirect};
 use axum::routing::get;
 use common::{spawn_gateway, spawn_mock_llm, test_config, test_state};
 use http::StatusCode;
@@ -18,6 +18,24 @@ fn test_config_no_key(llm_url: &str) -> Config {
         openai_api_key: None,
         ..test_config(llm_url)
     }
+}
+
+async fn spawn_upstream(app: Router) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let upstream = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}"), upstream)
+}
+
+async fn spawn_gateway_for_upstream(
+    app: Router,
+    configure: impl FnOnce(&mut Config),
+) -> (String, tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>) {
+    let (upstream_url, upstream) = spawn_upstream(app).await;
+    let mut config = test_config_no_key(&upstream_url);
+    configure(&mut config);
+    let (gateway_url, gateway) = spawn_gateway(test_state(&config)).await;
+    (gateway_url, upstream, gateway)
 }
 
 #[tokio::test]
@@ -59,10 +77,7 @@ async fn test_ready_returns_503_when_llm_unreachable() {
 #[tokio::test]
 async fn test_ready_returns_503_when_llm_rejects_health_check() {
     let app = Router::new().route("/health", get(|| async { StatusCode::UNAUTHORIZED }));
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let upstream = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    let (gw_url, gateway) = spawn_gateway(test_state(&test_config_no_key(&format!("http://{addr}")))).await;
+    let (gw_url, upstream, gateway) = spawn_gateway_for_upstream(app, |_| {}).await;
 
     let resp = reqwest::get(format!("{gw_url}/ready")).await.unwrap();
 
@@ -72,12 +87,23 @@ async fn test_ready_returns_503_when_llm_rejects_health_check() {
 }
 
 #[tokio::test]
+async fn test_ready_returns_503_when_llm_health_redirects_to_success() {
+    let app = Router::new()
+        .route("/health", get(|| async { Redirect::temporary("/login") }))
+        .route("/login", get(|| async { StatusCode::OK }));
+    let (gw_url, upstream, gateway) = spawn_gateway_for_upstream(app, |_| {}).await;
+
+    let response = reqwest::get(format!("{gw_url}/ready")).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    upstream.abort();
+    gateway.abort();
+}
+
+#[tokio::test]
 async fn test_ready_accepts_any_successful_llm_health_status() {
     let app = Router::new().route("/health", get(|| async { StatusCode::NO_CONTENT }));
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let upstream = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    let (gw_url, gateway) = spawn_gateway(test_state(&test_config_no_key(&format!("http://{addr}")))).await;
+    let (gw_url, upstream, gateway) = spawn_gateway_for_upstream(app, |_| {}).await;
 
     let resp = reqwest::get(format!("{gw_url}/ready")).await.unwrap();
 
@@ -95,10 +121,7 @@ async fn test_ready_returns_503_when_llm_health_check_times_out() {
             StatusCode::OK
         }),
     );
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let upstream = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    let (gw_url, gateway) = spawn_gateway(test_state(&test_config_no_key(&format!("http://{addr}")))).await;
+    let (gw_url, upstream, gateway) = spawn_gateway_for_upstream(app, |_| {}).await;
 
     let response = tokio::time::timeout(
         std::time::Duration::from_secs(3),
@@ -111,6 +134,48 @@ async fn test_ready_returns_503_when_llm_health_check_times_out() {
     assert_eq!(response.status(), 503);
     upstream.abort();
     gateway.abort();
+}
+
+#[tokio::test]
+async fn test_ready_returns_cached_result_during_overlapping_dependency_probe() {
+    for (cached, expected) in [
+        (None, StatusCode::SERVICE_UNAVAILABLE),
+        (Some(false), StatusCode::SERVICE_UNAVAILABLE),
+        (Some(true), StatusCode::OK),
+    ] {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let app = Router::new().route(
+            "/health",
+            get({
+                let requests = Arc::clone(&requests);
+                move || {
+                    let requests = Arc::clone(&requests);
+                    async move {
+                        requests.fetch_add(1, Ordering::SeqCst);
+                        StatusCode::OK
+                    }
+                }
+            }),
+        );
+        let (llm_url, upstream) = spawn_upstream(app).await;
+        let state = test_state(&test_config_no_key(&llm_url));
+        let readiness_tracker = state.readiness_tracker.clone();
+        if let Some(cached) = cached {
+            assert!(readiness_tracker.try_start_probe().unwrap().finish(cached));
+        }
+        let active_probe = readiness_tracker
+            .try_start_probe()
+            .expect("reserve the only readiness probe permit");
+        let (gw_url, gateway) = spawn_gateway(state).await;
+
+        let response = reqwest::get(format!("{gw_url}/ready")).await.unwrap();
+
+        assert_eq!(response.status(), expected);
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+        drop(active_probe);
+        upstream.abort();
+        gateway.abort();
+    }
 }
 
 #[tokio::test]
@@ -148,10 +213,8 @@ async fn test_ready_fails_fast_when_database_is_unready() {
             StatusCode::OK
         }),
     );
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let upstream = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    let mut config = test_config_no_key(&format!("http://{addr}"));
+    let (upstream_url, upstream) = spawn_upstream(app).await;
+    let mut config = test_config_no_key(&upstream_url);
     config.db_url = Some("sqlite://?mode=memory".to_owned());
     let exec_ctx = Arc::new(
         ExecutionContext::from_config(&config)
@@ -198,14 +261,10 @@ async fn test_ready_skips_upstream_when_configured() {
             }
         }),
     );
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let upstream = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    let config = Config {
-        skip_llm_ready_check: true,
-        ..test_config_no_key(&format!("http://{addr}"))
-    };
-    let (gw_url, gateway) = spawn_gateway(test_state(&config)).await;
+    let (gw_url, upstream, gateway) = spawn_gateway_for_upstream(app, |config| {
+        config.skip_llm_ready_check = true;
+    })
+    .await;
 
     let resp = reqwest::get(format!("{gw_url}/ready")).await.unwrap();
 
@@ -254,11 +313,10 @@ async fn test_ready_authenticates_upstream_health_check() {
             }
         }),
     );
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let upstream = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-
-    let (gw_url, gateway) = spawn_gateway(test_state(&test_config(&format!("http://{addr}")))).await;
+    let (gw_url, upstream, gateway) = spawn_gateway_for_upstream(app, |config| {
+        config.openai_api_key = Some("test-key".to_owned());
+    })
+    .await;
     let resp = reqwest::get(format!("{gw_url}/ready")).await.unwrap();
 
     assert_eq!(resp.status(), 200);
