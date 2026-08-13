@@ -30,16 +30,15 @@ fn validate_domain_list(tool: &Value, field: &str) -> ExecutorResult<()> {
         return Ok(());
     };
     let valid = value.as_array().is_some_and(|domains| {
-        !domains.is_empty()
-            && domains.iter().all(|domain| {
-                domain.as_str().is_some_and(|domain| {
-                    let domain = domain.trim();
-                    !domain.is_empty()
-                        && !domain.contains("://")
-                        && !domain.starts_with('/')
-                        && !domain.chars().any(char::is_whitespace)
-                })
+        domains.iter().all(|domain| {
+            domain.as_str().is_some_and(|domain| {
+                let domain = domain.trim();
+                !domain.is_empty()
+                    && !domain.contains("://")
+                    && !domain.starts_with('/')
+                    && !domain.chars().any(char::is_whitespace)
             })
+        })
     });
     if valid {
         Ok(())
@@ -128,13 +127,21 @@ fn native_web_search_max_uses(request: &Value) -> ExecutorResult<Option<usize>> 
         if tool_type != Some(NATIVE_WEB_SEARCH_TYPE) || !is_web_search {
             continue;
         }
-        if tool.get("allowed_domains").is_some() && tool.get("blocked_domains").is_some() {
+        validate_domain_list(tool, "allowed_domains")?;
+        validate_domain_list(tool, "blocked_domains")?;
+        let has_allowed_domains = tool
+            .get("allowed_domains")
+            .and_then(Value::as_array)
+            .is_some_and(|domains| !domains.is_empty());
+        let has_blocked_domains = tool
+            .get("blocked_domains")
+            .and_then(Value::as_array)
+            .is_some_and(|domains| !domains.is_empty());
+        if has_allowed_domains && has_blocked_domains {
             return Err(ExecutorError::InvalidRequest(
                 "web_search allowed_domains and blocked_domains cannot be used together".to_owned(),
             ));
         }
-        validate_domain_list(tool, "allowed_domains")?;
-        validate_domain_list(tool, "blocked_domains")?;
         validate_user_location(tool)?;
         validate_allowed_callers(tool)?;
         if let Some(value) = tool.get("max_uses") {

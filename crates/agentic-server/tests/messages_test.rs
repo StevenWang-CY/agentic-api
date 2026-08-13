@@ -369,6 +369,27 @@ async fn messages_normalizes_claude_native_web_search_for_vllm() {
 }
 
 #[tokio::test]
+async fn messages_treats_empty_native_domain_lists_as_no_filter() {
+    let final_msg = r#"{"id":"m","type":"message","role":"assistant","model":"qwen3","content":[{"type":"text","text":"Search ready."}],"stop_reason":"end_turn","usage":{"input_tokens":5,"output_tokens":3}}"#;
+    let (llm_url, requests, _upstream) = spawn_tool_validating_vllm_messages(final_msg).await;
+    let (gateway_url, _gateway) = spawn_gateway(test_state(&test_config(&llm_url))).await;
+    let body = br#"{"model":"qwen3","max_tokens":256,"stream":false,"messages":[{"role":"user","content":"latest rust?"}],"tools":[{"type":"web_search_20250305","name":"web_search","allowed_domains":[],"blocked_domains":[]}]}"#;
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/v1/messages"))
+        .body(body.to_vec())
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let requests = requests.lock().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["tools"][0]["name"], "web_search");
+    assert_eq!(requests[0]["tools"][0]["input_schema"]["type"], "object");
+}
+
+#[tokio::test]
 async fn messages_rejects_unsupported_native_web_search_version() {
     let final_msg = r#"{"id":"m","type":"message","role":"assistant","model":"qwen3","content":[{"type":"text","text":"should not run"}],"stop_reason":"end_turn"}"#;
     let (llm_url, calls, _upstream) = spawn_mock_vllm_messages(final_msg).await;
