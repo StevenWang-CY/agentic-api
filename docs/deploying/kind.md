@@ -3,14 +3,56 @@
 This guide runs a single Agentic API replica on a local [kind](https://kind.sigs.k8s.io/)
 cluster. It is intended for development and smoke testing, not production deployment.
 
-The example assumes that vLLM is already running on the host. Agentic API runs in kind
-and reaches the host through `host.docker.internal`.
+The example assumes that vLLM or an llm-d inference gateway is already running on the
+host. Agentic API runs in kind and reaches the upstream through `host.docker.internal`.
 
 !!! warning
 
     The example uses a local SQLite database inside the pod. The database is lost when
     the pod is removed, and this setup is limited to one replica. Use PostgreSQL and a
     persistent volume for a real deployment.
+
+## Use llm-d as the inference backend
+
+The same topology can place [llm-d](https://llm-d.ai/) between Agentic API and
+the vLLM workers. This is the deployment pattern validated on a Spark DGX:
+llm-d owns inference routing and presents an OpenAI-compatible upstream endpoint,
+while Agentic API owns response state, tool orchestration, and the agent loop.
+
+```mermaid
+flowchart LR
+    C["Codex or Claude Code"]
+    A["Agentic API\n(Kubernetes / kind)"]
+    L["llm-d\n(router / inference gateway)"]
+    V["vLLM worker(s)\n(Spark DGX)"]
+    T["Agentic API tools\n(web search / MCP / client tools)"]
+
+    C -->|"Responses or Messages"| A
+    A -->|"model request"| L
+    L --> V
+    V -->|"streamed model events"| L
+    L -->|"streamed response"| A
+    A -->|"tool call"| T
+    T -->|"tool result for next model turn"| A
+    A -->|"final response"| C
+
+    classDef client fill:#1a3a5c,color:#e0e0e0
+    classDef gateway fill:#1a5c2a,color:#e0e0e0
+    classDef router fill:#5c3a1a,color:#e0e0e0
+    classDef worker fill:#4b3a6b,color:#e0e0e0
+    class C client
+    class A,T gateway
+    class L router
+    class V worker
+```
+
+For this arrangement, configure Agentic API's upstream URL to the llm-d
+endpoint rather than directly to a vLLM worker. The Deployment below uses a
+host alias because the local kind pod reaches the tested llm-d/vLLM stack on the
+host; in a Kubernetes deployment where llm-d is a Service, use the Service DNS
+name instead. The tool loop remains in Agentic API: a model tool call is
+executed or returned to the client, and the resulting turn is sent back through
+llm-d for inference.
 
 ## Prerequisites
 
@@ -22,8 +64,9 @@ kind version
 kubectl version --client
 ```
 
-You also need a vLLM server reachable from Docker at `host.docker.internal:5050`.
-For example, start vLLM on the host with:
+You need an inference endpoint reachable from Docker at
+`host.docker.internal:5050`. This can be vLLM directly, or the llm-d endpoint
+fronting the vLLM workers. For a direct vLLM smoke test, start vLLM on the host with:
 
 ```console
 vllm serve Qwen/Qwen3-30B-A3B-FP8 \
