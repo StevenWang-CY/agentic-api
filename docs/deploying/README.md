@@ -15,7 +15,7 @@ host. Agentic API runs in kind and reaches the upstream through `host.docker.int
 ## Use llm-d as the inference backend
 
 The same topology can place [llm-d](https://llm-d.ai/) between Agentic API and
-the vLLM workers. This is the deployment pattern validated on GPU hardware:
+the vLLM serving stack. This is the deployment pattern validated on GPU hardware:
 llm-d owns inference routing and presents an OpenAI-compatible upstream endpoint,
 while Agentic API owns response state, tool orchestration, and the agent loop.
 
@@ -24,13 +24,16 @@ flowchart LR
     C["Codex or Claude Code"]
     A["Agentic API\n(Kubernetes / kind)"]
     L["llm-d\n(router / inference gateway)"]
-    V["vLLM worker(s)\n(GPU)"]
+    VC["vLLM CPU server\n(rendering / scheduling)"]
+    VG["vLLM GPU workers\n(token generation)"]
     T["Agentic API tools\n(web search / MCP / client tools)"]
 
     C -->|"Responses or Messages"| A
     A -->|"model request"| L
-    L --> V
-    V -->|"streamed model events"| L
+    L --> VC
+    VC --> VG
+    VG -->|"generated tokens"| VC
+    VC -->|"streamed model events"| L
     L -->|"streamed response"| A
     A -->|"tool call"| T
     T -->|"tool result for next model turn"| A
@@ -43,11 +46,11 @@ flowchart LR
     class C client
     class A,T gateway
     class L router
-    class V worker
+    class VC,VG worker
 ```
 
 For this arrangement, configure Agentic API's upstream URL to the llm-d
-endpoint rather than directly to a vLLM worker. The Deployment below uses a
+endpoint rather than directly to a vLLM server. The Deployment below uses a
 host alias because the local kind pod reaches the tested llm-d/vLLM stack on the
 host; in a Kubernetes deployment where llm-d is a Service, use the Service DNS
 name instead. The tool loop remains in Agentic API: a model tool call is
