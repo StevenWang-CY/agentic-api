@@ -20,6 +20,20 @@ cargo build
 cargo test
 ```
 
+## Running a harness session
+
+Build both binaries, then let the CLI start Agentic API and configure the harness in an isolated temporary home:
+
+```console
+cargo build -p agentic-server --bins
+./target/debug/agentic run codex --model Qwen/your-model
+./target/debug/agentic run claude --model Qwen/your-model
+```
+
+For an existing OpenAI-compatible upstream, provide both the upstream URL and harness model name. SQLite is the default;
+pass `--database-url postgresql://...` for a shared PostgreSQL deployment. Use `agentic validate` to check prerequisites
+without launching a session.
+
 ## Linting and Formatting
 
 ```console
