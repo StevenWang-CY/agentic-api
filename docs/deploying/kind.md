@@ -41,7 +41,8 @@ from the Docker network.
 
 The repository includes `Dockerfile.kind`, a multi-stage Linux build that works when
 the repository is checked out on macOS as well as Linux. The `.dockerignore` file
-keeps local build output out of the Docker context. Its contents are:
+keeps local build output out of the Docker context. The contents of
+`Dockerfile.kind` are:
 
 ```dockerfile
 FROM rust:1.96.0-bookworm AS build
@@ -91,8 +92,9 @@ provides for reaching services on the host.
 ## Deploy Agentic API
 
 Apply the following Deployment and Service. The `host.docker.internal` address is
-available in Docker Desktop. On Linux, add the `hostAliases` entry shown below if your
-Docker runtime does not provide that hostname automatically.
+available in Docker Desktop. On native Linux Docker, that hostname does not resolve
+inside the cluster, so you must also add the `hostAliases` block shown in the section
+below before applying the manifest.
 
 ```yaml
 apiVersion: apps/v1
@@ -155,18 +157,25 @@ kubectl rollout status deployment/agentic-api
 kubectl get pods,svc
 ```
 
-On Linux, if the pod cannot resolve `host.docker.internal`, add this block below
-`spec.template.spec` in the Deployment and apply the manifest again:
+On native Linux Docker, `host.docker.internal` never resolves inside the pod, so
+add this block below `spec.template.spec` in the Deployment before applying the
+manifest:
 
 ```yaml
       hostAliases:
-        - ip: "172.17.0.1"
+        - ip: "172.18.0.1"
           hostnames:
             - host.docker.internal
 ```
 
-The IP may differ with your Docker networking setup. Check the Docker bridge gateway
-with `docker network inspect bridge`.
+The IP must be the gateway of the `kind` Docker network, not the default bridge:
+kind nodes run on their own network, so the usual `172.17.0.1` bridge gateway is
+not reachable from the pod. Confirm the address with:
+
+```console
+docker network inspect kind \
+  --format '{{range .IPAM.Config}}{{.Gateway}} {{end}}'
+```
 
 ## Call the API
 
@@ -237,6 +246,14 @@ kubectl describe pod -l app=agentic-api
 kubectl logs deployment/agentic-api
 docker run --rm curlimages/curl:8.10.1 \
   http://host.docker.internal:5050/health
+```
+
+On native Linux Docker, run the connectivity check on the `kind` network against
+its gateway instead, since `host.docker.internal` does not resolve:
+
+```console
+docker run --rm --network kind curlimages/curl:8.10.1 \
+  http://172.18.0.1:5050/health
 ```
 
 ### The image is not refreshed
