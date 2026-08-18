@@ -25,7 +25,7 @@ flowchart LR
     A["Agentic API\n(Kubernetes / kind)"]
     L["llm-d\n(router / inference gateway)"]
     VC["vLLM CPU server\n(rendering / scheduling)"]
-    VG["vLLM GPU workers\n(token generation)"]
+    VG["vLLM GPU worker\n(token generation)"]
     T["Agentic API tools\n(web search / MCP / client tools)"]
 
     C -->|"Responses or Messages"| A
