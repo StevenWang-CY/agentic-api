@@ -1,4 +1,4 @@
-# Run Agentic API on kind
+# Run Agentic API on Kubernetes with kind
 
 This guide runs a single vLLM Agentic API replica on a local
 [kind](https://kind.sigs.k8s.io/) cluster. It is intended for development and smoke testing, not production deployment.
