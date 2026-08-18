@@ -15,7 +15,7 @@ host. Agentic API runs in kind and reaches the upstream through `host.docker.int
 ## Use llm-d as the inference backend
 
 The same topology can place [llm-d](https://llm-d.ai/) between Agentic API and
-the vLLM workers. This is the deployment pattern validated on a Spark DGX:
+the vLLM workers. This is the deployment pattern validated on GPU hardware:
 llm-d owns inference routing and presents an OpenAI-compatible upstream endpoint,
 while Agentic API owns response state, tool orchestration, and the agent loop.
 
@@ -24,7 +24,7 @@ flowchart LR
     C["Codex or Claude Code"]
     A["Agentic API\n(Kubernetes / kind)"]
     L["llm-d\n(router / inference gateway)"]
-    V["vLLM worker(s)\n(Spark DGX)"]
+    V["vLLM worker(s)\n(GPU)"]
     T["Agentic API tools\n(web search / MCP / client tools)"]
 
     C -->|"Responses or Messages"| A
