@@ -74,6 +74,49 @@ flowchart LR
 
 ## 🚀 Quickstart
 
+### Agentic API CLI
+
+Build the user-facing CLI and gateway binaries together:
+
+```bash
+cargo build -p agentic-server --bins
+```
+
+Launch Codex or Claude Code with an isolated Agentic API configuration:
+
+```bash
+./target/debug/agentic run codex --model Qwen/Qwen3-30B-A3B-FP8
+./target/debug/agentic run claude --model Qwen/Qwen3-30B-A3B-FP8
+```
+
+To use an existing upstream, provide its URL and the model name the harness should use:
+
+```bash
+./target/debug/agentic run codex \
+  --upstream http://127.0.0.1:5050 \
+  --model Qwen/Qwen3-30B-A3B-FP8
+```
+
+SQLite is the default storage backend. Use PostgreSQL explicitly when the session is shared:
+
+```bash
+./target/debug/agentic run codex \
+  --model Qwen/Qwen3-30B-A3B-FP8 \
+  --database-url postgresql://user:password@localhost/agentic_api
+```
+
+Run preflight checks without launching a harness:
+
+```bash
+./target/debug/agentic validate \
+  --upstream http://127.0.0.1:5050 \
+  --model Qwen/Qwen3-30B-A3B-FP8 \
+  --harness codex
+```
+
+Use `AGENTIC_CODEX_BIN` or `AGENTIC_CLAUDE_BIN` to override harness binary discovery. Add `--no-color` for scripts or
+`--quiet` for minimal lifecycle output.
+
 **1. Serve a model with vLLM.** Any recipe from [recipes.vllm.ai](https://recipes.vllm.ai) works:
 
 ```bash
