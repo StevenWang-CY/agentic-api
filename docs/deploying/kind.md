@@ -233,6 +233,25 @@ kubectl create secret generic agentic-api-secrets \
 
 Do not commit API keys to the manifest or source tree.
 
+## Optional: route through an inference gateway
+
+`--llm-api-base` accepts any OpenAI-compatible endpoint, not only a single vLLM
+server. Pointing it at an inference gateway backed by
+[llm-d](https://llm-d.ai/) and the
+[Gateway API Inference Extension](https://gateway-api-inference-extension.sigs.k8s.io/)
+lets one Agentic API instance serve multiple models (the gateway routes on the
+request's `model` field) and lets the endpoint picker place each request on the
+vLLM replica that already holds the matching KV-cache prefix. Because stateful
+Responses continuations rehydrate the full conversation history, prefix-aware
+placement substantially reduces continuation latency for multi-turn workloads;
+see the measurements in
+[ADR-04](https://github.com/vllm-project/agentic-api/issues/69). This setup has
+been validated on a kind cluster with the deployment above by replacing the
+`--llm-api-base` value with the gateway Service URL, for example
+`http://inference-gateway.default.svc.cluster.local:80`. Installing the gateway,
+`InferencePool`, and endpoint picker is out of scope for this guide; see the
+Inference Extension quickstart for those steps.
+
 ## Troubleshooting
 
 ### The pod stays unready
