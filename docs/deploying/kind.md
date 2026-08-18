@@ -1,7 +1,7 @@
 # Run Agentic API on kind
 
-This guide runs a single Agentic API replica on a local [kind](https://kind.sigs.k8s.io/)
-cluster. It is intended for development and smoke testing, not production deployment.
+This guide runs a single vLLM Agentic API replica on a local
+[kind](https://kind.sigs.k8s.io/) cluster. It is intended for development and smoke testing, not production deployment.
 
 The example assumes that vLLM or an llm-d inference gateway is already running on the
 host. Agentic API runs in kind and reaches the upstream through `host.docker.internal`.
@@ -70,7 +70,7 @@ fronting the vLLM workers. For a direct vLLM smoke test, start vLLM on the host 
 
 ```console
 vllm serve Qwen/Qwen3-30B-A3B-FP8 \
-  --tool-call-parser qwen3_coder \
+  --tool-call-parser hermes \
   --enable-auto-tool-choice \
   --reasoning-parser qwen3 \
   --host 0.0.0.0 \
@@ -82,34 +82,14 @@ from the Docker network.
 
 ## Build the local image
 
-The repository includes `Dockerfile.kind`, a multi-stage Linux build that works when
-the repository is checked out on macOS as well as Linux. The `.dockerignore` file
-keeps local build output out of the Docker context. The contents of
-`Dockerfile.kind` are:
-
-```dockerfile
-FROM rust:1.96.0-bookworm AS build
-
-WORKDIR /src
-COPY . .
-RUN cargo build --release -p agentic-server
-
-FROM debian:bookworm-slim
-
-RUN apt-get update \
-    && apt-get install --no-install-recommends --yes ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-
-COPY --from=build /src/target/release/agentic-server /usr/local/bin/agentic-server
-
-EXPOSE 9000
-ENTRYPOINT ["/usr/local/bin/agentic-server"]
-```
+Use the repository's `Dockerfile`, the same multi-stage, digest-pinned build that CI
+publishes. It builds on macOS (including Apple Silicon) as well as Linux, and the
+`.dockerignore` file keeps local build output out of the Docker context.
 
 Build the image and load it into kind:
 
 ```console
-docker build -f Dockerfile.kind -t agentic-api:kind .
+docker build -t agentic-api:kind .
 kind create cluster --name agentic-api
 kind load docker-image agentic-api:kind --name agentic-api
 ```
@@ -119,18 +99,21 @@ after rebuilding it.
 
 ### Podman
 
-Podman can run kind through its experimental provider. Start a Podman machine first,
-then use the provider environment variable for both cluster operations:
+Podman can run kind through its experimental provider. Start a Podman machine and
+build the image with Podman first - Podman stores unqualified image names under the
+`localhost/` prefix, so use that name consistently when loading the image and in the
+Deployment's `image:` field:
 
 ```console
 podman machine start
+podman build -t agentic-api:kind .
 KIND_EXPERIMENTAL_PROVIDER=podman kind create cluster --name agentic-api-podman
-KIND_EXPERIMENTAL_PROVIDER=podman kind load docker-image agentic-api:kind --name agentic-api-podman
+KIND_EXPERIMENTAL_PROVIDER=podman kind load docker-image localhost/agentic-api:kind --name agentic-api-podman
 ```
 
-In the Deployment below, replace `host.docker.internal` with
-`host.containers.internal` when using Podman. The latter is the hostname Podman
-provides for reaching services on the host.
+In the Deployment below, set `image: localhost/agentic-api:kind`, and replace
+`host.docker.internal` with `host.containers.internal`. The latter is the hostname
+Podman provides for reaching services on the host.
 
 ## Deploy Agentic API
 
@@ -167,6 +150,12 @@ spec:
           ports:
             - name: http
               containerPort: 9000
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            failureThreshold: 60
           readinessProbe:
             httpGet:
               path: /ready
@@ -191,6 +180,13 @@ spec:
       port: 9000
       targetPort: http
 ```
+
+The `startupProbe` matters: the server does not bind its HTTP listener until the
+configured LLM endpoint reports healthy, so while a large model is still loading,
+`/health` is unreachable. Without the startup probe, the liveness probe would kill
+the container after about 30 seconds and leave the pod in `CrashLoopBackOff`. The
+settings above allow up to five minutes; raise `failureThreshold` for models with
+longer load times.
 
 Save the YAML as `agentic-api-kind.yaml`, then apply it:
 
@@ -246,7 +242,22 @@ curl http://localhost:9000/v1/responses \
   }'
 ```
 
-The model name must match the model served by vLLM. View gateway logs while testing:
+The response includes an `id`. Continue the conversation by passing it as
+`previous_response_id` - this is the stateful part, served from the response
+store rather than client-supplied history:
+
+```console
+curl http://localhost:9000/v1/responses \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "Qwen/Qwen3-30B-A3B-FP8",
+    "input": "Repeat what you just said.",
+    "previous_response_id": "<id from the previous response>"
+  }'
+```
+
+The model name must match the model served by vLLM. View the server logs while
+testing:
 
 ```console
 kubectl logs -f deployment/agentic-api
@@ -350,6 +361,13 @@ spec:
       protocol: HTTP
 ```
 
+On macOS or Windows (Docker Desktop), the `172.18.0.1` kind network gateway is not
+reachable from pods; use `TCP:host.docker.internal:5050` as the socat target
+instead. Note that the pod's TCP readiness probe only checks socat's listener, not
+the forwarding target, so a wrong address here shows up as hanging requests rather
+than an unready pod - verify the path with the `/v1/models` check below before
+wiring anything else to it.
+
 ### Install the InferencePool and EPP
 
 The Helm chart installs the `InferencePool`, the EPP, and an `HTTPRoute` bound
@@ -425,7 +443,7 @@ kind uses the image already loaded into its node. Rebuild and load it explicitly
 restart the Deployment:
 
 ```console
-docker build -f Dockerfile.kind -t agentic-api:kind .
+docker build -t agentic-api:kind .
 kind load docker-image agentic-api:kind --name agentic-api
 kubectl rollout restart deployment/agentic-api
 ```
@@ -439,12 +457,27 @@ kubectl get events --sort-by=.lastTimestamp
 
 ## Clean up
 
-Delete the Kubernetes resources and the kind cluster when finished:
+Delete the Kubernetes resources and the kind cluster when finished. If you deployed
+the optional llm-d routing plane, remove it first:
+
+```console
+helm uninstall vllm-pool
+kubectl delete -f llm-pool.yaml
+helm uninstall agentgateway --namespace agentgateway-system
+```
+
+Then delete the Agentic API resources and the cluster:
 
 ```console
 kubectl delete -f agentic-api-kind.yaml
 kind delete cluster --name agentic-api
 ```
 
-The temporary `agentic-api-kind.yaml` file can then be removed from the repository
-checkout.
+If you used the Podman provider, delete that cluster as well:
+
+```console
+KIND_EXPERIMENTAL_PROVIDER=podman kind delete cluster --name agentic-api-podman
+```
+
+The temporary `agentic-api-kind.yaml` and `llm-pool.yaml` files can then be removed
+from the repository checkout.
