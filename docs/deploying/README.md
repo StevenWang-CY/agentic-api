@@ -467,6 +467,7 @@ the optional llm-d routing plane, remove it first:
 helm uninstall vllm-pool
 kubectl delete -f llm-pool.yaml
 helm uninstall agentgateway --namespace agentgateway-system
+helm uninstall agentgateway-crds --namespace agentgateway-system
 ```
 
 Then delete the Agentic API resources and the cluster:
