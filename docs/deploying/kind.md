@@ -233,24 +233,125 @@ kubectl create secret generic agentic-api-secrets \
 
 Do not commit API keys to the manifest or source tree.
 
-## Optional: route through an inference gateway
+## Optional: deploy with llm-d
 
 `--llm-api-base` accepts any OpenAI-compatible endpoint, not only a single vLLM
 server. Pointing it at an inference gateway backed by
 [llm-d](https://llm-d.ai/) and the
 [Gateway API Inference Extension](https://gateway-api-inference-extension.sigs.k8s.io/)
 lets one Agentic API instance serve multiple models (the gateway routes on the
-request's `model` field) and lets the endpoint picker place each request on the
-vLLM replica that already holds the matching KV-cache prefix. Because stateful
-Responses continuations rehydrate the full conversation history, prefix-aware
-placement substantially reduces continuation latency for multi-turn workloads;
-see the measurements in
-[ADR-04](https://github.com/vllm-project/agentic-api/issues/69). This setup has
-been validated on a kind cluster with the deployment above by replacing the
-`--llm-api-base` value with the gateway Service URL, for example
-`http://inference-gateway.default.svc.cluster.local:80`. Installing the gateway,
-`InferencePool`, and endpoint picker is out of scope for this guide; see the
-Inference Extension quickstart for those steps.
+request's `model` field) and lets the endpoint picker (EPP) place each request
+on the vLLM replica that already holds the matching KV-cache prefix. Because
+stateful Responses continuations rehydrate the full conversation history,
+prefix-aware placement substantially reduces continuation latency for
+multi-turn workloads; see the measurements in
+[ADR-04](https://github.com/vllm-project/agentic-api/issues/69).
+
+The steps below add the routing plane to the kind cluster from this guide.
+They keep vLLM on the host, as elsewhere in this guide; each host server is
+represented inside the cluster by a small TCP proxy pod so the `InferencePool`
+can select and monitor it. On a real cluster, vLLM runs as in-cluster pods and
+the pool selects them directly - the proxy pods are only the local-development
+bridge, and the EPP scrapes vLLM metrics through them transparently.
+
+### Install the routing plane
+
+Install the Gateway API and Inference Extension CRDs, then
+[Agentgateway](https://agentgateway.dev/) as the gateway implementation:
+
+```console
+kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.4.0/standard-install.yaml
+kubectl apply -f https://github.com/kubernetes-sigs/gateway-api-inference-extension/releases/download/v1.5.0/manifests.yaml
+helm upgrade -i --create-namespace --namespace agentgateway-system --version v1.0.0 \
+  agentgateway-crds oci://cr.agentgateway.dev/charts/agentgateway-crds
+helm upgrade -i --namespace agentgateway-system --version v1.0.0 \
+  agentgateway oci://cr.agentgateway.dev/charts/agentgateway \
+  --set inferenceExtension.enabled=true
+```
+
+### Create the pool backends and Gateway
+
+Save and apply the following as `llm-pool.yaml`. The proxy pod forwards pool
+traffic to the host vLLM server; the IP is the `kind` network gateway described
+in the `hostAliases` section above. To scale the pool, start more vLLM servers
+on additional host ports and add one labeled proxy pod per server:
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: vllm-replica-1
+  labels:
+    app: vllm-pool
+spec:
+  containers:
+    - name: proxy
+      image: alpine/socat:1.8.0.0
+      args: ["TCP-LISTEN:8000,fork,reuseaddr", "TCP:172.18.0.1:5050"]
+      ports:
+        - containerPort: 8000
+      readinessProbe:
+        tcpSocket:
+          port: 8000
+        periodSeconds: 5
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: inference-gateway
+spec:
+  gatewayClassName: agentgateway
+  listeners:
+    - name: http
+      port: 80
+      protocol: HTTP
+```
+
+### Install the InferencePool and EPP
+
+The Helm chart installs the `InferencePool`, the EPP, and an `HTTPRoute` bound
+to the Gateway:
+
+```console
+helm install vllm-pool \
+  --dependency-update \
+  --set inferencePool.modelServers.matchLabels.app=vllm-pool \
+  --set provider.name=none \
+  --set experimentalHttpRoute.enabled=true \
+  --version v1.5.0 \
+  oci://registry.k8s.io/gateway-api-inference-extension/charts/inferencepool
+```
+
+On arm64 hosts the chart's default EPP image is amd64-only and crashes with
+`exec format error`; switch it to the multi-arch llm-d scheduler build, which
+is the same EPP framework:
+
+```console
+kubectl set image deployment/vllm-pool-epp \
+  epp=ghcr.io/llm-d/llm-d-inference-scheduler:latest
+```
+
+Verify the path end to end before involving Agentic API:
+
+```console
+kubectl port-forward svc/inference-gateway 8080:80 &
+curl http://localhost:8080/v1/models
+```
+
+### Point Agentic API at the gateway
+
+In the Deployment from this guide, replace the `--llm-api-base` value with the
+gateway Service URL and apply it again:
+
+```yaml
+          args:
+            - --llm-api-base
+            - http://inference-gateway.default.svc.cluster.local:80
+```
+
+The readiness probe works unchanged: `/ready` checks vLLM `/health` through the
+gateway, which routes it to a pool member. Requests to `/v1/responses` now flow
+client -> Agentic API -> gateway -> EPP-selected vLLM replica.
 
 ## Troubleshooting
 
