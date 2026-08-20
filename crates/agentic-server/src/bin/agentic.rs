@@ -1,4 +1,4 @@
-use std::process::ExitCode;
+use std::{ffi::OsStr, path::Path, process::ExitCode};
 
 use agentic_core::error::Error;
 use agentic_server::{
@@ -71,7 +71,7 @@ async fn validate(options: agentic_server::agentic_cli::ValidateOptions) -> Resu
     agentic_core::storage::create_pool_with_schema(Some(&options.common.database_url))
         .await
         .map_err(|error| Error::Config(format!("database validation failed: {error}")))?;
-    if options.source.model.is_some() && which("python").is_none() {
+    if options.source.model.is_some() && options.source.upstream.is_none() && which(OsStr::new("python")).is_none() {
         return Err(Error::Config(
             "python was not found; it is required for --model".to_owned(),
         ));
@@ -86,17 +86,29 @@ async fn validate(options: agentic_server::agentic_cli::ValidateOptions) -> Resu
             agentic_server::agentic_cli::Harness::Claude => "AGENTIC_CLAUDE_BIN",
         };
         let binary = std::env::var_os(override_name).unwrap_or_else(|| binary_name.into());
-        if !binary.to_string_lossy().contains('/') && which(binary_name).is_none() {
+        if !executable_available(&binary) {
             return Err(Error::Config(format!(
-                "{binary_name} not found; install it or set {override_name}"
+                "{} not found; install it or set {override_name}",
+                binary.to_string_lossy()
             )));
         }
     }
-    println!("Agentic API configuration looks valid.");
+    if !options.common.quiet {
+        println!("Agentic API configuration looks valid.");
+    }
     Ok(ExitCode::SUCCESS)
 }
 
-fn which(binary: &str) -> Option<std::path::PathBuf> {
+fn executable_available(binary: &OsStr) -> bool {
+    let path = Path::new(binary);
+    if path.components().count() > 1 {
+        path.is_file()
+    } else {
+        which(binary).is_some()
+    }
+}
+
+fn which(binary: &OsStr) -> Option<std::path::PathBuf> {
     std::env::split_paths(&std::env::var_os("PATH")?)
         .map(|path| path.join(binary))
         .find(|path| path.is_file())

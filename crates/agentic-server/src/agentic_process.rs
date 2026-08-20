@@ -50,6 +50,7 @@ pub async fn wait_for_gateway(
     client: &Client,
     gateway_url: &str,
     timeout: Duration,
+    interval: Duration,
     skip_llm_ready_check: bool,
 ) -> Result<(), Error> {
     let deadline = Instant::now() + timeout;
@@ -73,7 +74,7 @@ pub async fn wait_for_gateway(
         if health_ok && ready_ok {
             return Ok(());
         }
-        sleep(Duration::from_millis(100)).await;
+        sleep(interval).await;
     }
 }
 
@@ -95,7 +96,7 @@ pub async fn run_session(
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |duration| duration.as_nanos())
     ));
-    std::fs::create_dir_all(&session_root)?;
+    tokio::fs::create_dir_all(&session_root).await?;
 
     let mut server = start_server(current_exe, &options)?;
 
@@ -114,6 +115,7 @@ pub async fn run_session(
         &client,
         &gateway_url,
         Duration::from_secs_f64(options.common.llm_ready_timeout_s),
+        Duration::from_secs_f64(options.common.llm_ready_interval_s),
         options.common.skip_llm_ready_check,
     )
     .await
@@ -218,7 +220,7 @@ fn spawn_harness(
 async fn cleanup(server: &mut tokio::process::Child, session_root: &Path) {
     let _ = server.kill().await;
     let _ = server.wait().await;
-    let _ = std::fs::remove_dir_all(session_root);
+    let _ = tokio::fs::remove_dir_all(session_root).await;
 }
 
 #[cfg(test)]

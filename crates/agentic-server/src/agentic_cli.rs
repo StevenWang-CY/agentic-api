@@ -102,7 +102,7 @@ pub struct CommonOptions {
     pub gateway_port: u16,
 
     /// `SQLite` or `PostgreSQL` storage URL
-    #[arg(long, default_value = DEFAULT_DATABASE_URL, env = "DATABASE_URL")]
+    #[arg(long, default_value = DEFAULT_DATABASE_URL, env = "DATABASE_URL", hide_env_values = true)]
     pub database_url: String,
 
     /// API key forwarded to the gateway and harness when configured
@@ -114,11 +114,11 @@ pub struct CommonOptions {
     pub skip_llm_ready_check: bool,
 
     /// Upstream readiness timeout in seconds
-    #[arg(long, default_value_t = 600.0)]
+    #[arg(long, default_value_t = 600.0, value_parser = parse_timeout_seconds)]
     pub llm_ready_timeout_s: f64,
 
     /// Upstream readiness poll interval in seconds
-    #[arg(long, default_value_t = 2.0)]
+    #[arg(long, default_value_t = 2.0, value_parser = parse_interval_seconds)]
     pub llm_ready_interval_s: f64,
 
     /// Suppress lifecycle output
@@ -128,6 +128,28 @@ pub struct CommonOptions {
     /// Disable ANSI color output
     #[arg(long)]
     pub no_color: bool,
+}
+
+fn parse_timeout_seconds(value: &str) -> Result<f64, String> {
+    let value = value
+        .parse::<f64>()
+        .map_err(|error| format!("invalid timeout in seconds: {error}"))?;
+    if value.is_finite() && value >= 0.0 {
+        Ok(value)
+    } else {
+        Err("timeout must be a finite, non-negative number of seconds".to_owned())
+    }
+}
+
+fn parse_interval_seconds(value: &str) -> Result<f64, String> {
+    let value = value
+        .parse::<f64>()
+        .map_err(|error| format!("invalid interval in seconds: {error}"))?;
+    if value.is_finite() && value > 0.0 {
+        Ok(value)
+    } else {
+        Err("interval must be a finite, positive number of seconds".to_owned())
+    }
 }
 
 impl Default for CommonOptions {

@@ -25,16 +25,15 @@ pub fn redact_url(url: &str) -> String {
     let Some((scheme, rest)) = url.split_once("://") else {
         return url.to_owned();
     };
-    let Some((authority, suffix)) = rest.split_once('/') else {
-        return url.to_owned();
-    };
+    let suffix_start = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, suffix) = rest.split_at(suffix_start);
     let Some((userinfo, host)) = authority.split_once('@') else {
         return url.to_owned();
     };
     let Some((username, _password)) = userinfo.split_once(':') else {
         return url.to_owned();
     };
-    format!("{scheme}://{username}:[REDACTED]@{host}/{suffix}")
+    format!("{scheme}://{username}:[REDACTED]@{host}{suffix}")
 }
 
 fn display_width(value: &str) -> usize {
@@ -66,6 +65,14 @@ mod tests {
         assert_eq!(
             redact_url("postgresql://alice:secret@db.example/agentic"),
             "postgresql://alice:[REDACTED]@db.example/agentic"
+        );
+        assert_eq!(
+            redact_url("postgresql://alice:secret@db.example"),
+            "postgresql://alice:[REDACTED]@db.example"
+        );
+        assert_eq!(
+            redact_url("postgresql://alice:secret@db.example?sslmode=require"),
+            "postgresql://alice:[REDACTED]@db.example?sslmode=require"
         );
     }
 
