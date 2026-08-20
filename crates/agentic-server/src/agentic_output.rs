@@ -1,4 +1,7 @@
-const CYAN: &str = "\u{1b}[36m";
+const BLUE: &str = "\u{1b}[38;5;75m";
+const GOLD: &str = "\u{1b}[38;5;214m";
+const DIM: &str = "\u{1b}[2m";
+const BOLD: &str = "\u{1b}[1m";
 const RESET: &str = "\u{1b}[0m";
 
 #[must_use]
@@ -6,18 +9,33 @@ pub fn render_banner(color: bool) -> String {
     let inner_width = 30;
     let rows = ["  ⚡  Agentic API", "      Local agent gateway"];
     let mut lines = Vec::with_capacity(rows.len() + 2);
-    lines.push(format!("┌{}┐", "─".repeat(inner_width)));
+    if color {
+        lines.push(format!("{DIM}┌{}┐{RESET}", "─".repeat(inner_width)));
+    } else {
+        lines.push(format!("┌{}┐", "─".repeat(inner_width)));
+    }
     lines.extend(rows.into_iter().map(|row| {
         let padding = inner_width.saturating_sub(display_width(row));
-        format!("│{row}{}│", " ".repeat(padding))
+        let content = if color {
+            match row {
+                "  ⚡  Agentic API" => format!("  {GOLD}⚡{RESET}  {BLUE}{BOLD}Agentic{RESET} {GOLD}{BOLD}API{RESET}"),
+                _ => format!("{BLUE}{row}{RESET}"),
+            }
+        } else {
+            row.to_owned()
+        };
+        if color {
+            format!("{DIM}│{RESET}{content}{}{DIM}│{RESET}", " ".repeat(padding))
+        } else {
+            format!("│{content}{}│", " ".repeat(padding))
+        }
     }));
-    lines.push(format!("└{}┘", "─".repeat(inner_width)));
-    let banner = lines.join("\n");
     if color {
-        format!("{CYAN}{banner}{RESET}")
+        lines.push(format!("{DIM}└{}┘{RESET}", "─".repeat(inner_width)));
     } else {
-        banner
+        lines.push(format!("└{}┘", "─".repeat(inner_width)));
     }
+    lines.join("\n")
 }
 
 #[must_use]
@@ -56,7 +74,9 @@ mod tests {
 
     #[test]
     fn banner_can_be_colored() {
-        assert!(render_banner(true).contains("\u{1b}["));
+        let banner = render_banner(true);
+        assert!(banner.contains("\u{1b}[38;5;75m"));
+        assert!(banner.contains("\u{1b}[38;5;214m"));
         assert!(!render_banner(false).contains('\u{1b}'));
     }
 

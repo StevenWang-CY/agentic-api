@@ -1,4 +1,18 @@
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{
+    Args, Parser, Subcommand, ValueEnum,
+    builder::{Styles, styling::AnsiColor},
+};
+
+const LOGO: &str = "\n╭──────────────────────────────╮\n│  ⚡  Agentic API              │\n│      Local agent gateway      │\n╰──────────────────────────────╯\n";
+
+const fn brand_styles() -> Styles {
+    Styles::styled()
+        .header(AnsiColor::BrightCyan.on_default().bold())
+        .usage(AnsiColor::BrightBlue.on_default().bold())
+        .literal(AnsiColor::BrightYellow.on_default().bold())
+        .placeholder(AnsiColor::BrightWhite.on_default())
+        .valid(AnsiColor::BrightGreen.on_default())
+}
 
 pub const DEFAULT_DATABASE_URL: &str = "sqlite://./agentic_api.db";
 
@@ -13,6 +27,8 @@ pub enum Harness {
     name = "agentic",
     about = "Agentic API — local agent gateway for Claude Code and Codex",
     version,
+    before_help = LOGO,
+    styles = brand_styles(),
     after_help = "Examples:\n  agentic run codex --model Qwen/...\n  agentic run claude --upstream http://127.0.0.1:8000"
 )]
 pub struct Cli {
@@ -193,7 +209,7 @@ impl HarnessCommand {
 
 #[cfg(test)]
 mod tests {
-    use clap::Parser;
+    use clap::{CommandFactory, Parser};
 
     use super::{Cli, Command, DEFAULT_DATABASE_URL, HarnessCommand};
 
@@ -274,5 +290,13 @@ mod tests {
             panic!("expected run command");
         };
         assert!(harness.options().common.yolo);
+    }
+
+    #[test]
+    fn help_includes_brand_logo() {
+        let help = Cli::command().render_help().to_string();
+
+        assert!(help.contains("╭──────────────────────────────╮"));
+        assert!(help.contains("⚡  Agentic API"));
     }
 }
