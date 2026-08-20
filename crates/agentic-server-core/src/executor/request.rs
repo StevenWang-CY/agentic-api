@@ -156,7 +156,6 @@ impl ExecutionContext {
         let resp_handler = ResponseHandler::new(ResponseStore::new(pool.clone()));
         let client = Arc::new(reqwest::Client::new());
         let gateway_executors = GatewayExecutors::from_config(Arc::clone(&client), &cfg.tools)
-            .await
             .map_err(|error| Error::Config(format!("failed to initialize configured MCP servers: {error}")))?;
 
         Ok(Self {
