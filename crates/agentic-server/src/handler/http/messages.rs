@@ -107,12 +107,34 @@ async fn execute_messages(state: &AppState, headers: &HeaderMap, req: &MessagesR
     }
 }
 
+/// Qwen-family reasoning models only accept `xhigh|medium|low` in their chat
+/// template, but clients like Claude Code send the OpenAI-standard
+/// `output_config.effort = "high"` (their top tier). Map the standard top tiers
+/// (`high`, `max`) onto the model's top tier (`xhigh`) so the template accepts
+/// them; leave `medium`/`low`/`xhigh` untouched. Returns rewritten bytes only
+/// when a change was made.
+///
+/// NOTE: this assumes a Qwen-style effort vocabulary (the model family this
+/// gateway targets). A backend that supports `high` but not `xhigh` would need
+/// this made model-aware.
+fn normalize_reasoning_effort(bytes: &Bytes) -> Option<Bytes> {
+    let mut json: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    let effort = json.get_mut("output_config")?.get_mut("effort")?;
+    let mapped = match effort.as_str()? {
+        "high" | "max" => "xhigh",
+        _ => return None,
+    };
+    *effort = serde_json::Value::String(mapped.to_owned());
+    serde_json::to_vec(&json).ok().map(Bytes::from)
+}
+
 pub async fn messages(State(state): State<AppState>, request: Request) -> Response {
     let (parts, body) = request.into_parts();
     let bytes: Bytes = match read_bytes_with_auth(body, ProxyAuth::Anthropic).await {
         Ok(bytes) => bytes,
         Err(response) => return response,
     };
+    let bytes = normalize_reasoning_effort(&bytes).unwrap_or(bytes);
 
     // Route to the loop only when a gateway-owned tool is declared; everything
     // else keeps the transparent proxy path.
