@@ -1,5 +1,6 @@
 const BLUE: &str = "\u{1b}[38;5;75m";
 const GOLD: &str = "\u{1b}[38;5;214m";
+const BRIGHT_YELLOW: &str = "\u{1b}[93m";
 const MAGENTA: &str = "\u{1b}[38;5;207m";
 const BOLD: &str = "\u{1b}[1m";
 const RESET: &str = "\u{1b}[0m";
@@ -79,7 +80,7 @@ pub fn colorize_help(help: &str, color: bool) -> String {
 pub fn render_examples(color: bool) -> String {
     render_box(&[CODEX_EXAMPLE, CLAUDE_EXAMPLE], Some("Examples"), GOLD, color, |row| {
         if color {
-            format!("{GOLD}{row}{RESET}")
+            format!("{BRIGHT_YELLOW}{row}{RESET}")
         } else {
             row.to_owned()
         }
@@ -195,7 +196,9 @@ mod tests {
 
     #[test]
     fn examples_box_can_be_colored() {
-        assert!(render_examples(true).contains("\u{1b}[38;5;214m"));
+        let examples = render_examples(true);
+        assert!(examples.contains("\u{1b}[38;5;214m"));
+        assert!(examples.contains("\u{1b}[93magentic run codex"));
         assert!(!render_examples(false).contains('\u{1b}'));
     }
 
