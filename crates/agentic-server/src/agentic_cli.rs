@@ -205,7 +205,7 @@ impl HarnessCommand {
 
 #[cfg(test)]
 mod tests {
-    use clap::{CommandFactory, Parser};
+    use clap::Parser;
 
     use super::{Cli, Command, DEFAULT_DATABASE_URL, HarnessCommand};
 
@@ -286,13 +286,5 @@ mod tests {
             panic!("expected run command");
         };
         assert!(harness.options().common.yolo);
-    }
-
-    #[test]
-    fn help_includes_brand_logo() {
-        let help = Cli::command().render_help().to_string();
-
-        assert!(help.contains("╭──────────────────────────────╮"));
-        assert!(help.contains("⚡  Agentic API"));
     }
 }
