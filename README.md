@@ -116,7 +116,14 @@ Run preflight checks without launching a harness:
 
 Use `AGENTIC_CODEX_BIN` or `AGENTIC_CLAUDE_BIN` to override harness binary discovery. Add `--no-color` for scripts or
 `--quiet` for minimal lifecycle output. Use `--yolo` only in an externally isolated environment; it skips Claude
-permission checks and disables Codex approvals and sandboxing.
+permission checks and disables Codex approvals and sandboxing. For Claude yolo sessions, Agentic API sets both
+`--effort medium` and `CLAUDE_CODE_EFFORT_LEVEL=medium`; the environment variable is intentional because Claude Code
+gives it precedence over the command-line effort flag.
+
+Qwen3.8-27B's vLLM chat template accepts `low`, `medium`, and `xhigh` reasoning effort values. It does not accept
+`high`, so use `--yolo` or set `AGENTIC_CLAUDE_EFFORT=medium` with the Spark launcher. See the [Claude Code effort
+configuration](https://code.claude.com/docs/en/model-config) and [vLLM reasoning output
+documentation](https://docs.vllm.ai/en/latest/features/reasoning_outputs/) for the underlying behavior.
 
 **1. Serve a model with vLLM.** Any recipe from [recipes.vllm.ai](https://recipes.vllm.ai) works:
 
