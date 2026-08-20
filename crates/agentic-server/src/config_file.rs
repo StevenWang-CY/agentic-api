@@ -135,6 +135,10 @@ impl FileConfig {
                 error.error
             )));
         }
+        #[cfg(unix)]
+        std::fs::File::open(home)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| Error::Config(format!("failed to sync configuration directory: {error}")))?;
         Ok(self)
     }
 

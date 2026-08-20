@@ -44,6 +44,7 @@ pub struct GatewayExecutors {
     mcp: HashMap<String, Vec<McpDiscoveredHandler>>,
     mcp_configs: HashMap<String, super::mcp::McpServerEntry>,
     mcp_clients: Arc<RwLock<HashMap<String, Arc<super::mcp::McpClient>>>>,
+    mcp_discovered: Arc<RwLock<HashMap<String, Vec<McpDiscoveredHandler>>>>,
     mcp_allowed_hosts: Vec<String>,
     web_search: Option<Arc<dyn GatewayExecutor>>,
 }
@@ -55,6 +56,7 @@ impl GatewayExecutors {
             mcp: HashMap::new(),
             mcp_configs: HashMap::new(),
             mcp_clients: Arc::new(RwLock::new(HashMap::new())),
+            mcp_discovered: Arc::new(RwLock::new(HashMap::new())),
             mcp_allowed_hosts: super::mcp::pool::allowed_hosts_from_env(),
             web_search: Some(Arc::new(WebSearchHandler::from_env(client))),
         }
@@ -74,6 +76,7 @@ impl GatewayExecutors {
             mcp: HashMap::new(),
             mcp_configs: config.mcp_servers.clone(),
             mcp_clients: Arc::new(RwLock::new(HashMap::new())),
+            mcp_discovered: Arc::new(RwLock::new(HashMap::new())),
             mcp_allowed_hosts: if config.mcp_allowed_hosts.is_empty() {
                 super::mcp::pool::allowed_hosts_from_env()
             } else {
@@ -199,9 +202,19 @@ impl GatewayExecutors {
                     .insert(server_label.to_owned(), Arc::clone(&client));
                 client
             };
-            let tool_set = McpHandler::discover_tools(server_label, client, entry.allowed_tools()).await?;
-            let discovered_handlers = require_non_empty_mcp_handlers(server_label, tool_set.discovered_handlers)?;
-            self.mcp.insert(server_label.to_owned(), discovered_handlers.clone());
+            let discovered_handlers = if let Some(discovered_handlers) =
+                self.mcp_discovered.read().await.get(server_label).cloned()
+            {
+                discovered_handlers
+            } else {
+                let tool_set = McpHandler::discover_tools(server_label, client, entry.allowed_tools()).await?;
+                let discovered_handlers = require_non_empty_mcp_handlers(server_label, tool_set.discovered_handlers)?;
+                self.mcp_discovered
+                    .write()
+                    .await
+                    .insert(server_label.to_owned(), discovered_handlers.clone());
+                discovered_handlers
+            };
             let discovered_handlers = require_non_empty_mcp_handlers(
                 server_label,
                 filter_allowed_mcp_handlers(&discovered_handlers, param.allowed_tools.as_deref()),
@@ -288,6 +301,7 @@ impl std::fmt::Debug for GatewayExecutors {
             .field("mcp_server_handlers", &self.mcp.len())
             .field("mcp_server_configs", &self.mcp_configs.len())
             .field("mcp_clients", &Arc::strong_count(&self.mcp_clients))
+            .field("mcp_discovered", &Arc::strong_count(&self.mcp_discovered))
             .field("mcp_allowed_hosts", &self.mcp_allowed_hosts)
             .field("web_search", &self.web_search.is_some())
             .finish()

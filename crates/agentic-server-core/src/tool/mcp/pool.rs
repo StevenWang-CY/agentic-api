@@ -219,8 +219,7 @@ fn clean_string(value: Option<&str>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        McpServerEntry, allowed_hosts_from_env, parse_allowed_hosts, server_entry_from_param,
-        validate_request_server_url_with_allowed_hosts,
+        McpServerEntry, parse_allowed_hosts, server_entry_from_param, validate_request_server_url_with_allowed_hosts,
     };
     use crate::types::tools::McpToolParam;
 
@@ -294,9 +293,7 @@ mod tests {
 
     #[test]
     fn request_server_url_rejects_unallowlisted_host() {
-        let error =
-            validate_request_server_url_with_allowed_hosts("http://169.254.169.254/mcp", &allowed_hosts_from_env())
-                .unwrap_err();
+        let error = validate_request_server_url_with_allowed_hosts("http://169.254.169.254/mcp", &[]).unwrap_err();
         assert!(error.contains("not allowed"));
     }
 
