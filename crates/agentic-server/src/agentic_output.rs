@@ -31,11 +31,28 @@ pub fn render_help(help: &str, color: bool) -> String {
     rendered.push_str(&render_banner(color));
     rendered.push_str("\n\n");
     rendered.push_str(help.trim());
-    if help.contains("Usage: agentic <COMMAND>") {
+    if strip_ansi_codes(help).contains("Usage: agentic <COMMAND>") {
         rendered.push_str("\n\n");
         rendered.push_str(&render_examples(color));
     }
     rendered
+}
+
+fn strip_ansi_codes(value: &str) -> String {
+    let mut plain = String::with_capacity(value.len());
+    let mut in_escape = false;
+    for character in value.chars() {
+        if in_escape {
+            if character.is_ascii_alphabetic() {
+                in_escape = false;
+            }
+        } else if character == '\u{1b}' {
+            in_escape = true;
+        } else {
+            plain.push(character);
+        }
+    }
+    plain
 }
 
 #[must_use]
@@ -151,6 +168,13 @@ mod tests {
     fn help_has_logo_and_examples_box() {
         let help = render_help("Usage: agentic <COMMAND>\n\nCommands:", false);
         assert!(help.contains("⚡  Agentic API"));
+        assert!(help.contains("╭─ Examples"));
+    }
+
+    #[test]
+    fn styled_root_usage_keeps_examples_box() {
+        let help = render_help("Usage: agentic \u{1b}[35m<COMMAND>\u{1b}[0m", false);
+
         assert!(help.contains("╭─ Examples"));
     }
 
