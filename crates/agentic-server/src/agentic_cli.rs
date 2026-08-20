@@ -92,6 +92,7 @@ pub struct SourceOptions {
 }
 
 #[derive(Args, Clone, Debug)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct CommonOptions {
     /// Gateway bind host
     #[arg(long, default_value = "127.0.0.1", env = "GATEWAY_HOST")]
@@ -124,6 +125,10 @@ pub struct CommonOptions {
     /// Suppress lifecycle output
     #[arg(long)]
     pub quiet: bool,
+
+    /// Skip harness permission prompts and sandbox restrictions
+    #[arg(long)]
+    pub yolo: bool,
 
     /// Disable ANSI color output
     #[arg(long)]
@@ -163,6 +168,7 @@ impl Default for CommonOptions {
             llm_ready_timeout_s: 600.0,
             llm_ready_interval_s: 2.0,
             quiet: false,
+            yolo: false,
             no_color: false,
         }
     }
@@ -257,5 +263,16 @@ mod tests {
             panic!("expected run command");
         };
         assert_eq!(harness.options().source.model.as_deref(), Some("Qwen/test"));
+    }
+
+    #[test]
+    fn run_accepts_yolo_mode() {
+        let cli =
+            Cli::try_parse_from(["agentic", "run", "claude", "--model", "Qwen/test", "--yolo"]).expect("valid CLI");
+
+        let Command::Run { harness } = cli.command else {
+            panic!("expected run command");
+        };
+        assert!(harness.options().common.yolo);
     }
 }

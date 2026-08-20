@@ -115,7 +115,8 @@ Run preflight checks without launching a harness:
 ```
 
 Use `AGENTIC_CODEX_BIN` or `AGENTIC_CLAUDE_BIN` to override harness binary discovery. Add `--no-color` for scripts or
-`--quiet` for minimal lifecycle output.
+`--quiet` for minimal lifecycle output. Use `--yolo` only in an externally isolated environment; it skips Claude
+permission checks and disables Codex approvals and sandboxing.
 
 **1. Serve a model with vLLM.** Any recipe from [recipes.vllm.ai](https://recipes.vllm.ai) works:
 

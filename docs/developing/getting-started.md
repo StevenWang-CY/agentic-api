@@ -34,6 +34,9 @@ For an existing OpenAI-compatible upstream, provide both the upstream URL and ha
 pass `--database-url postgresql://...` for a shared PostgreSQL deployment. Use `agentic validate` to check prerequisites
 without launching a session.
 
+For a deliberately unattended session in an externally isolated environment, add `--yolo`. This skips Claude Code
+permission checks and disables Codex approvals and sandboxing.
+
 ## Linting and Formatting
 
 ```console
