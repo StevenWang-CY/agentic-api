@@ -3,7 +3,7 @@
 This guide is the shareable checklist for exercising a coding harness (Claude Code or Codex) against Agentic API,
 both with a local gateway started by the CLI and against a gateway already running on Kubernetes. It was written
 while verifying [issue #190](https://github.com/vllm-project/agentic-api/issues/190) / [PR
-#191](https://github.com/vllm-project/agentic-api/pull/191) and records the exact commands and expected output.
+#197](https://github.com/vllm-project/agentic-api/pull/197) and records the exact commands and expected output.
 
 ## Prerequisites
 
@@ -116,8 +116,8 @@ curl -s -w '\nHTTP %{http_code}\n' -H 'content-type: application/json' http://12
 
 | Gateway build | Result |
 |---|---|
-| Before PR #191 | `HTTP 400` — `invalid tool config: parallel_tool_calls must be false when using built-in tools` |
-| PR #191 or later | `HTTP 200`, `"status": "completed"` |
+| Before PR #197 | `HTTP 400` — `invalid tool config: parallel_tool_calls must be false when using built-in tools` |
+| PR #197 or later | `HTTP 200`, `"status": "completed"`; the gateway forwards `parallel_tool_calls: false` upstream and serializes tool calls |
 
 Also run the mixed shape (a `function` tool plus a built-in such as `code_interpreter`) with `parallel_tool_calls:
 true`; it must return `HTTP 200` as well. Unit coverage lives in
@@ -209,4 +209,4 @@ kubectl logs deploy/agentic-api --since=10m | grep -ci error   # expect 0
 | Codex `exec` prints `Reading additional input from stdin...` and hangs | stdin is not a terminal | Append `</dev/null`. |
 | Codex warns it could not create PATH aliases | `CODEX_HOME` under `/tmp` | Use a home under `$HOME`. |
 | A long stream stops without a terminal event during a rollout | Bounded drain: 5 s `preStop` plus up to 8 s of in-flight draining, then the pod exits | Expected for responses longer than the drain window; clients should reconnect and continue with `previous_response_id`. |
-| `parallel_tool_calls must be false when using built-in tools` | Gateway predates PR #191 | Rebuild and redeploy the image. |
+| `parallel_tool_calls must be false when using built-in tools` | Gateway predates PR #197 | Rebuild and redeploy the image. |
