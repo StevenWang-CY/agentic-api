@@ -158,6 +158,35 @@ CLAUDE_CODE_EFFORT_LEVEL=medium \
 claude --effort medium -p "Reply with exactly one word: pong"
 ```
 
+Codex needs a `CODEX_HOME` with the same provider configuration the CLI generates. Keep it outside `/tmp` (Codex
+refuses to create its helper binaries there) and close stdin for `exec`, otherwise Codex waits for additional prompt
+input when it is not attached to a terminal:
+
+```console
+export CODEX_HOME=$HOME/.cache/agentic-codex-k8s
+mkdir -p "$CODEX_HOME"
+cat > "$CODEX_HOME/config.toml" <<EOF
+model = "Qwen/Qwen3.8-27B-FP8"
+model_provider = "agentic-api"
+model_catalog_json = "$CODEX_HOME/model_catalog.json"
+
+[model_providers.agentic-api]
+name = "Agentic API"
+base_url = "http://127.0.0.1:9000/v1"
+wire_api = "responses"
+requires_openai_auth = false
+supports_websockets = true
+EOF
+# Copy model_catalog.json from a CLI session (printed path) or from prepare_codex_home in
+# crates/agentic-server/src/agentic_harness.rs, replacing the slug with your model id.
+codex exec --skip-git-repo-check "Reply with exactly one word: pong" </dev/null
+```
+
+Codex uses the gateway's WebSocket transport (`supports_websockets = true`), so this also verifies `/v1/responses`
+over WebSocket through the port-forward. On Linux hosts where Codex's sandbox (`codex-linux-sandbox`/bwrap) cannot
+start, shell tool calls fail inside Codex itself; that is unrelated to the gateway and `--dangerously-bypass-approvals-and-sandbox`
+(or the CLI's `--yolo`) confirms the gateway side.
+
 Replace `agentic-api-local` with a real key when the deployment enforces inbound authentication. Finish by
 confirming the gateway logged no errors during the run:
 
@@ -174,4 +203,10 @@ kubectl logs deploy/agentic-api --since=10m | grep -ci error   # expect 0
 | `There's an issue with the selected model` | Model name does not match what the upstream serves | Omit `--model` to auto-discover, or copy the id from `/v1/models` exactly. |
 | Template `ValueError` mentioning effort | Claude Code sent `high` | Do not override `AGENTIC_CLAUDE_EFFORT` with `high`; valid values for Qwen are `low`, `medium`, `xhigh`. |
 | `HTTP 503` from a cluster gateway | `/ready` failing because the gateway cannot reach its upstream or database | `kubectl logs deploy/agentic-api` and look for `gateway dependencies not ready`. |
+| `readiness.ready=false` warnings every minute or two while the upstream is healthy | Gateway build predates the readiness-client pooling fix: a pooled keep-alive connection that the upstream closed fails with `hyper::Error(IncompleteMessage)` | Rebuild and redeploy; add `agentic_server::handler::http::models=debug` to `RUST_LOG` to see the probe error. |
+| Pods in `CrashLoopBackOff` with `failed to create temporary configuration file: Read-only file system` | Gateway build predates the read-only-home fix, and the base mounts a read-only root filesystem | Rebuild and redeploy; the base now also mounts an `emptyDir` at `/var/lib/agentic-api`. |
+| `kubectl apply -k` fails with `cycle detected` | Overlay directory placed inside `deploy/kubernetes` | Move the overlay to a sibling directory such as `deploy/overlays/<env>` and reference `../../kubernetes`. |
+| Codex `exec` prints `Reading additional input from stdin...` and hangs | stdin is not a terminal | Append `</dev/null`. |
+| Codex warns it could not create PATH aliases | `CODEX_HOME` under `/tmp` | Use a home under `$HOME`. |
+| A long stream stops without a terminal event during a rollout | Bounded drain: 5 s `preStop` plus up to 8 s of in-flight draining, then the pod exits | Expected for responses longer than the drain window; clients should reconnect and continue with `previous_response_id`. |
 | `parallel_tool_calls must be false when using built-in tools` | Gateway predates PR #191 | Rebuild and redeploy the image. |
