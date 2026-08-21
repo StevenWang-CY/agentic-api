@@ -41,9 +41,10 @@ pub fn prepare_codex_home(
                 {"effort": "high", "description": "Deep reasoning"}
             ],
             "supports_reasoning_summaries": true,
-            // The gateway preserves the caller's parallel_tool_calls alongside
-            // built-in tools (see #190/#191), so Codex may advertise it.
-            "supports_parallel_tool_calls": true,
+            // The gateway rejects parallel_tool_calls=true alongside built-in tools
+            // (#190; the #191 change was reverted in #194), so keep Codex from
+            // requesting it.
+            "supports_parallel_tool_calls": false,
             // apply_patch_tool_type is intentionally omitted: Codex only supports
             // "freeform", which the gateway cannot normalize while preserving
             // constrained decoding. Codex falls back to editing via the shell tool.
