@@ -106,7 +106,7 @@ pub async fn resolve_model(client: &Client, source: &SourceOptions, api_key: Opt
     let Some(upstream) = &source.upstream else {
         return Ok(PLACEHOLDER_MODEL.to_owned());
     };
-    let models_url = format!("{}/v1/models", upstream.trim_end_matches('/'));
+    let models_url = format!("{}/v1/models", agentic_core::config::normalize_base_url(upstream));
     let mut request = client.get(&models_url);
     if let Some(api_key) = api_key {
         request = request.bearer_auth(api_key);
@@ -460,6 +460,44 @@ mod tests {
         assert_eq!(
             environment.environment.get("ANTHROPIC_MODEL"),
             Some(&"Qwen/discovered".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_model_does_not_double_the_v1_suffix() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buffer = [0_u8; 1024];
+            let read = socket.read(&mut buffer).await.unwrap();
+            let request_line = String::from_utf8_lossy(&buffer[..read])
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .to_owned();
+            let body = r#"{"data":[{"id":"Qwen/served"}]}"#;
+            let status = if request_line.starts_with("GET /v1/models ") {
+                "200 OK"
+            } else {
+                "404 Not Found"
+            };
+            let response = format!(
+                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        let client = reqwest::Client::new();
+        let source = SourceOptions {
+            upstream: Some(format!("http://{address}/v1")),
+            model: None,
+            llm_port: 8000,
+        };
+        assert_eq!(
+            super::resolve_model(&client, &source, None).await.unwrap(),
+            "Qwen/served"
         );
     }
 

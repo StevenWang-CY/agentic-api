@@ -158,6 +158,11 @@ fn parse_upstream_url(value: &str) -> Result<String, String> {
     if parsed.host_str().is_none_or(str::is_empty) {
         return Err(format!("invalid upstream URL `{value}`: missing host"));
     }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(format!(
+            "invalid upstream URL `{value}`: query strings and fragments are not supported; pass a base URL such as http://host:port"
+        ));
+    }
     Ok(value.trim_end_matches('/').to_owned())
 }
 
