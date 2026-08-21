@@ -57,6 +57,18 @@ Supporting `cache_control` at the transport layer is necessary, but forwarding m
 to upstream load balancing and eviction policy. Agentic API currently has no Messages-specific state model for keeping
 successive requests on compatible workers, representing cache branches, or retaining provider cache handles.
 
+### Relationship to the existing Messages design
+
+The existing Claude Code integration design deliberately rejected server-managed conversation state for Messages.
+That decision remains in force: the client sends every model-visible input, the gateway does not rehydrate omitted
+history, and `/v1/messages` exposes no continuation object or identifier.
+
+This RFC narrows the older document's broader statements that the gateway keeps "no state at all." It introduces only
+private, non-authoritative cache optimization state that can be discarded without changing the request or response.
+The new state cannot supply model-visible input, authorize a continuation, or make a cache hit part of API correctness.
+In this document, "stateless Messages API" therefore means conversation-stateless at the public protocol boundary, not
+that the implementation is prohibited from retaining advisory execution metadata.
+
 ### Existing Responses state management
 
 Responses already demonstrates the relevant internal shape:
@@ -90,6 +102,12 @@ An isolated capture of Claude Code 2.1.238 against a local synthetic Messages SS
 - the newest conversation marker moved as history grew; and
 - an attribution block was stable in one client surface but changed across a resumed bare-client session.
 
+The capture pointed a custom Claude Code base URL at a local synthetic SSE endpoint, recorded request headers and JSON,
+and compared fresh, resumed, and environment-flag variants. It used synthetic credentials and did not establish real
+provider cache hits. The raw capture is not part of this PR, so these observations are supporting evidence rather than
+normative compatibility requirements. Phase 0 must regenerate and check in versioned fixtures before relying on them as
+a release gate.
+
 These observations imply that the server can use stable session and agent coordinates for affinity, but it must derive
 cache applicability from the complete current prefix. It cannot hard-code a marker count, marker location, or globally
 stable attribution prefix.
@@ -101,10 +119,13 @@ followers proceed.
 
 ### Affine KV-cache evidence
 
-The repository's affine KV continuation work shows why routing and state coordination matter. In its controlled
-two-turn benchmark, load-only continuation achieved approximately 49.5% KV hit rate and 811 ms latency, while precise
-or approximate continuation achieved approximately 99.1% and 315 ms. The benchmark is directional rather than a
-production guarantee: it did not cover multi-tenant traffic, branches, worker churn, cache pressure, or long pauses.
+The companion [affine KV continuation draft ADR](https://github.com/vllm-project/agentic-api/blob/feat/adr04-token-cache-phase2/docs/adr/ADR-04_kv_affine_continuation.md)
+and its [raw results](https://github.com/vllm-project/agentic-api/tree/feat/adr04-token-cache-phase2/docs/adr/results/adr-04/2026-07-13-n12)
+show why routing and state coordination matter. The controlled benchmark used 12 sequential two-turn pairs per routing
+profile. Load-only continuation achieved approximately 49.5% mean KV hit rate and 811 ms mean latency, while precise or
+approximate continuation achieved approximately 99.1% and 315 ms. This is a directional single-client routing proof,
+not a production guarantee: it did not cover multi-tenant traffic, branches, worker churn, cache pressure, or long
+pauses, and it does not establish an expected Phase 2 improvement for Messages.
 
 Together, the client and engine evidence support server-managed execution state, not server-managed Messages history.
 The opportunity is to preserve cache locality and compatibility while retaining a full-request fallback.
@@ -194,11 +215,14 @@ MessagesCacheCoordinator
         |
         +--> MessagesCacheStore -------- immutable checkpoints/extents
         +--> PrefixMatcher ------------- exact applicability
-        +--> CacheRoutePlanner --------- worker affinity
+        +--> CacheRoutePlanner --------- route intent/capability
         +--> ProviderCacheAdapter ------ receipts/retention/artifacts
         |
         v
 Messages executor and gateway tool loop
+        |
+        v
+llm-d router or direct vLLM upstream
         |
         v
 usage/receipt observation + accepted-boundary commit
@@ -218,7 +242,13 @@ Agentic API owns:
 - authenticated tenant scope and opaque engine-facing session and continuation coordinates;
 - durable logical lineage, compatibility fingerprints, desired lifecycle, and expiration;
 - mappings from logical checkpoints to provider receipts, artifacts, worker observations, and engine epochs; and
-- route, retain, offload, prefetch, evict, and fallback decisions based on application lifecycle.
+- route intent, retain, offload, prefetch, evict, and fallback policy based on application lifecycle.
+
+In an llm-d deployment, Agentic API sends the complete prepared request plus trusted coordinates and lifecycle hints to
+the llm-d inference endpoint. llm-d owns its worker-membership view, exact-prefix index, load-aware scoring, and vLLM
+endpoint selection. Agentic API must not duplicate llm-d's canonical block-key algorithm or claim exact residency from
+a session coordinate. In a direct deployment without llm-d, a provider adapter may perform targeted routing when the
+upstream exposes that capability.
 
 vLLM and its KV connectors own:
 
@@ -449,9 +479,15 @@ unbounded inference backpressure.
 
 ## Routing and cache retention
 
-The routing adapter provides a versioned worker-membership view, deterministic placement, health/load override, and an
-explicit route target. Rendezvous hashing or an upstream equivalent should use `(upstream_pool, tenant_scope,
-session_tag, optional_agent_lane)`.
+`CacheRoutePlanner` produces a capability-checked route intent. With llm-d, the adapter forwards trusted session and
+continuation coordinates after Messages request preparation; llm-d combines them with exact-prefix evidence, worker
+health, load, and admission control to choose the vLLM endpoint. The planner does not reproduce llm-d tokenization,
+canonical block keys, event indexing, or scoring.
+
+Without llm-d, a direct provider adapter may use a versioned worker-membership view and deterministic placement when
+the upstream supports an explicit route target. Rendezvous hashing or an upstream equivalent may use
+`(upstream_pool, tenant_scope, session_tag, optional_agent_lane)`. If neither llm-d nor the direct upstream exposes an
+effective routing capability, `route` mode is rejected at startup.
 
 Worker membership changes can remap a session. Remapping is a cache miss, not a request failure. Affinity cannot override
 health, load shedding, or admission control.
@@ -563,6 +599,10 @@ Each mode includes prior behavior. Startup rejects modes whose required router, 
 are unavailable. `off`, `observe`, and `route` require no durable cache tables. `artifact` remains unavailable for a
 provider until token-prefix ingestion and render-parity conformance pass.
 
+The schema is incremental rather than a four-table prerequisite. Phase 3 adds session, checkpoint, and extent storage
+only after a durable consumer exists. The artifact table and its encryption and cleanup obligations arrive only with
+Phase 5. A deployment that stops after routing requires neither cache-state migrations nor cache-state cleanup workers.
+
 Rollback selects the previous mode. Later-stage rows become inert and expire naturally; no client or schema rollback is
 required.
 
@@ -587,7 +627,7 @@ Exit condition: dashboards distinguish intent, routing, creation, and read outco
 ### Phase 2: routing
 
 - Implement tenant-safe scope derivation and stable cache salt.
-- Add execution fingerprints and capability-validated `CacheRoutePlanner`.
+- Add execution fingerprints and a capability-validated `CacheRoutePlanner` for llm-d or direct-provider routing.
 - Keep provider handles request-local.
 
 Exit condition: controlled multi-worker tests show a measured cache or latency improvement without unacceptable worker
@@ -761,9 +801,13 @@ artifacts are the deferred portability boundary.
 - [Claude Code LLM gateway protocol](https://code.claude.com/docs/en/llm-gateway-protocol)
 - [vLLM session-centric KV-cache orchestration RFC](https://github.com/vllm-project/vllm/issues/48501)
 - [vLLM agent-aware KV-cache management RFC](https://github.com/vllm-project/vllm/issues/52113)
+- [llm-d-router session-centric KV lifecycle orchestration](https://github.com/llm-d/llm-d-router/issues/1979)
+- [llm-d-router Session Control Protocol](https://github.com/llm-d/llm-d-router/issues/2003)
 - Agentic API Responses storage and execution code under `crates/agentic-server-core/src/storage/` and
   `crates/agentic-server-core/src/executor/`
-- Affine KV continuation ADR at `docs/adr/ADR-04_kv_affine_continuation.md` on the reviewed feature branch
+- [Affine KV continuation draft ADR](https://github.com/vllm-project/agentic-api/blob/feat/adr04-token-cache-phase2/docs/adr/ADR-04_kv_affine_continuation.md)
+- [Affine KV continuation raw benchmark results](https://github.com/vllm-project/agentic-api/tree/feat/adr04-token-cache-phase2/docs/adr/results/adr-04/2026-07-13-n12)
 
 The Claude Code observations in this document are pinned to client version 2.1.238. They are compatibility evidence,
-not a promise about future marker placement or proof of real provider cache hits.
+not a promise about future marker placement or proof of real provider cache hits. Until reproducible capture fixtures
+land, documented behavior remains the normative compatibility source.
