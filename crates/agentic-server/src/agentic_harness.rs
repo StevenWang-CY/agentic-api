@@ -50,7 +50,7 @@ pub fn prepare_codex_home(
             "web_search_tool_type": "text",
             "shell_type": "local",
             "context_window": 32768,
-            "max_context_window": 262144,
+            "max_context_window": 262_144,
             "base_instructions": "",
             "support_verbosity": false,
             "supports_image_detail_original": false,
