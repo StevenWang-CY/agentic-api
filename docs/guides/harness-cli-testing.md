@@ -70,15 +70,24 @@ is expected for any non-Anthropic model name and does not affect the request.
 
 ## 3. Tool-call round trip
 
-Tool calls are where the parallel-tool-call handling from #190 is exercised, so run at least one:
+Tool calls are where the parallel-tool-call handling from #190 is exercised, so run at least one. Start a normal
+session and approve the permission prompt when the harness asks to run the command:
+
+```console
+./target/debug/agentic run claude --upstream http://127.0.0.1:8000
+> Run 'ls crates' with the Bash tool and list the directory names.
+```
+
+Expected: the harness runs the command and answers with `agentic-praxis`, `agentic-server`, `agentic-server-core`.
+The gateway log must not contain `invalid tool config`.
+
+Permission prompts are the default. Only for an unattended run in an externally isolated environment (CI, a
+throwaway container) add `--yolo`, which forwards the harness's native bypass flag:
 
 ```console
 ./target/debug/agentic run claude --upstream http://127.0.0.1:8000 --yolo \
   -- -p "Run 'ls crates' with the Bash tool and list the directory names."
 ```
-
-Expected: the harness runs the command and answers with `agentic-praxis`, `agentic-server`, `agentic-server-core`.
-The gateway log must not contain `invalid tool config`.
 
 ## 4. Interactive session
 
