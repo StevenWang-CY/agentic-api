@@ -1,0 +1,31 @@
+# Development overlay for the kind cluster described in docs/deploying/README.md.
+# Overlays must live outside deploy/kubernetes: Kustomize rejects a base that is
+# an ancestor of the overlay directory ("cycle detected").
+#
+#   kubectl apply -k deploy/overlays/kind
+#
+# The hostAliases entry is only needed on native Linux Docker, where
+# host.docker.internal does not resolve inside kind. Confirm the IP with:
+#   docker network inspect kind --format '{{range .IPAM.Config}}{{.Gateway}} {{end}}'
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: agentic-api
+resources:
+  - ../../kubernetes
+images:
+  - name: agentic-api
+    newName: agentic-api
+    newTag: kind
+patches:
+  - target: {kind: ConfigMap, name: agentic-api}
+    patch: |
+      - op: replace
+        path: /data/LLM_API_BASE
+        value: http://host.docker.internal:8000
+  - target: {kind: Deployment, name: agentic-api}
+    patch: |
+      - op: add
+        path: /spec/template/spec/hostAliases
+        value:
+          - ip: "172.18.0.1"
+            hostnames: [host.docker.internal]

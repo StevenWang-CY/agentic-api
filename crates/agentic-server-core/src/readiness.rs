@@ -40,12 +40,19 @@ pub enum LlmReadiness {
 /// The client rejects redirects so an authentication page or generic UI cannot
 /// turn an unsuccessful `/health` response into a false-positive readiness result.
 ///
+/// Connections are never pooled: the probe runs every few seconds, which is close
+/// to the idle keep-alive timeout of common upstream servers (uvicorn closes idle
+/// connections after 5 s). Reusing a pooled connection the upstream has already
+/// closed fails with `hyper::Error(IncompleteMessage)` and flaps `/ready` even
+/// though the upstream is healthy.
+///
 /// # Errors
 ///
 /// Returns an error when the HTTP client cannot be constructed.
 pub fn llm_readiness_client() -> Result<reqwest::Client, Error> {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
+        .pool_max_idle_per_host(0)
         .build()
         .map_err(Error::HttpClient)
 }
