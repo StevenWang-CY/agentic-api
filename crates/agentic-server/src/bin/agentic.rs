@@ -1,16 +1,25 @@
-use std::{ffi::OsStr, path::Path, process::ExitCode};
+use std::{ffi::OsStr, io::IsTerminal, path::Path, process::ExitCode};
 
 use agentic_core::error::Error;
 use agentic_server::{
     agentic_cli::{Cli, Command, HarnessCommand},
-    agentic_output::{redact_url, render_banner},
+    agentic_output::{colorize_help, redact_url, render_banner, render_help},
     agentic_process::{run_session, server_args, server_binary_path},
 };
-use clap::Parser;
+use clap::{Parser, error::ErrorKind};
 
 #[tokio::main]
 async fn main() -> Result<ExitCode, Error> {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) if error.kind() == ErrorKind::DisplayHelp => {
+            let color = std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
+            let help = colorize_help(&error.render().to_string(), color);
+            println!("{}", render_help(&help, color));
+            return Ok(ExitCode::SUCCESS);
+        }
+        Err(error) => error.exit(),
+    };
     match cli.command {
         Command::Run { harness } => run_harness(harness).await,
         Command::Serve(options) => serve(options.source, options.common).await,

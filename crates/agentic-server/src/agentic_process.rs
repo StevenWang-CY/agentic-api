@@ -41,6 +41,26 @@ pub fn server_binary_path(current_exe: &Path) -> std::path::PathBuf {
     current_exe.with_file_name("agentic-server")
 }
 
+fn harness_launch_args(harness: crate::agentic_cli::Harness, yolo: bool, passthrough: &[String]) -> Vec<String> {
+    let mut args = Vec::with_capacity(passthrough.len() + 3);
+    if yolo {
+        match harness {
+            crate::agentic_cli::Harness::Codex => {
+                args.push("--dangerously-bypass-approvals-and-sandbox".to_owned());
+            }
+            crate::agentic_cli::Harness::Claude => {
+                args.extend([
+                    "--dangerously-skip-permissions".to_owned(),
+                    "--effort".to_owned(),
+                    "medium".to_owned(),
+                ]);
+            }
+        }
+    }
+    args.extend_from_slice(passthrough);
+    args
+}
+
 /// Wait until the gateway is live and, unless skipped, its upstream is ready.
 ///
 /// # Errors
@@ -176,7 +196,7 @@ fn harness_environment(
     options: &crate::agentic_cli::HarnessOptions,
     session_root: &Path,
 ) -> Result<crate::agentic_harness::HarnessEnv, Error> {
-    match harness {
+    let mut environment = match harness {
         crate::agentic_cli::Harness::Codex => crate::agentic_harness::prepare_codex_home(
             session_root,
             gateway_url,
@@ -189,7 +209,13 @@ fn harness_environment(
             options.source.model.as_deref().unwrap_or("agentic-api"),
             options.common.api_key.as_deref(),
         )),
+    }?;
+    if options.common.yolo && matches!(harness, crate::agentic_cli::Harness::Claude) {
+        environment
+            .environment
+            .insert("CLAUDE_CODE_EFFORT_LEVEL".to_owned(), "medium".to_owned());
     }
+    Ok(environment)
 }
 
 fn spawn_harness(
@@ -207,7 +233,7 @@ fn spawn_harness(
     };
     let binary = std::env::var_os(override_name).unwrap_or_else(|| binary_name.into());
     let mut harness_command = tokio::process::Command::new(binary);
-    harness_command.args(&options.harness_args);
+    harness_command.args(harness_launch_args(harness, options.common.yolo, &options.harness_args));
     harness_command.envs(&harness_env.environment);
     harness_command.stdin(std::process::Stdio::inherit());
     harness_command.stdout(std::process::Stdio::inherit());
@@ -227,8 +253,8 @@ async fn cleanup(server: &mut tokio::process::Child, session_root: &Path) {
 mod tests {
     use std::ffi::OsString;
 
-    use super::server_args;
-    use crate::agentic_cli::{CommonOptions, SourceOptions};
+    use super::{harness_launch_args, server_args};
+    use crate::agentic_cli::{CommonOptions, Harness, SourceOptions};
 
     #[test]
     fn integrated_mode_builds_server_arguments() {
@@ -280,5 +306,45 @@ mod tests {
 
         assert_eq!(args[0], "--llm-api-base");
         assert!(!args.iter().any(|arg| *arg == "serve"));
+    }
+
+    #[test]
+    fn yolo_mode_uses_native_codex_bypass_flag() {
+        assert_eq!(
+            harness_launch_args(Harness::Codex, true, &["exec".to_owned()]),
+            ["--dangerously-bypass-approvals-and-sandbox", "exec"]
+        );
+    }
+
+    #[test]
+    fn yolo_mode_uses_native_claude_bypass_and_compatible_effort() {
+        assert_eq!(
+            harness_launch_args(Harness::Claude, true, &[]),
+            ["--dangerously-skip-permissions", "--effort", "medium"]
+        );
+    }
+
+    #[test]
+    fn yolo_claude_environment_overrides_inherited_effort() {
+        let options = crate::agentic_cli::HarnessOptions {
+            source: SourceOptions {
+                upstream: Some("http://127.0.0.1:8000".to_owned()),
+                model: Some("Qwen/test".to_owned()),
+                llm_port: 8000,
+            },
+            common: CommonOptions {
+                yolo: true,
+                ..CommonOptions::default()
+            },
+            harness_args: Vec::new(),
+        };
+        let root = std::env::temp_dir().join(format!("agentic-api-yolo-test-{}", std::process::id()));
+        let environment = super::harness_environment(Harness::Claude, "http://127.0.0.1:3000", &options, &root)
+            .expect("Claude environment");
+
+        assert_eq!(
+            environment.environment.get("CLAUDE_CODE_EFFORT_LEVEL"),
+            Some(&"medium".to_owned())
+        );
     }
 }

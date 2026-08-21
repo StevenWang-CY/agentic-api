@@ -1,4 +1,16 @@
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{
+    Args, Parser, Subcommand, ValueEnum,
+    builder::{Styles, styling::AnsiColor},
+};
+
+const fn brand_styles() -> Styles {
+    Styles::styled()
+        .header(AnsiColor::BrightCyan.on_default().bold())
+        .usage(AnsiColor::BrightBlue.on_default().bold())
+        .literal(AnsiColor::BrightYellow.on_default().bold())
+        .placeholder(AnsiColor::BrightMagenta.on_default())
+        .valid(AnsiColor::BrightGreen.on_default())
+}
 
 pub const DEFAULT_DATABASE_URL: &str = "sqlite://./agentic_api.db";
 
@@ -13,7 +25,7 @@ pub enum Harness {
     name = "agentic",
     about = "Agentic API — local agent gateway for Claude Code and Codex",
     version,
-    after_help = "Examples:\n  agentic run codex --model Qwen/...\n  agentic run claude --upstream http://127.0.0.1:8000"
+    styles = brand_styles(),
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -92,6 +104,7 @@ pub struct SourceOptions {
 }
 
 #[derive(Args, Clone, Debug)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct CommonOptions {
     /// Gateway bind host
     #[arg(long, default_value = "127.0.0.1", env = "GATEWAY_HOST")]
@@ -124,6 +137,10 @@ pub struct CommonOptions {
     /// Suppress lifecycle output
     #[arg(long)]
     pub quiet: bool,
+
+    /// Skip harness permission prompts and sandbox restrictions
+    #[arg(long)]
+    pub yolo: bool,
 
     /// Disable ANSI color output
     #[arg(long)]
@@ -163,6 +180,7 @@ impl Default for CommonOptions {
             llm_ready_timeout_s: 600.0,
             llm_ready_interval_s: 2.0,
             quiet: false,
+            yolo: false,
             no_color: false,
         }
     }
@@ -257,5 +275,16 @@ mod tests {
             panic!("expected run command");
         };
         assert_eq!(harness.options().source.model.as_deref(), Some("Qwen/test"));
+    }
+
+    #[test]
+    fn run_accepts_yolo_mode() {
+        let cli =
+            Cli::try_parse_from(["agentic", "run", "claude", "--model", "Qwen/test", "--yolo"]).expect("valid CLI");
+
+        let Command::Run { harness } = cli.command else {
+            panic!("expected run command");
+        };
+        assert!(harness.options().common.yolo);
     }
 }

@@ -34,6 +34,15 @@ For an existing OpenAI-compatible upstream, provide both the upstream URL and ha
 pass `--database-url postgresql://...` for a shared PostgreSQL deployment. Use `agentic validate` to check prerequisites
 without launching a session.
 
+For a deliberately unattended session in an externally isolated environment, add `--yolo`. This skips Claude Code
+permission checks and disables Codex approvals and sandboxing. For Claude, it also forces the compatible `medium`
+effort in both the CLI argument and `CLAUDE_CODE_EFFORT_LEVEL`, because Claude Code gives the environment variable
+precedence over `--effort`.
+
+Qwen3.8-27B's vLLM chat template accepts `low`, `medium`, and `xhigh`; `high` produces a template `ValueError`. The
+legacy `scripts/spark-claude-code.sh` launcher defaults to `medium` as well and can be overridden with
+`AGENTIC_CLAUDE_EFFORT`.
+
 ## Linting and Formatting
 
 ```console
