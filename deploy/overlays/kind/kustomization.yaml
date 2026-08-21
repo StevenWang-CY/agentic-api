@@ -2,11 +2,12 @@
 # Overlays must live outside deploy/kubernetes: Kustomize rejects a base that is
 # an ancestor of the overlay directory ("cycle detected").
 #
-#   kubectl apply -k deploy/overlays/kind
+#   kubectl apply -k deploy/overlays/kind          # Docker Desktop (macOS/Windows)
+#   kubectl apply -k deploy/overlays/kind-linux    # native Linux Docker
 #
-# The hostAliases entry is only needed on native Linux Docker, where
-# host.docker.internal does not resolve inside kind. Confirm the IP with:
-#   docker network inspect kind --format '{{range .IPAM.Config}}{{.Gateway}} {{end}}'
+# vLLM (or the llm-d endpoint) listens on the host at port 5050, matching the
+# kind guide. Docker Desktop resolves host.docker.internal inside the cluster;
+# native Linux Docker needs the hostAliases entry from the kind-linux overlay.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 namespace: agentic-api
@@ -21,11 +22,4 @@ patches:
     patch: |
       - op: replace
         path: /data/LLM_API_BASE
-        value: http://host.docker.internal:8000
-  - target: {kind: Deployment, name: agentic-api}
-    patch: |
-      - op: add
-        path: /spec/template/spec/hostAliases
-        value:
-          - ip: "172.18.0.1"
-            hostnames: [host.docker.internal]
+        value: http://host.docker.internal:5050

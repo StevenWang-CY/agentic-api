@@ -27,8 +27,9 @@ images:
 
 Change `LLM_API_BASE` and `CORS_ALLOWED_ORIGINS` in `deploy/kubernetes/configmap.yaml` or patch them in the same
 overlay. `deploy/overlays/kind` is a working example for the local kind cluster from the
-[kind guide](README.md): it points `LLM_API_BASE` at vLLM on the host and adds the `hostAliases` entry that native
-Linux Docker needs for `host.docker.internal`. Keep `SKIP_LLM_READY_CHECK=false` when the inference service exposes `/health`. The recurring upstream check
+[kind guide](README.md): it points `LLM_API_BASE` at `host.docker.internal:5050` on the host. On native Linux
+Docker, apply `deploy/overlays/kind-linux` instead; it layers the `hostAliases` entry that `host.docker.internal`
+needs there on top of the same overlay. Keep `SKIP_LLM_READY_CHECK=false` when the inference service exposes `/health`. The recurring upstream check
 uses `OPENAI_API_KEY` as a bearer credential when configured. For a provider without `/health`, set
 `SKIP_LLM_READY_CHECK=true`; `/ready` will continue checking PostgreSQL but will omit the upstream check. Add a small
 Responses API request as an external monitor in that configuration.

@@ -221,6 +221,56 @@ mod tests {
         assert_eq!(interval.min(remaining), Duration::from_millis(100));
     }
 
+    /// Regression test for readiness flapping: the probe must not reuse a pooled
+    /// keep-alive connection between runs, because upstreams such as uvicorn close
+    /// idle connections on roughly the same cadence as the probe and a reused dead
+    /// socket fails with `IncompleteMessage` while the upstream is healthy.
+    #[tokio::test]
+    async fn readiness_client_opens_a_new_connection_per_probe() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let connections = Arc::new(AtomicUsize::new(0));
+        let upstream = tokio::spawn({
+            let connections = Arc::clone(&connections);
+            async move {
+                loop {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    connections.fetch_add(1, Ordering::SeqCst);
+                    tokio::spawn(async move {
+                        // Serve keep-alive responses for as many requests as arrive on this socket.
+                        let mut buffer = [0_u8; 2048];
+                        while let Ok(read) = socket.read(&mut buffer).await {
+                            if read == 0 {
+                                break;
+                            }
+                            let response = "HTTP/1.1 204 No Content\r\nconnection: keep-alive\r\n\r\n";
+                            if socket.write_all(response.as_bytes()).await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+                }
+            }
+        });
+
+        let client = super::llm_readiness_client().unwrap();
+        for _ in 0..3 {
+            let readiness = probe_llm_readiness(&client, &url, None, Duration::from_secs(1))
+                .await
+                .unwrap();
+            assert!(matches!(readiness, super::LlmReadiness::Ready), "{readiness:?}");
+        }
+        upstream.abort();
+
+        assert_eq!(
+            connections.load(Ordering::SeqCst),
+            3,
+            "each probe must open its own TCP connection instead of reusing a pooled one"
+        );
+    }
+
     #[tokio::test]
     async fn probe_rejects_invalid_bearer_header_before_network_io() {
         let error = probe_llm_readiness(
