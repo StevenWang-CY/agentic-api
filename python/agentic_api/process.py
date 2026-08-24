@@ -15,6 +15,7 @@ from threading import Lock
 
 POLL_INTERVAL_S = 0.05
 READY_REQUEST_TIMEOUT_S = 0.1
+_IS_POSIX = os.name == "posix"
 
 
 class ShutdownRequested(RuntimeError):
@@ -60,7 +61,7 @@ class ProcessSupervisor:
             "env": dict(env),
             "shell": False,
         }
-        if os.name == "posix":
+        if _IS_POSIX:
             popen_kwargs["start_new_session"] = True
 
         process = subprocess.Popen(command_list, **popen_kwargs)
@@ -68,7 +69,7 @@ class ProcessSupervisor:
             name=Path(command_list[0]).name or command_list[0],
             command=tuple(command_list),
             process=process,
-            process_group_id=process.pid if os.name == "posix" else None,
+            process_group_id=process.pid if _IS_POSIX else None,
         )
         with self._lock:
             self._children.append(child)

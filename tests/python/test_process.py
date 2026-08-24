@@ -220,7 +220,7 @@ def test_terminate_all_uses_direct_child_signals_off_posix(monkeypatch: pytest.M
     fake_process.wait_should_timeout = True
 
     monkeypatch.setattr("agentic_api.process.subprocess.Popen", lambda command, **kwargs: fake_process)
-    monkeypatch.setattr("agentic_api.process.os.name", "nt")
+    monkeypatch.setattr("agentic_api.process._IS_POSIX", False)
 
     supervisor = ProcessSupervisor()
     supervisor.start(["agentic-server"], {})
