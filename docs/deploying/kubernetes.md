@@ -26,11 +26,21 @@ images:
 ```
 
 Change `LLM_API_BASE` and `CORS_ALLOWED_ORIGINS` in `deploy/kubernetes/configmap.yaml` or patch them in the same
-overlay. `deploy/overlays/kind` is a working example for the local kind cluster from the
-[kind guide](README.md): it points `LLM_API_BASE` at `host.docker.internal:5050` on the host. On native Linux
-Docker, apply `deploy/overlays/kind-linux` instead; it layers the `hostAliases` entry that `host.docker.internal`
-needs there on top of the same overlay. When the host inference service listens on a different port, override
-`LLM_API_BASE` without editing the checked-in overlay, for example with vLLM on port 8000:
+overlay. `deploy/overlays/kind` is the working example for Docker Desktop on macOS and Windows: it points
+`LLM_API_BASE` at `host.docker.internal:5050` on the host. On native Linux Docker, apply
+`deploy/overlays/kind-linux` instead; it layers the `hostAliases` entry that `host.docker.internal` needs there on
+top of the same overlay. When the host inference service listens on a different port, override `LLM_API_BASE`
+without editing the checked-in overlay. Use the overlay that matches your host:
+
+macOS or Windows with Docker Desktop:
+
+```console
+kubectl kustomize deploy/overlays/kind |
+  sed 's#host.docker.internal:5050#host.docker.internal:8000#' |
+  kubectl apply --filename=-
+```
+
+Native Linux Docker:
 
 ```console
 kubectl kustomize deploy/overlays/kind-linux |
