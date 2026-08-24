@@ -145,6 +145,7 @@ async fn spawn_failing_search() -> (String, mpsc::Receiver<()>, tokio::task::Joi
     (format!("http://{addr}"), rx, handle)
 }
 
+#[allow(clippy::result_large_err)]
 async fn build_exec_ctx(vllm_url: &str, search_url: &str) -> ExecutionContext {
     let pool = support::setup_pool().await;
     let conv = ConversationHandler::new(ConversationStore::new(Arc::clone(&pool)));
@@ -163,6 +164,7 @@ async fn build_tool_registry(tools: &Vec<ToolParam>, exec_ctx: &ExecutionContext
         .unwrap()
 }
 
+#[allow(clippy::result_large_err)]
 async fn run_test_messages_loop(
     request: Value,
     registry: &ToolRegistry,
