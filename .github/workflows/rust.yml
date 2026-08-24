@@ -14,6 +14,40 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  kubernetes:
+    runs-on: ubuntu-latest
+    env:
+      KUBECTL_VERSION: v1.36.2
+      KUBECTL_SHA256: 1e9045ec32bea85da43de85f0065358529ea7c7a152eca78154fba5b58c27d82
+      KUBECONFORM_VERSION: v0.7.0
+      KUBECONFORM_SHA256: c31518ddd122663b3f3aa874cfe8178cb0988de944f29c74a0b9260920d115d3
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install pinned Kubernetes validators
+        run: |
+          curl --fail --location --silent --show-error \
+            "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl" \
+            --output "${RUNNER_TEMP}/kubectl"
+          echo "${KUBECTL_SHA256}  ${RUNNER_TEMP}/kubectl" | sha256sum --check
+          chmod +x "${RUNNER_TEMP}/kubectl"
+
+          curl --fail --location --silent --show-error \
+            "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz" \
+            --output "${RUNNER_TEMP}/kubeconform.tar.gz"
+          echo "${KUBECONFORM_SHA256}  ${RUNNER_TEMP}/kubeconform.tar.gz" | sha256sum --check
+          tar --extract --gzip --file "${RUNNER_TEMP}/kubeconform.tar.gz" --directory "${RUNNER_TEMP}" kubeconform
+
+      - name: Render and validate Kubernetes manifests
+        run: |
+          set -o pipefail
+          "${RUNNER_TEMP}/kubectl" kustomize deploy/kubernetes \
+            | "${RUNNER_TEMP}/kubeconform" \
+                -kubernetes-version 1.36.0 \
+                -strict \
+                -summary
+
   rust:
     runs-on: ubuntu-latest
     steps:
@@ -23,7 +57,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: stable
+          toolchain: 1.98.0
           components: clippy, rustfmt
 
       - name: Cache cargo registry and build
@@ -49,6 +83,12 @@ jobs:
       - name: Run tests
         run: cargo test
 
+      - name: Test Codex and Claude launcher contracts
+        run: bash scripts/tests/agentic-launchers-test.sh
+
+      - name: Test agentic CLI end to end
+        run: python3 scripts/tests/agentic-cli-e2e-test.py
+
   postgres:
     runs-on: ubuntu-latest
     services:
@@ -73,7 +113,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: stable
+          toolchain: 1.98.0
 
       - name: Cache cargo registry and build
         uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v4
@@ -88,7 +128,7 @@ jobs:
             cargo-${{ runner.os }}-
 
       - name: Verify PostgreSQL schema upgrades and validation
-        run: cargo test -p agentic-server-core --lib -- --ignored
+        run: cargo test -p agentic-server-core --lib -- --ignored --test-threads=1
 
       - name: Verify PostgreSQL migrations and restart persistence
-        run: cargo test -p agentic-server-core --test postgres_storage_integration -- --ignored
+        run: cargo test -p agentic-server-core --test postgres_storage_integration -- --ignored --test-threads=1

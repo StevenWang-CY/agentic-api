@@ -11,6 +11,8 @@ pub enum SSEItemType {
     CustomToolCall,
     WebSearchCall,
     McpCall,
+    McpListTools,
+    Compaction,
     Message,
 }
 
@@ -23,6 +25,8 @@ impl SSEItemType {
             Self::CustomToolCall => "custom_tool_call",
             Self::WebSearchCall => "web_search_call",
             Self::McpCall => "mcp_call",
+            Self::McpListTools => "mcp_list_tools",
+            Self::Compaction => "compaction",
             Self::Message => "message",
         }
     }
@@ -36,6 +40,8 @@ impl From<&str> for SSEItemType {
             "custom_tool_call" => Self::CustomToolCall,
             "web_search_call" => Self::WebSearchCall,
             "mcp_call" => Self::McpCall,
+            "mcp_list_tools" => Self::McpListTools,
+            "compaction" => Self::Compaction,
             _ => Self::Message,
         }
     }
@@ -108,6 +114,9 @@ pub enum SSEEventType {
     McpCallArgumentsDone,
     McpCallCompleted,
     McpCallFailed,
+    McpListToolsInProgress,
+    McpListToolsCompleted,
+    McpListToolsFailed,
 
     // Catch-all for unrecognized events
     Other,
@@ -147,6 +156,9 @@ impl From<&str> for SSEEventType {
             "response.mcp_call_arguments.done" => SSEEventType::McpCallArgumentsDone,
             "response.mcp_call.completed" => SSEEventType::McpCallCompleted,
             "response.mcp_call.failed" => SSEEventType::McpCallFailed,
+            "response.mcp_list_tools.in_progress" => SSEEventType::McpListToolsInProgress,
+            "response.mcp_list_tools.completed" => SSEEventType::McpListToolsCompleted,
+            "response.mcp_list_tools.failed" => SSEEventType::McpListToolsFailed,
             _ => Self::Other,
         }
     }
@@ -188,6 +200,9 @@ impl TryFrom<SSEEventType> for &'static str {
             SSEEventType::McpCallArgumentsDone => Ok("response.mcp_call_arguments.done"),
             SSEEventType::McpCallCompleted => Ok("response.mcp_call.completed"),
             SSEEventType::McpCallFailed => Ok("response.mcp_call.failed"),
+            SSEEventType::McpListToolsInProgress => Ok("response.mcp_list_tools.in_progress"),
+            SSEEventType::McpListToolsCompleted => Ok("response.mcp_list_tools.completed"),
+            SSEEventType::McpListToolsFailed => Ok("response.mcp_list_tools.failed"),
             SSEEventType::Other => Err(()),
         }
     }
@@ -376,6 +391,9 @@ mod tests {
             SSEEventType::McpCallArgumentsDone,
             SSEEventType::McpCallCompleted,
             SSEEventType::McpCallFailed,
+            SSEEventType::McpListToolsInProgress,
+            SSEEventType::McpListToolsCompleted,
+            SSEEventType::McpListToolsFailed,
         ] {
             let wire_name = <&str>::try_from(event_type).expect("known event type has a wire name");
             assert_eq!(SSEEventType::from(wire_name), event_type);

@@ -203,9 +203,12 @@ async fn storage_backed_state(llm_url: &str) -> StorageBackedState {
     let state = AppState {
         proxy_state,
         exec_ctx,
+        llm_readiness_client: agentic_core::readiness::llm_readiness_client().expect("readiness client"),
+        readiness_tracker: agentic_server::app::ReadinessTracker::default(),
         shutdown_token: CancellationToken::new(),
         websocket_tracker: WebSocketTracker::default(),
         llm_api_base: config.llm_api_base,
+        skip_llm_ready_check: config.skip_llm_ready_check,
         openai_api_key: config.openai_api_key,
     };
     StorageBackedState { state, pool, _db: db }
@@ -262,9 +265,15 @@ fn conflict_error() -> serde_json::Value {
 
 fn sse_events(body: &str) -> Vec<serde_json::Value> {
     body.split("\n\n")
-        .filter_map(|frame| frame.strip_prefix("data: "))
-        .filter(|data| *data != "[DONE]")
-        .map(|data| serde_json::from_str(data).expect("SSE data should be JSON"))
+        .filter(|frame| !frame.is_empty() && *frame != "data: [DONE]")
+        .map(|frame| {
+            let (event_line, data_line) = frame.split_once('\n').expect("named SSE event and data lines");
+            let event_name = event_line.strip_prefix("event: ").expect("SSE event header");
+            let data = data_line.strip_prefix("data: ").expect("SSE data");
+            let event: serde_json::Value = serde_json::from_str(data).expect("SSE data should be JSON");
+            assert_eq!(event["type"].as_str(), Some(event_name));
+            event
+        })
         .collect()
 }
 

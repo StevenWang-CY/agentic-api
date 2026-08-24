@@ -6,7 +6,10 @@ use bytes::Bytes;
 use http::HeaderMap;
 use tracing::debug;
 
-use agentic_core::executor::{ExecutorError, MessagesUpstream, run_messages_loop, run_messages_stream};
+use agentic_core::executor::{
+    ExecutorError, MessagesUpstream, normalize_native_web_search_for_upstream, run_messages_loop, run_messages_stream,
+    validate_native_web_search_request,
+};
 use agentic_core::proxy::{
     ProxyAuth, ProxyBody, ProxyRequest, ProxyResponse, error_response_for_auth, proxy_request_with_path,
     upstream_request_headers,
@@ -90,6 +93,9 @@ async fn execute_messages(
         Ok(v) => v,
         Err(e) => return messages_error_response(ExecutorError::from(e)),
     };
+    if let Err(error) = validate_native_web_search_request(&request_json) {
+        return messages_error_response(error);
+    }
 
     let upstream = MessagesUpstream::new(
         &state.exec_ctx.llm_base_url,
@@ -144,9 +150,19 @@ pub async fn messages(State(state): State<AppState>, request: Request) -> Respon
 
 pub async fn count_tokens(State(state): State<AppState>, request: Request) -> Response {
     let (parts, body) = request.into_parts();
-    let bytes: Bytes = match read_bytes_with_auth(body, ProxyAuth::Anthropic).await {
+    let mut bytes: Bytes = match read_bytes_with_auth(body, ProxyAuth::Anthropic).await {
         Ok(bytes) => bytes,
         Err(response) => return response,
     };
+    if let Ok(mut request_json) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+        match normalize_native_web_search_for_upstream(&mut request_json) {
+            Ok(true) => match serde_json::to_vec(&request_json) {
+                Ok(body) => bytes = Bytes::from(body),
+                Err(error) => return messages_error_response(ExecutorError::from(error)),
+            },
+            Ok(false) => {}
+            Err(error) => return messages_error_response(error),
+        }
+    }
     proxy_messages(&state, parts, bytes, "/v1/messages/count_tokens").await
 }

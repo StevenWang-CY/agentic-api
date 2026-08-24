@@ -24,6 +24,7 @@ use serde_json::{Value, json};
 
 use crate::executor::error::{ExecutorError, ExecutorResult};
 use crate::executor::inference::{BoxStream, response_lines, send_request};
+use crate::executor::messages_request::{normalize_native_web_search, web_search_budget_exhausted_result};
 use crate::executor::request::ExecutionContext;
 use crate::proxy::processed_response_headers;
 use crate::tool::ToolRegistry;
@@ -51,6 +52,7 @@ pub async fn run_messages_stream(
     exec_ctx: Arc<ExecutionContext>,
     upstream: MessagesUpstream,
 ) -> ExecutorResult<MessagesResponse<BoxStream>> {
+    let mut web_search_budget = normalize_native_web_search(&mut request)?;
     request["stream"] = Value::Bool(true);
 
     // Prime the first upstream request before the handler commits an HTTP 200.
@@ -120,7 +122,13 @@ pub async fn run_messages_stream(
             // the gateway tool_use (F3, streaming half). The gateway calls are
             // derived from the same buffered blocks for dispatch.
             let (assistant_content, calls) = acc.take_round();
-            let resolved = execute_gateway_calls(&calls, &registry, &exec_ctx.messages_gateway_tools).await;
+            let allowed_searches = web_search_budget.reserve(calls.len());
+            let resolved = execute_gateway_calls(
+                &calls,
+                &registry,
+                &exec_ctx.messages_gateway_tools,
+                allowed_searches,
+            ).await;
             append_round_to_history(&mut request, &assistant_content, &resolved);
         }
 
@@ -446,8 +454,14 @@ async fn execute_gateway_calls(
     calls: &[StreamedCall],
     registry: &ToolRegistry,
     gateway_map: &tool_seam::GatewayToolMap,
+    allowed_searches: usize,
 ) -> Vec<ResolvedStreamCall> {
-    let futures = calls.iter().map(|c| async move {
+    let futures = calls.iter().enumerate().map(|(index, c)| async move {
+        if index >= allowed_searches {
+            return ResolvedStreamCall {
+                tool_result_block: web_search_budget_exhausted_result(&c.id),
+            };
+        }
         // F4: reject a malformed/incomplete reconstructed input rather than
         // coercing to {} and dispatching the tool with args the model never sent.
         let (output, is_error) = match tool_seam::parse_tool_input(&c.input_json) {
@@ -727,8 +741,13 @@ mod tests {
         // After the fix, execute_gateway_calls must NOT coerce invalid input to
         // {} and dispatch — it must produce an error tool_result. Assert the
         // reconstructed call is flagged invalid rather than silently dispatchable.
-        let resolved =
-            execute_gateway_calls(&calls, &no_op_registry().await, &tool_seam::GatewayToolMap::default()).await;
+        let resolved = execute_gateway_calls(
+            &calls,
+            &no_op_registry().await,
+            &tool_seam::GatewayToolMap::default(),
+            calls.len(),
+        )
+        .await;
         let content = resolved[0].tool_result_block["content"].as_str().unwrap_or_default();
         assert!(
             content.contains("invalid") || content.contains("malformed") || content.contains("could not"),

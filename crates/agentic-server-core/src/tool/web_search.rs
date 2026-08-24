@@ -118,8 +118,17 @@ pub struct WebSearchHandler {
 impl WebSearchHandler {
     #[must_use]
     pub fn from_env(client: Arc<reqwest::Client>) -> Self {
+        Self::from_values(
+            client,
+            std::env::var(YOU_API_KEY).ok(),
+            std::env::var(YOU_API_BASE_URL).ok(),
+        )
+    }
+
+    #[must_use]
+    pub fn from_values(client: Arc<reqwest::Client>, api_key: Option<String>, base_url: Option<String>) -> Self {
         Self {
-            provider: Arc::new(YouSearchProvider::from_env(client)),
+            provider: Arc::new(YouSearchProvider::from_values(client, api_key, base_url)),
         }
     }
 
@@ -176,14 +185,11 @@ struct YouSearchProvider {
 }
 
 impl YouSearchProvider {
-    fn from_env(client: Arc<reqwest::Client>) -> Self {
-        let api_key = std::env::var(YOU_API_KEY)
-            .ok()
+    fn from_values(client: Arc<reqwest::Client>, api_key: Option<String>, base_url: Option<String>) -> Self {
+        let api_key = api_key
             .map(|value| value.trim().to_owned())
             .filter(|value| !value.is_empty());
-        let base_url = std::env::var(YOU_API_BASE_URL)
-            .ok()
-            .and_then(|value| clean_base_url(&value));
+        let base_url = base_url.and_then(|value| clean_base_url(&value));
         Self {
             client,
             api_key,
@@ -365,8 +371,12 @@ impl YouSearchRequest {
             .filters
             .as_ref()
             .and_then(|filters| clean_vec(filters.allowed_domains.as_deref()));
+        let config_blocked_domains = config
+            .filters
+            .as_ref()
+            .and_then(|filters| clean_vec(filters.blocked_domains.as_deref()));
         let include_domains = config_domains.or_else(|| clean_vec(args.include_domains.as_deref()));
-        let exclude_domains = clean_vec(args.exclude_domains.as_deref());
+        let exclude_domains = config_blocked_domains.or_else(|| clean_vec(args.exclude_domains.as_deref()));
         let boost_domains = clean_vec(args.boost_domains.as_deref());
         if include_domains.is_some() && (exclude_domains.is_some() || boost_domains.is_some()) {
             return Err(ToolError::Config(

@@ -10,9 +10,9 @@ on:
         required: true
         type: boolean
         default: true
-      target_ref:
-        description: "Git ref to release, such as a commit SHA or releases/vX.Y.Z branch; defaults to selected main commit"
-        required: false
+      version:
+        description: "Version already merged into main, such as 0.3.0"
+        required: true
         type: string
 
 concurrency:
@@ -49,23 +49,15 @@ jobs:
 
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          ref: ${{ inputs.target_ref || github.sha }}
-
-      - name: Resolve release target
-        id: target
-        run: |
-          set -euo pipefail
-          target_sha="$(git rev-parse HEAD)"
-
-          echo "sha=$target_sha" >> "$GITHUB_OUTPUT"
-          echo "Release target: $target_sha"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: stable
+          toolchain: 1.98.0
           components: clippy, rustfmt
+
+      - name: Refresh lockfile
+        run: cargo check --workspace
 
       - name: Cache cargo registry and build
         uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v4
@@ -88,10 +80,11 @@ jobs:
       - name: Run tests
         run: cargo test
 
-      - name: Read release version
+      - name: Read and verify package versions
         id: version
         run: |
           set -euo pipefail
+          requested_version="${{ inputs.version }}"
           core_version="$(cargo metadata --format-version 1 --no-deps \
             | jq -r '.packages[] | select(.name == "agentic-server-core") | .version')"
           server_version="$(cargo metadata --format-version 1 --no-deps \
@@ -107,27 +100,32 @@ jobs:
             exit 1
           fi
 
+          if [ "$core_version" != "$requested_version" ]; then
+            echo "::error::package version $core_version does not match requested release version $requested_version"
+            exit 1
+          fi
+
+          echo "Release version: $core_version"
           echo "version=$core_version" >> "$GITHUB_OUTPUT"
           echo "tag=v$core_version" >> "$GITHUB_OUTPUT"
-          echo "release_branch=releases/v$core_version" >> "$GITHUB_OUTPUT"
-          echo "Release version: $core_version"
+
+      - name: Resolve release commit
+        id: target
+        run: |
+          set -euo pipefail
+          target_sha="$(git rev-parse HEAD)"
+
+          echo "sha=$target_sha" >> "$GITHUB_OUTPUT"
+          echo "Release target: $target_sha"
 
       - name: Check release refs
         run: |
           set -euo pipefail
           tag="${{ steps.version.outputs.tag }}"
-          release_branch="${{ steps.version.outputs.release_branch }}"
           target_sha="${{ steps.target.outputs.sha }}"
 
           if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
             echo "::error::Tag $tag already exists"
-            exit 1
-          fi
-
-          existing_branch_sha="$(git ls-remote --heads origin "refs/heads/$release_branch" | awk '{print $1}')"
-
-          if [ -n "$existing_branch_sha" ] && [ "$existing_branch_sha" != "$target_sha" ]; then
-            echo "::error::Release branch $release_branch already exists at $existing_branch_sha, not target $target_sha"
             exit 1
           fi
 
@@ -154,7 +152,6 @@ jobs:
           cargo package -p agentic-server --no-verify
           echo "Would release commit ${{ steps.target.outputs.sha }}"
           echo "Would create tag ${{ steps.version.outputs.tag }}"
-          echo "Would create branch ${{ steps.version.outputs.release_branch }}"
           echo "Would create GitHub release ${{ steps.version.outputs.tag }} with generated notes"
 
       - name: Publish agentic-server-core
@@ -193,7 +190,6 @@ jobs:
         run: |
           set -euo pipefail
           tag="${{ steps.version.outputs.tag }}"
-          release_branch="${{ steps.version.outputs.release_branch }}"
           target_sha="${{ steps.target.outputs.sha }}"
 
           git config user.name "github-actions[bot]"
@@ -201,7 +197,6 @@ jobs:
 
           git tag -a "$tag" "$target_sha" -m "$tag"
           git push origin "$tag"
-          git push origin "$target_sha:refs/heads/$release_branch"
 
       - name: Create GitHub release
         if: ${{ !inputs.dry_run }}

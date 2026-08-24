@@ -10,8 +10,9 @@ use tokio_util::sync::CancellationToken;
 use agentic_core::config::Config;
 use agentic_core::executor::{ConversationHandler, ExecutionContext, ResponseHandler};
 use agentic_core::proxy::ProxyState;
+use agentic_core::readiness::llm_readiness_client;
 use agentic_core::storage::{ConversationStore, ResponseStore};
-use agentic_server::app::{AppState, ServerConfig, WebSocketTracker, build_router};
+use agentic_server::app::{AppState, ReadinessTracker, ServerConfig, WebSocketTracker, build_router};
 
 pub fn test_config(llm_url: &str) -> Config {
     Config {
@@ -23,6 +24,7 @@ pub fn test_config(llm_url: &str) -> Config {
         db_url: None,
         postgres: agentic_core::config::PostgresConfig::default(),
         sqlite: agentic_core::config::SqliteConfig::default(),
+        tools: agentic_core::config::ToolRuntimeConfig::default(),
     }
 }
 
@@ -38,9 +40,12 @@ pub fn test_state(config: &Config) -> AppState {
     AppState {
         proxy_state,
         exec_ctx,
+        llm_readiness_client: llm_readiness_client().expect("readiness client"),
+        readiness_tracker: ReadinessTracker::default(),
         shutdown_token: CancellationToken::new(),
         websocket_tracker: WebSocketTracker::default(),
         llm_api_base: config.llm_api_base.clone(),
+        skip_llm_ready_check: config.skip_llm_ready_check,
         openai_api_key: config.openai_api_key.clone(),
     }
 }

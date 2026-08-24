@@ -9,7 +9,7 @@ use crate::utils::common::deserialize_from_value_opt;
 use crate::utils::uuid7_str;
 
 use super::input::{
-    InputContent, InputFunctionToolCall, InputItem, InputMessage, InputMessageContent, InputTextContent,
+    CompactionItem, InputContent, InputFunctionToolCall, InputItem, InputMessage, InputMessageContent, InputTextContent,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -195,6 +195,25 @@ impl TryFrom<&EventPayload> for CustomToolCall {
             call_id: call_id.as_deref().unwrap_or_default().to_owned(),
             name: name.as_deref().unwrap_or_default().to_owned(),
             input: String::new(),
+        })
+    }
+}
+
+impl TryFrom<&EventPayload> for CompactionItem {
+    type Error = ExecutorError;
+
+    fn try_from(payload: &EventPayload) -> Result<Self, Self::Error> {
+        let EventPayload::OutputItemAdded { item_id, .. } = payload else {
+            return Err(ExecutorError::ParseError("expected OutputItemAdded payload".into()));
+        };
+        let id = if item_id.is_empty() {
+            uuid7_str("cmp_")
+        } else {
+            item_id.clone()
+        };
+        Ok(Self {
+            id: Some(id),
+            encrypted_content: String::new(),
         })
     }
 }
@@ -413,6 +432,70 @@ impl McpCall {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpListTool {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub input_schema: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<Value>,
+}
+
+impl McpListTool {
+    #[must_use]
+    pub fn new(
+        name: impl Into<String>,
+        description: Option<String>,
+        input_schema: Value,
+        annotations: Option<Value>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            description,
+            input_schema,
+            annotations,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpListTools {
+    pub id: String,
+    pub server_label: String,
+    pub tools: Vec<McpListTool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl McpListTools {
+    #[must_use]
+    pub fn new(id: impl Into<String>, server_label: impl Into<String>, tools: Vec<McpListTool>) -> Self {
+        Self {
+            id: id.into(),
+            server_label: server_label.into(),
+            tools,
+            error: None,
+        }
+    }
+}
+
+impl TryFrom<&EventPayload> for McpListTools {
+    type Error = ExecutorError;
+
+    fn try_from(payload: &EventPayload) -> Result<Self, Self::Error> {
+        let EventPayload::OutputItemAdded { item_id, .. } = payload else {
+            return Err(ExecutorError::ParseError("expected OutputItemAdded payload".into()));
+        };
+        let id = if item_id.is_empty() {
+            uuid7_str("mcpl_")
+        } else {
+            item_id.clone()
+        };
+        Ok(Self::new(id, "", vec![]))
+    }
+}
+
 impl TryFrom<&EventPayload> for McpCall {
     type Error = ExecutorError;
 
@@ -521,41 +604,86 @@ impl ApplyDone for ReasoningOutput {
 
 impl ApplyDone for FunctionToolCall {
     fn apply_done(&mut self, payload: &EventPayload, buffer: &mut String) {
-        let EventPayload::FunctionCallArgsDone {
-            arguments,
-            call_id,
-            name,
-            ..
-        } = payload
-        else {
-            return;
-        };
-        self.arguments = if arguments.is_empty() {
-            std::mem::take(buffer)
-        } else {
-            buffer.clear();
-            arguments.clone()
-        };
-        if let Some(cid) = call_id.as_deref().filter(|s| !s.is_empty()) {
-            cid.clone_into(&mut self.call_id);
-        }
-        if !name.is_empty() {
-            name.clone_into(&mut self.name);
+        match payload {
+            EventPayload::FunctionCallArgsDone {
+                arguments,
+                call_id,
+                name,
+                ..
+            } => {
+                self.arguments = if arguments.is_empty() {
+                    std::mem::take(buffer)
+                } else {
+                    buffer.clear();
+                    arguments.clone()
+                };
+                if let Some(cid) = call_id.as_deref().filter(|s| !s.is_empty()) {
+                    cid.clone_into(&mut self.call_id);
+                }
+                if !name.is_empty() {
+                    name.clone_into(&mut self.name);
+                }
+            }
+            EventPayload::OutputItemDone { item, .. } => {
+                let Some(mut call) = deserialize_from_value_opt::<Self>(item.clone()) else {
+                    return;
+                };
+                if item.get("id").and_then(Value::as_str).is_none_or(str::is_empty) {
+                    call.id.clone_from(&self.id);
+                }
+                if call.call_id.is_empty() {
+                    call.call_id.clone_from(&self.call_id);
+                }
+                if call.name.is_empty() {
+                    call.name.clone_from(&self.name);
+                }
+                if call.namespace.is_none() {
+                    call.namespace.clone_from(&self.namespace);
+                }
+                if call.arguments.is_empty() {
+                    call.arguments = if self.arguments.is_empty() {
+                        std::mem::take(buffer)
+                    } else {
+                        std::mem::take(&mut self.arguments)
+                    };
+                } else {
+                    buffer.clear();
+                }
+                *self = call;
+            }
+            _ => {}
         }
     }
 }
 
 impl ApplyDone for CustomToolCall {
     fn apply_done(&mut self, payload: &EventPayload, buffer: &mut String) {
-        let EventPayload::CustomToolCallInputDone { input, .. } = payload else {
-            return;
-        };
-        self.input = if input.is_empty() {
-            std::mem::take(buffer)
-        } else {
-            buffer.clear();
-            input.clone()
-        };
+        match payload {
+            EventPayload::CustomToolCallInputDone { input, .. } => {
+                self.input = if input.is_empty() {
+                    std::mem::take(buffer)
+                } else {
+                    buffer.clear();
+                    input.clone()
+                };
+            }
+            EventPayload::OutputItemDone { item, .. } => {
+                let Some(mut call) = deserialize_from_value_opt::<Self>(item.clone()) else {
+                    return;
+                };
+                if call.input.is_empty() {
+                    call.input = if self.input.is_empty() {
+                        std::mem::take(buffer)
+                    } else {
+                        std::mem::take(&mut self.input)
+                    };
+                } else {
+                    buffer.clear();
+                }
+                *self = call;
+            }
+            _ => {}
+        }
     }
 }
 
@@ -567,6 +695,32 @@ impl ApplyDone for McpCall {
         if let Some(call) = deserialize_from_value_opt(item.clone()) {
             *self = call;
         }
+    }
+}
+
+impl ApplyDone for McpListTools {
+    fn apply_done(&mut self, payload: &EventPayload, _buffer: &mut String) {
+        let EventPayload::OutputItemDone { item, .. } = payload else {
+            return;
+        };
+        if let Some(list_tools) = deserialize_from_value_opt(item.clone()) {
+            *self = list_tools;
+        }
+    }
+}
+
+impl ApplyDone for CompactionItem {
+    fn apply_done(&mut self, payload: &EventPayload, _buffer: &mut String) {
+        let EventPayload::OutputItemDone { item, .. } = payload else {
+            return;
+        };
+        let Some(mut compaction) = deserialize_from_value_opt::<Self>(item.clone()) else {
+            return;
+        };
+        if compaction.id.as_deref().is_none_or(str::is_empty) {
+            compaction.id.clone_from(&self.id);
+        }
+        *self = compaction;
     }
 }
 
@@ -583,8 +737,12 @@ pub enum OutputItem {
     WebSearchCall(WebSearchCall),
     #[serde(rename = "mcp_call")]
     McpCall(McpCall),
+    #[serde(rename = "mcp_list_tools")]
+    McpListTools(McpListTools),
     #[serde(rename = "reasoning")]
     Reasoning(ReasoningOutput),
+    #[serde(rename = "compaction")]
+    Compaction(CompactionItem),
     #[serde(other)]
     Unknown,
 }
@@ -597,7 +755,13 @@ impl OutputItem {
                 .lookup(&call.name)
                 .is_none_or(|entry| !entry.tool_type.is_gateway_owned()),
             Self::CustomToolCall(_) => true,
-            Self::Message(_) | Self::WebSearchCall(_) | Self::McpCall(_) | Self::Reasoning(_) | Self::Unknown => false,
+            Self::Message(_)
+            | Self::WebSearchCall(_)
+            | Self::McpCall(_)
+            | Self::McpListTools(_)
+            | Self::Reasoning(_)
+            | Self::Compaction(_)
+            | Self::Unknown => false,
         }
     }
 
@@ -607,8 +771,9 @@ impl OutputItem {
             Self::Message(message) => Some(InputItem::Message(message.clone().into())),
             Self::Reasoning(reasoning) => Some(InputItem::Reasoning(reasoning.clone())),
             Self::FunctionCall(call) => Some(InputItem::FunctionCall(InputFunctionToolCall::from(call.clone()))),
-            Self::CustomToolCall(call) => Some(InputItem::CustomToolCall(call.clone())),
-            Self::WebSearchCall(_) | Self::McpCall(_) | Self::Unknown => None,
+            Self::CustomToolCall(call) => Some(InputItem::FunctionCall(call.clone().into())),
+            Self::Compaction(item) => Some(InputItem::Compaction(item.clone())),
+            Self::WebSearchCall(_) | Self::McpCall(_) | Self::McpListTools(_) | Self::Unknown => None,
         }
     }
 }
@@ -617,6 +782,29 @@ impl OutputItem {
 mod tests {
     use super::*;
     use crate::types::io::InputItem;
+
+    #[test]
+    fn compaction_output_item_round_trips_with_type_tag() {
+        let item: OutputItem = serde_json::from_value(serde_json::json!({
+            "id": "cmp_1",
+            "type": "compaction",
+            "encrypted_content": "durable summary"
+        }))
+        .unwrap();
+
+        assert!(!item.requires_client_action(&ToolRegistry::default()));
+        let Some(InputItem::Compaction(compaction)) = item.to_input_item() else {
+            panic!("compaction should rehydrate as a compaction input item");
+        };
+        assert_eq!(compaction.id.as_deref(), Some("cmp_1"));
+        assert_eq!(compaction.encrypted_content, "durable summary");
+
+        let serialized = serde_json::to_value(&item).unwrap();
+        assert_eq!(serialized["type"], "compaction");
+        assert_eq!(serialized["encrypted_content"], "durable summary");
+        let parsed: OutputItem = serde_json::from_value(serialized).unwrap();
+        assert!(matches!(parsed, OutputItem::Compaction(_)));
+    }
 
     #[test]
     fn custom_tool_call_preserves_freeform_input_and_requires_client_action() {
@@ -636,11 +824,11 @@ mod tests {
         };
         assert_eq!(call.status, Some(MessageStatus::Completed));
 
-        let Some(InputItem::CustomToolCall(call)) = item.to_input_item() else {
-            panic!("custom call should rehydrate as input");
+        let Some(InputItem::FunctionCall(call)) = item.to_input_item() else {
+            panic!("custom call should rehydrate as a function call");
         };
         assert_eq!(call.name, "apply_patch");
-        assert_eq!(call.input, "*** Begin Patch\n*** End Patch");
+        assert_eq!(call.arguments, r#"{"input":"*** Begin Patch\n*** End Patch"}"#);
     }
 
     #[test]
@@ -712,6 +900,91 @@ mod tests {
         assert_eq!(json["output"], "1");
         assert!(json["approval_request_id"].is_null());
         assert!(json["error"].is_null());
+    }
+
+    #[test]
+    fn mcp_list_tools_serializes_as_openai_output_item() {
+        let item = OutputItem::McpListTools(McpListTools::new(
+            "mcpl_1",
+            "counter",
+            vec![McpListTool::new(
+                "increment",
+                Some("Increment the counter by one".to_owned()),
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {},
+                }),
+                Some(serde_json::json!({"read_only": false})),
+            )],
+        ));
+
+        let json = serde_json::to_value(&item).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "type": "mcp_list_tools",
+                "id": "mcpl_1",
+                "server_label": "counter",
+                "tools": [{
+                    "name": "increment",
+                    "description": "Increment the counter by one",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {},
+                    },
+                    "annotations": {"read_only": false},
+                }],
+            })
+        );
+
+        let decoded: OutputItem = serde_json::from_value(json).unwrap();
+        let OutputItem::McpListTools(decoded) = decoded else {
+            panic!("expected MCP list-tools item");
+        };
+        assert_eq!(decoded.id, "mcpl_1");
+        assert_eq!(decoded.server_label, "counter");
+        assert_eq!(decoded.tools.len(), 1);
+        assert_eq!(decoded.tools[0].name, "increment");
+        assert!(decoded.error.is_none());
+    }
+
+    #[test]
+    fn mcp_list_tools_builds_from_added_and_applies_done_item() {
+        let added = EventPayload::OutputItemAdded {
+            item_id: "mcpl_1".to_owned(),
+            item_type: crate::events::SSEItemType::McpListTools,
+            output_index: 0,
+            name: None,
+            namespace: None,
+            call_id: None,
+        };
+        let mut item = McpListTools::try_from(&added).unwrap();
+        assert_eq!(item.id, "mcpl_1");
+        assert!(item.server_label.is_empty());
+        assert!(item.tools.is_empty());
+
+        let done = EventPayload::OutputItemDone {
+            item_id: "mcpl_1".to_owned(),
+            item_type: crate::events::SSEItemType::McpListTools,
+            output_index: 0,
+            item: serde_json::json!({
+                "type": "mcp_list_tools",
+                "id": "mcpl_1",
+                "server_label": "counter",
+                "tools": [{
+                    "name": "increment",
+                    "description": "Increment the counter by one",
+                    "input_schema": {"type": "object", "properties": {}},
+                    "annotations": {"read_only": false},
+                }],
+            }),
+        };
+        item.apply_done(&done, &mut String::new());
+
+        assert_eq!(item.id, "mcpl_1");
+        assert_eq!(item.server_label, "counter");
+        assert_eq!(item.tools.len(), 1);
+        assert_eq!(item.tools[0].name, "increment");
     }
 
     #[test]

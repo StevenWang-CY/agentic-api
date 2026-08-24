@@ -86,13 +86,7 @@ async fn test_single_turn_streaming_emits_response_completed_event() {
         panic!("expected streaming response");
     };
     let chunks = stream.collect::<Vec<_>>().await;
-    let events = chunks
-        .iter()
-        .filter_map(|chunk| {
-            let data = chunk.trim_end_matches('\n').strip_prefix("data: ")?;
-            (data != "[DONE]").then(|| serde_json::from_str::<Value>(data).expect("stream event JSON"))
-        })
-        .collect::<Vec<_>>();
+    let events = support::streamed_sse_events(&chunks);
 
     assert!(
         !events
@@ -136,10 +130,7 @@ async fn test_stream_persists_when_client_disconnects_after_completion_event() {
         let Some(chunk) = stream.next().await else {
             panic!("stream ended before response.completed");
         };
-        let Some(data) = chunk.trim_end_matches('\n').strip_prefix("data: ") else {
-            continue;
-        };
-        let Ok(event) = serde_json::from_str::<Value>(data) else {
+        let Some(event) = support::streamed_sse_event(&chunk) else {
             continue;
         };
         if event["type"] == "response.completed" {
@@ -433,7 +424,7 @@ async fn test_previous_response_id_rehydrates_function_call_before_tool_output()
     let mut second = make_request("ignored", true, false, Some(p1.id), None);
     second.input = ResponsesInput::Items(vec![InputItem::FunctionCallOutput(FunctionToolResultMessage {
         call_id: "call_1".to_string(),
-        output: "{\"stdout\":\"/workspace\"}".to_string(),
+        output: "{\"stdout\":\"/workspace\"}".into(),
     })]);
     let _p2 = unwrap_blocking(
         execute(second, Arc::clone(&fixture.exec_ctx))
@@ -787,7 +778,7 @@ fn upstream_mcp_fixture_call(id: &str, call_id: &str, name: &str, arguments: &st
 fn tool_output(call_id: &str, output: &str) -> InputItem {
     InputItem::FunctionCallOutput(FunctionToolResultMessage {
         call_id: call_id.to_string(),
-        output: output.to_string(),
+        output: output.into(),
     })
 }
 

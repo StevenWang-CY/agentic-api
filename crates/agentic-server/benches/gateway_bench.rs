@@ -161,6 +161,7 @@ async fn spawn_gateway(llm_url: &str) -> (Arc<reqwest::Client>, String) {
         db_url: Some(format!("sqlite://{}", db_path.display())),
         postgres: agentic_core::config::PostgresConfig::default(),
         sqlite: agentic_core::config::SqliteConfig::default(),
+        tools: agentic_core::config::ToolRuntimeConfig::default(),
     };
 
     let proxy_state = ProxyState::new(config.clone()).unwrap();
@@ -173,9 +174,12 @@ async fn spawn_gateway(llm_url: &str) -> (Arc<reqwest::Client>, String) {
     let state = AppState {
         proxy_state,
         exec_ctx,
+        llm_readiness_client: agentic_core::readiness::llm_readiness_client().expect("readiness client"),
+        readiness_tracker: agentic_server::app::ReadinessTracker::default(),
         shutdown_token: CancellationToken::new(),
         websocket_tracker: WebSocketTracker::default(),
         llm_api_base: config.llm_api_base,
+        skip_llm_ready_check: config.skip_llm_ready_check,
         openai_api_key: config.openai_api_key,
     };
 
