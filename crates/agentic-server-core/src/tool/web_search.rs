@@ -224,7 +224,7 @@ impl WebSearchProvider for YouSearchProvider {
             let resp = self
                 .client
                 .get(format!("{base_url}/v1/search"))
-                .query(&request)
+                .query(&request.query_params())
                 .header("X-API-Key", api_key)
                 .send()
                 .await
@@ -350,6 +350,44 @@ struct YouSearchRequest {
 }
 
 impl YouSearchRequest {
+    fn query_params(&self) -> Vec<(String, String)> {
+        let mut params = vec![("query".to_owned(), self.query.clone())];
+        if let Some(count) = self.count {
+            params.push(("count".to_owned(), count.to_string()));
+        }
+        if let Some(freshness) = &self.freshness {
+            params.push(("freshness".to_owned(), freshness.clone()));
+        }
+        if let Some(country) = &self.country {
+            params.push(("country".to_owned(), country.clone()));
+        }
+        if let Some(language) = &self.language {
+            params.push(("language".to_owned(), language.clone()));
+        }
+        if let Some(safesearch) = &self.safesearch {
+            params.push(("safesearch".to_owned(), safesearch.clone()));
+        }
+        if let Some(livecrawl) = &self.livecrawl {
+            params.push(("livecrawl".to_owned(), livecrawl.clone()));
+        }
+        for format in self.livecrawl_formats.iter().flatten() {
+            params.push(("livecrawl_formats".to_owned(), format.clone()));
+        }
+        if let Some(crawl_timeout) = self.crawl_timeout {
+            params.push(("crawl_timeout".to_owned(), crawl_timeout.to_string()));
+        }
+        for domain in self.include_domains.iter().flatten() {
+            params.push(("include_domains".to_owned(), domain.clone()));
+        }
+        for domain in self.exclude_domains.iter().flatten() {
+            params.push(("exclude_domains".to_owned(), domain.clone()));
+        }
+        for domain in self.boost_domains.iter().flatten() {
+            params.push(("boost_domains".to_owned(), domain.clone()));
+        }
+        params
+    }
+
     fn from_args_and_config(args: &WebSearchArguments, config: &WebSearchToolParam) -> Result<Self, ToolError> {
         let count = args
             .count

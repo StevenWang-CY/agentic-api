@@ -391,7 +391,19 @@ fn query_params_as_json(uri: &Uri) -> serde_json::Value {
         } else {
             serde_json::Value::String(value.into_owned())
         };
-        params.insert(key.into_owned(), value);
+        let key = key.into_owned();
+        match params.remove(&key) {
+            None => {
+                params.insert(key, value);
+            }
+            Some(serde_json::Value::Array(mut values)) => {
+                values.push(value);
+                params.insert(key, serde_json::Value::Array(values));
+            }
+            Some(previous) => {
+                params.insert(key, serde_json::Value::Array(vec![previous, value]));
+            }
+        }
     }
     serde_json::Value::Object(params)
 }
@@ -406,7 +418,7 @@ async fn web_search_handler_gets_query_params_from_you_and_formats_results() {
         .execute(
             "call_search",
             "web_search",
-            r#"{"query":"rust async","count":2}"#,
+            r#"{"query":"rust async","count":2,"exclude_domains":["example.com","example.org"]}"#,
             &serde_json::json!({"type":"web_search_preview"}),
         )
         .await
@@ -416,6 +428,10 @@ async fn web_search_handler_gets_query_params_from_you_and_formats_results() {
     assert_eq!(request.api_key, "secret-you-key");
     assert_eq!(request.body["query"], "rust async");
     assert_eq!(request.body["count"], 2);
+    assert_eq!(
+        request.body["exclude_domains"],
+        serde_json::json!(["example.com", "example.org"])
+    );
 
     assert_eq!(output.call_id, "call_search");
     let output_json: serde_json::Value = serde_json::from_str(&output.output).unwrap();
