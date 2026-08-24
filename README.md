@@ -23,7 +23,7 @@ ______________________________________________________________________
 
 vLLM gives you state-of-the-art inference throughput. But real agentic applications need more than raw tokens: they need **conversation state, tool-call loops, and multi-turn orchestration**. Today, all of that complexity lives in your client code.
 
-**Agentic API moves it server-side.** It is a Rust-native gateway that sits in front of vLLM and owns the stateful agentic APIs, starting with an OpenAI-compatible [Responses API](https://platform.openai.com/docs/api-reference/responses). Your application makes *one API call* and the server handles the rest: state hydration, tool execution, streaming, and continuation.
+**Agentic API moves it server-side.** It is a Rust-native gateway that sits in front of vLLM and owns the stateful agentic APIs, starting with an OpenAI-compatible [Responses API](https://platform.openai.com/docs/api-reference/responses). vLLM is one supported backend, not part of the Agentic API product name. Your application makes *one API call* and the server handles the rest: state hydration, tool execution, streaming, and continuation.
 
 ```mermaid
 flowchart LR
@@ -119,6 +119,38 @@ Run preflight checks without launching a harness:
 Use `AGENTIC_CODEX_BIN` or `AGENTIC_CLAUDE_BIN` to override harness binary discovery. Add `--no-color` for scripts or
 `--quiet` for minimal lifecycle output. Use `--yolo` only in an externally isolated environment; it skips Claude
 permission checks and disables Codex approvals and sandboxing.
+
+### Python distribution
+
+The `agentic-api` wheel packages the Rust gateway and a small Python launcher. Version 0.4.0 is a build-only release:
+download the wheel artifact for your platform from the release workflow, then install that local file. It is not
+published on PyPI.
+
+```bash
+WHEEL_PATH=/absolute/path/to/agentic_api-0.4.0-PLATFORM.whl
+uv pip install "$WHEEL_PATH"
+agentic-api serve --vllm-base-url http://existing-vllm:8000
+
+uv pip install "agentic-api[local] @ file://$WHEEL_PATH"
+agentic-api serve --model MODEL_ID
+```
+
+The `[local]` extra is for supported Linux hosts where the launcher should manage a local vLLM process.
+
+#### Planned for 0.5.0
+
+These public-index and `uvx` examples apply only after the PyPI publication gate for 0.5.0 passes:
+
+```bash
+uv pip install agentic-api
+uv pip install "agentic-api[local]"
+uvx --from agentic-api agentic-api doctor
+uvx --from agentic-api agentic-api serve --vllm-base-url http://existing-vllm:8000
+```
+
+The Rust-native `agentic` CLI remains supported for `run codex`, `run claude`, `serve`, and `validate`. For the full
+installation walkthrough, managed-vLLM passthrough examples, `doctor` output, and known-good model profiles, see
+[Python installation and workflows](docs/guides/python-installation.md).
 
 For Claude sessions, Agentic API always sets both `--effort medium` and `CLAUDE_CODE_EFFORT_LEVEL=medium`; the
 environment variable is intentional because Claude Code gives it precedence over the command-line effort flag.

@@ -1,0 +1,173 @@
+from __future__ import annotations
+
+import importlib
+from pathlib import Path
+
+import pytest
+
+from agentic_api import diagnostics
+from agentic_api.compatibility import SUPPORTED_VLLM_VERSION
+
+
+def test_remote_doctor_is_healthy_without_vllm(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    rust_binary = tmp_path / "agentic-server"
+    rust_binary.write_text("")
+    rust_binary.chmod(0o755)
+
+    monkeypatch.setattr("agentic_api.diagnostics.find_packaged_binary", lambda name: rust_binary)
+    monkeypatch.setattr("agentic_api.diagnostics.read_binary_version", lambda path: "agentic-server 0.4.0")
+    monkeypatch.setattr("agentic_api.diagnostics.metadata_version", _metadata_version_without_vllm)
+    monkeypatch.setattr(
+        "agentic_api.diagnostics.find_active_environment_executable",
+        lambda name: (_ for _ in ()).throw(FileNotFoundError(name)),
+    )
+
+    exit_code = diagnostics.doctor("remote")
+    output = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "Selected mode: remote" in output
+    assert "Installed vLLM version: not installed" in output
+    assert "Local mode health: unavailable" in output
+    assert "Remote mode health: ok" in output
+
+
+def test_local_doctor_reports_missing_vllm_installation(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    rust_binary = tmp_path / "agentic-server"
+    rust_binary.write_text("")
+    rust_binary.chmod(0o755)
+
+    monkeypatch.setattr("agentic_api.diagnostics.find_packaged_binary", lambda name: rust_binary)
+    monkeypatch.setattr("agentic_api.diagnostics.read_binary_version", lambda path: "agentic-server 0.4.0")
+    monkeypatch.setattr("agentic_api.diagnostics.metadata_version", _metadata_version_without_vllm)
+    monkeypatch.setattr(
+        "agentic_api.diagnostics.find_active_environment_executable",
+        lambda name: (_ for _ in ()).throw(FileNotFoundError(name)),
+    )
+
+    exit_code = diagnostics.doctor("local")
+    output = capsys.readouterr().out
+
+    assert exit_code == 1
+    assert "Selected mode: local" in output
+    assert "Local mode health: unavailable" in output
+    assert "Install the 0.4.0 wheel artifact with its local extra" in output
+    assert "file:///path/to/agentic_api-0.4.0-PLATFORM.whl" in output
+
+
+def test_local_doctor_reports_incompatible_vllm_version(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    rust_binary = tmp_path / "agentic-server"
+    rust_binary.write_text("")
+    rust_binary.chmod(0o755)
+    vllm_binary = tmp_path / "vllm"
+    vllm_binary.write_text("")
+    vllm_binary.chmod(0o755)
+
+    monkeypatch.setattr("agentic_api.diagnostics.find_packaged_binary", lambda name: rust_binary)
+    monkeypatch.setattr("agentic_api.diagnostics.read_binary_version", lambda path: "agentic-server 0.4.0")
+    monkeypatch.setattr("agentic_api.diagnostics.metadata_version", _metadata_version_with_incompatible_vllm)
+    monkeypatch.setattr("agentic_api.diagnostics.find_active_environment_executable", lambda name: vllm_binary)
+
+    exit_code = diagnostics.doctor("local")
+    output = capsys.readouterr().out
+
+    assert exit_code == 1
+    assert f"Supported vLLM version: {SUPPORTED_VLLM_VERSION}" in output
+    assert "Installed vLLM version: 0.12.0" in output
+    assert "Local mode health: unavailable" in output
+    assert "Installed vLLM does not match the tested version" in output
+
+
+def test_local_doctor_finds_vllm_in_active_environment_when_it_is_not_on_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    rust_binary = tmp_path / "agentic-server"
+    rust_binary.write_text("")
+    rust_binary.chmod(0o755)
+    scripts_dir = tmp_path / "environment" / "bin"
+    scripts_dir.mkdir(parents=True)
+    vllm_binary = scripts_dir / "vllm"
+    vllm_binary.write_text("")
+    vllm_binary.chmod(0o755)
+
+    monkeypatch.setattr("agentic_api.diagnostics.find_packaged_binary", lambda name: rust_binary)
+    monkeypatch.setattr("agentic_api.diagnostics.read_binary_version", lambda path: "agentic-server 0.4.0")
+    monkeypatch.setattr("agentic_api.diagnostics.metadata_version", _metadata_version_with_supported_vllm)
+    monkeypatch.setattr("agentic_api.binary.sysconfig.get_path", lambda name: str(scripts_dir))
+    monkeypatch.setattr("agentic_api.binary.sys.executable", str(scripts_dir / "python"))
+    monkeypatch.setenv("PATH", "")
+
+    report = diagnostics.collect_doctor_report()
+
+    assert report.local_ok is True
+    assert report.vllm_executable_path == str(vllm_binary)
+
+
+def test_doctor_report_includes_platform_package_and_binary_details(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    rust_binary = tmp_path / "agentic-server"
+    rust_binary.write_text("")
+    rust_binary.chmod(0o755)
+    vllm_binary = tmp_path / "vllm"
+    vllm_binary.write_text("")
+    vllm_binary.chmod(0o755)
+
+    monkeypatch.setattr("agentic_api.diagnostics.find_packaged_binary", lambda name: rust_binary)
+    monkeypatch.setattr("agentic_api.diagnostics.read_binary_version", lambda path: "agentic-server 0.4.0")
+    monkeypatch.setattr("agentic_api.diagnostics.metadata_version", _metadata_version_with_supported_vllm)
+    monkeypatch.setattr("agentic_api.diagnostics.find_active_environment_executable", lambda name: vllm_binary)
+    monkeypatch.setattr("agentic_api.diagnostics.platform.system", lambda: "Linux")
+    monkeypatch.setattr("agentic_api.diagnostics.platform.machine", lambda: "x86_64")
+    monkeypatch.setattr("agentic_api.diagnostics.platform.python_version", lambda: "3.12.4")
+
+    exit_code = diagnostics.doctor(None)
+    output = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "Python version: 3.12.4" in output
+    assert "Platform: Linux x86_64" in output
+    assert "agentic-api version: 0.4.0" in output
+    assert f"Supported vLLM version: {SUPPORTED_VLLM_VERSION}" in output
+    assert f"Rust binary path: {rust_binary}" in output
+    assert "Rust binary executable: yes" in output
+    assert "Rust binary version: agentic-server 0.4.0" in output
+    assert f"vLLM executable path: {vllm_binary}" in output
+
+
+def test_python_module_entrypoint_delegates_to_cli_main(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = importlib.import_module("agentic_api.__main__")
+    called: list[object] = []
+
+    monkeypatch.setattr("agentic_api.cli.main", lambda argv=None: called.append(argv) or 7)
+
+    assert module.main() == 7
+    assert called == [None]
+
+
+def _metadata_version_without_vllm(name: str) -> str:
+    if name == "agentic-api":
+        return "0.4.0"
+    raise diagnostics.PackageNotFoundError(name)
+
+
+def _metadata_version_with_incompatible_vllm(name: str) -> str:
+    if name == "agentic-api":
+        return "0.4.0"
+    if name == "vllm":
+        return "0.12.0"
+    raise diagnostics.PackageNotFoundError(name)
+
+
+def _metadata_version_with_supported_vllm(name: str) -> str:
+    if name == "agentic-api":
+        return "0.4.0"
+    if name == "vllm":
+        return SUPPORTED_VLLM_VERSION
+    raise diagnostics.PackageNotFoundError(name)

@@ -34,3 +34,39 @@ fn help_does_not_expose_database_url_credentials() {
     assert!(!stdout.contains(database_url));
     assert!(!stdout.contains("super-secret"));
 }
+
+#[test]
+fn agentic_server_reports_version() {
+    let output = Command::new(env!("CARGO_BIN_EXE_agentic-server"))
+        .arg("--version")
+        .output()
+        .expect("agentic-server version must run");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("stdout must be UTF-8");
+    assert!(stdout.contains("agentic-server 0.4.0"));
+}
+
+#[test]
+fn packaged_agentic_cli_preserves_top_level_commands_and_harness_subcommands() {
+    let output = Command::new(env!("CARGO_BIN_EXE_agentic"))
+        .arg("--help")
+        .output()
+        .expect("agentic help must run");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("stdout must be UTF-8");
+    assert!(stdout.contains("run"));
+    assert!(stdout.contains("serve"));
+    assert!(stdout.contains("validate"));
+
+    let run_output = Command::new(env!("CARGO_BIN_EXE_agentic"))
+        .args(["run", "--help"])
+        .output()
+        .expect("agentic run help must run");
+
+    assert!(run_output.status.success());
+    let run_stdout = String::from_utf8(run_output.stdout).expect("stdout must be UTF-8");
+    assert!(run_stdout.contains("codex"));
+    assert!(run_stdout.contains("claude"));
+}
