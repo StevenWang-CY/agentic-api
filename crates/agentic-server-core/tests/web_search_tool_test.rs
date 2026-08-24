@@ -11,8 +11,8 @@ use agentic_core::types::io::{OutputItem, ResponsesInput, ToolChoice};
 use agentic_core::types::request_response::RequestPayload;
 use agentic_core::types::tools::ResponsesTool;
 use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode};
-use axum::routing::post;
+use axum::http::{HeaderMap, StatusCode, Uri};
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use either::Either;
 use futures::StreamExt;
@@ -298,15 +298,14 @@ async fn spawn_mock_you_with_response(
     let app = Router::new()
         .route(
             "/v1/search",
-            post(
-                move |State(tx): State<mpsc::Sender<CapturedSearchRequest>>,
-                      headers: HeaderMap,
-                      Json(body): Json<serde_json::Value>| async move {
+            get(
+                move |State(tx): State<mpsc::Sender<CapturedSearchRequest>>, headers: HeaderMap, uri: Uri| async move {
                     let api_key = headers
                         .get("x-api-key")
                         .and_then(|value| value.to_str().ok())
                         .unwrap_or_default()
                         .to_owned();
+                    let body = query_params_as_json(&uri);
                     tx.send(CapturedSearchRequest { api_key, body }).await.unwrap();
                     (status, Json(response_body.clone()))
                 },
@@ -331,19 +330,20 @@ async fn spawn_mock_you_waiting_for_two_searches() -> (
     let app = Router::new()
         .route(
             "/v1/search",
-            post(
+            get(
                 move |State((tx, started, notify)): State<(
                     mpsc::Sender<CapturedSearchRequest>,
                     Arc<AtomicUsize>,
                     Arc<Notify>,
                 )>,
                       headers: HeaderMap,
-                      Json(body): Json<serde_json::Value>| async move {
+                      uri: Uri| async move {
                     let api_key = headers
                         .get("x-api-key")
                         .and_then(|value| value.to_str().ok())
                         .unwrap_or_default()
                         .to_owned();
+                    let body = query_params_as_json(&uri);
                     tx.send(CapturedSearchRequest {
                         api_key,
                         body: body.clone(),
@@ -383,8 +383,21 @@ async fn spawn_mock_you_waiting_for_two_searches() -> (
     (format!("http://{addr}"), rx, handle)
 }
 
+fn query_params_as_json(uri: &Uri) -> serde_json::Value {
+    let mut params = serde_json::Map::new();
+    for (key, value) in url::form_urlencoded::parse(uri.query().unwrap_or_default().as_bytes()) {
+        let value = if let Ok(number) = value.parse::<u64>() {
+            serde_json::Value::from(number)
+        } else {
+            serde_json::Value::String(value.into_owned())
+        };
+        params.insert(key.into_owned(), value);
+    }
+    serde_json::Value::Object(params)
+}
+
 #[tokio::test]
-async fn web_search_handler_posts_to_you_and_formats_results() {
+async fn web_search_handler_gets_query_params_from_you_and_formats_results() {
     let (base_url, mut captured, _handle) = spawn_mock_you().await;
     let handler =
         WebSearchHandler::with_api_key(Arc::new(reqwest::Client::new()), "secret-you-key".to_owned(), &base_url);

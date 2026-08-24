@@ -9,7 +9,7 @@ use serde_json::Value;
 use crate::types::io::output::{FunctionToolCall, WebSearchCall, WebSearchCallStatus, WebSearchSource};
 use crate::types::io::{FunctionTool, OutputItem};
 use crate::types::tools::{WebSearchContextSize, WebSearchToolParam};
-use crate::utils::common::{serialize_to_string, serialize_to_value_or_custom_default};
+use crate::utils::common::serialize_to_value_or_custom_default;
 
 use super::handler::{GatewayExecutor, ToolError, ToolHandler, ToolOutput};
 use super::registry::{ToolEntry, ToolType};
@@ -221,16 +221,11 @@ impl WebSearchProvider for YouSearchProvider {
                 ToolError::Config(format!("{YOU_API_BASE_URL} must be set to use the web_search tool"))
             })?;
             let request = YouSearchRequest::from_args_and_config(args, config)?;
-            let url = format!("{base_url}/v1/search");
-            let body = serialize_to_string(&request)
-                .map_err(|e| ToolError::Execution(format!("failed to serialize web_search request: {e}")))?;
-
             let resp = self
                 .client
-                .post(url)
+                .get(format!("{base_url}/v1/search"))
+                .query(&request)
                 .header("X-API-Key", api_key)
-                .header("Content-Type", "application/json")
-                .body(body)
                 .send()
                 .await
                 .map_err(|e| ToolError::Execution(format!("You.com search request failed: {e}")))?;
