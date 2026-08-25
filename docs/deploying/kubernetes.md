@@ -417,7 +417,7 @@ for a saturated database or inference service.
 ## Enable and verify web search
 
 The `web_search_preview` built-in tool is executed by Agentic API when `YOU_API_KEY` and `YOU_API_BASE_URL` are
-configured. Keep the key in a Secret and use the current You.com Search API base URL, `https://ydc-index.io`.
+configured. Keep the key in a Secret and use the current You.com Search API base URL, `https://api.ydc-index.io`.
 
 Create the Secret from a protected environment file so the key does not enter shell history or process arguments:
 
@@ -441,7 +441,7 @@ patches:
     patch: |-
       - op: add
         path: /data/YOU_API_BASE_URL
-        value: https://ydc-index.io
+        value: https://api.ydc-index.io
   - target:
       kind: Deployment
       name: agentic-api
