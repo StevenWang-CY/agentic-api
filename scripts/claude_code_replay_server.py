@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 import yaml
 
@@ -149,9 +149,34 @@ def _declared_web_search_name(request: dict[str, Any]) -> str:
 
 def make_handler(state: ReplayState) -> type[BaseHTTPRequestHandler]:
     class ReplayHandler(BaseHTTPRequestHandler):
+        def _send_search_response(self, request: dict[str, Any]) -> None:
+            append_capture(state.capture_path, "search", request)
+            self._send_json(
+                200,
+                {
+                    "results": {
+                        "web": [
+                            {
+                                "url": "https://www.rust-lang.org/",
+                                "title": "Rust",
+                                "description": "Rust language release",
+                                "snippets": ["Rust 1.89.0 is the latest stable release."],
+                            }
+                        ],
+                        "news": [],
+                    },
+                    "metadata": {"query": request.get("query", ""), "search_uuid": "ci-search", "latency": 0.0},
+                },
+            )
+
         def do_GET(self) -> None:
-            if urlsplit(self.path).path == "/health":
+            parsed = urlsplit(self.path)
+            if parsed.path == "/health":
                 self._send_bytes(200, "text/plain", b"")
+                return
+            if parsed.path == "/v1/search":
+                query = {key: values[-1] for key, values in parse_qs(parsed.query).items()}
+                self._send_search_response(query)
                 return
             self.send_error(404)
 
@@ -165,24 +190,7 @@ def make_handler(state: ReplayState) -> type[BaseHTTPRequestHandler]:
                 self._send_json(200, {"input_tokens": 512})
                 return
             if path == "/v1/search":
-                append_capture(state.capture_path, "search", request)
-                self._send_json(
-                    200,
-                    {
-                        "results": {
-                            "web": [
-                                {
-                                    "url": "https://www.rust-lang.org/",
-                                    "title": "Rust",
-                                    "description": "Rust language release",
-                                    "snippets": ["Rust 1.89.0 is the latest stable release."],
-                                }
-                            ],
-                            "news": [],
-                        },
-                        "metadata": {"query": request.get("query", ""), "search_uuid": "ci-search", "latency": 0.0},
-                    },
-                )
+                self._send_search_response(request)
                 return
             if path != "/v1/messages":
                 self.send_error(404)
