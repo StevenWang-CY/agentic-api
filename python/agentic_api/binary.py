@@ -61,13 +61,14 @@ def read_binary_version(path: Path) -> str:
 def _candidate_paths(name: str, *, include_ambient_path: bool = True) -> list[Path]:
     candidates: list[Path] = []
 
+    if sys.argv and sys.argv[0]:
+        candidates.append(Path(sys.argv[0]).resolve().parent / name)
+
     scripts_dir = sysconfig.get_path("scripts")
     if scripts_dir:
         candidates.append(Path(scripts_dir) / name)
 
     candidates.append(Path(sys.executable).resolve().parent / name)
-    if sys.argv and sys.argv[0]:
-        candidates.append(Path(sys.argv[0]).resolve().parent / name)
 
     if include_ambient_path:
         which_path = shutil.which(name)

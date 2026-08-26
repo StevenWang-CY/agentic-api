@@ -22,7 +22,13 @@ def scripts_dir() -> Path:
     return Path(path).resolve()
 
 
+def require_wheel_install() -> None:
+    if os.environ.get("AGENTIC_API_TEST_WHEEL") is None:
+        pytest.skip("set AGENTIC_API_TEST_WHEEL to exercise installed wheel commands")
+
+
 def test_installed_wheel_exposes_expected_commands() -> None:
+    require_wheel_install()
     directory = scripts_dir()
 
     for name in ("agentic-api", "agentic", "agentic-server"):
@@ -32,6 +38,7 @@ def test_installed_wheel_exposes_expected_commands() -> None:
 
 
 def test_agentic_api_serve_uses_discovered_packaged_server_without_importing_vllm(tmp_path: Path) -> None:
+    require_wheel_install()
     directory = scripts_dir()
     server_path = directory / "agentic-server"
     backup_path = tmp_path / "agentic-server.real"

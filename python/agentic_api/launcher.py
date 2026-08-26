@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 import os
-import secrets
 import signal
 import sys
-from collections.abc import Sequence
 from importlib.metadata import PackageNotFoundError, version
+from pathlib import Path
 
 from agentic_api.binary import (
     PackagedBinaryNotFoundError,
@@ -68,6 +67,7 @@ def _run_local_mode(supervisor: ProcessSupervisor, options: ServeOptions) -> Chi
     if options.model is None:
         raise ValueError("--model is required in local mode")
 
+    rust_binary = find_packaged_binary("agentic-server")
     vllm_path = find_active_environment_executable("vllm")
     installed_version = _installed_vllm_version()
     if installed_version != SUPPORTED_VLLM_VERSION:
@@ -75,7 +75,7 @@ def _run_local_mode(supervisor: ProcessSupervisor, options: ServeOptions) -> Chi
             f"agentic-api local mode requires vllm=={SUPPORTED_VLLM_VERSION}; found {installed_version}"
         )
 
-    vllm_api_key = os.environ.get(options.vllm_api_key_env) or secrets.token_urlsafe(24)
+    vllm_api_key = os.environ.get(options.vllm_api_key_env)
     vllm_url = f"http://127.0.0.1:{options.vllm_port}"
 
     vllm_process = supervisor.start(
@@ -101,7 +101,7 @@ def _run_local_mode(supervisor: ProcessSupervisor, options: ServeOptions) -> Chi
     )
 
     supervisor.start(
-        _rust_command(options, vllm_url),
+        _rust_command(options, vllm_url, binary=rust_binary),
         _rust_environment(options.gateway_api_key_env, vllm_api_key),
     )
     return supervisor.wait_for_failure()
@@ -118,12 +118,14 @@ def _run_remote_mode(supervisor: ProcessSupervisor, options: ServeOptions) -> Ch
     return supervisor.wait_for_failure()
 
 
-def _rust_command(options: ServeOptions, upstream_base_url: str) -> list[str]:
-    binary = find_packaged_binary("agentic-server")
+def _rust_command(options: ServeOptions, upstream_base_url: str, *, binary: Path | None = None) -> list[str]:
+    binary = binary or find_packaged_binary("agentic-server")
     return [
         str(binary),
         "--llm-api-base",
         upstream_base_url,
+        "--llm-ready-timeout-s",
+        str(options.startup_timeout_s),
         "--gateway-host",
         options.host,
         "--gateway-port",
@@ -141,9 +143,12 @@ def _rust_environment(gateway_api_key_env: str, api_key_override: str | None) ->
     return env
 
 
-def _vllm_environment(api_key: str) -> dict[str, str]:
+def _vllm_environment(api_key: str | None) -> dict[str, str]:
     env = os.environ.copy()
-    env["VLLM_API_KEY"] = api_key
+    if api_key is not None:
+        env["VLLM_API_KEY"] = api_key
+    else:
+        env.pop("VLLM_API_KEY", None)
     return env
 
 

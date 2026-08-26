@@ -77,6 +77,10 @@ def test_find_packaged_binary_finds_sibling_of_console_script(
     packaged_binary = scripts_dir / "agentic-server"
     packaged_binary.write_text("#!/bin/sh\nexit 0\n")
     packaged_binary.chmod(0o755)
+    host_binary = tmp_path / "host" / "bin" / "agentic-server"
+    host_binary.parent.mkdir(parents=True)
+    host_binary.write_text("#!/bin/sh\nexit 0\n")
+    host_binary.chmod(0o755)
     console_script = scripts_dir / "agentic-api"
     console_script.write_text("#!/bin/sh\nexit 0\n")
     console_script.chmod(0o755)

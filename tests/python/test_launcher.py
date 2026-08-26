@@ -83,7 +83,8 @@ def test_run_serve_local_mode_starts_vllm_then_rust(monkeypatch: pytest.MonkeyPa
     monkeypatch.setattr(launcher, "find_packaged_binary", lambda name: Path("/pkg/bin/agentic-server"))
     monkeypatch.setattr(launcher, "find_active_environment_executable", lambda name: Path("/venv/bin/vllm"))
     monkeypatch.setattr(launcher, "_installed_vllm_version", lambda: "0.11.0")
-    monkeypatch.setattr(launcher.secrets, "token_urlsafe", lambda _: "generated-token")
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("AGENTIC_VLLM_API_KEY", raising=False)
     monkeypatch.setattr(
         launcher,
         "wait_for_vllm_ready",
@@ -112,22 +113,43 @@ def test_run_serve_local_mode_starts_vllm_then_rust(monkeypatch: pytest.MonkeyPa
         "--port",
         "8000",
     ]
-    assert supervisor.starts[0][1]["VLLM_API_KEY"] == "generated-token"
-    assert "generated-token" not in supervisor.starts[0][0]
+    assert "VLLM_API_KEY" not in supervisor.starts[0][1]
     assert supervisor.starts[1][0] == [
         "/pkg/bin/agentic-server",
         "--llm-api-base",
         "http://127.0.0.1:8000",
+        "--llm-ready-timeout-s",
+        "600.0",
         "--gateway-host",
         "0.0.0.0",
         "--gateway-port",
         "9000",
     ]
-    assert supervisor.starts[1][1]["OPENAI_API_KEY"] == "generated-token"
-    assert wait_calls == [("http://127.0.0.1:8000", "generated-token", 600.0, 2.0)]
+    assert "OPENAI_API_KEY" not in supervisor.starts[1][1]
+    assert wait_calls == [("http://127.0.0.1:8000", None, 600.0, 2.0)]
     assert signal.SIGINT in signal_handlers
     assert signal.SIGTERM in signal_handlers
     assert supervisor.terminate_timeout == 10.0
+
+
+def test_run_serve_local_mode_checks_packaged_gateway_before_starting_vllm(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import agentic_api.launcher as launcher
+
+    supervisor = FakeSupervisor()
+    monkeypatch.setattr(launcher, "ProcessSupervisor", lambda: supervisor)
+    monkeypatch.setattr(
+        launcher,
+        "find_packaged_binary",
+        lambda name: (_ for _ in ()).throw(launcher.PackagedBinaryNotFoundError("missing gateway")),
+    )
+    monkeypatch.setattr(launcher, "find_active_environment_executable", lambda name: Path("/venv/bin/vllm"))
+    monkeypatch.setattr(launcher.signal, "signal", lambda sig, handler: handler)
+
+    assert launcher.run_serve(make_options()) == 1
+    assert supervisor.starts == []
+    assert capsys.readouterr().err == "missing gateway\n"
 
 
 def test_run_serve_local_mode_returns_sigint_during_readiness_without_startup_error(
@@ -142,7 +164,6 @@ def test_run_serve_local_mode_returns_sigint_during_readiness_without_startup_er
     monkeypatch.setattr(launcher, "find_packaged_binary", lambda name: Path("/pkg/bin/agentic-server"))
     monkeypatch.setattr(launcher, "find_active_environment_executable", lambda name: Path("/venv/bin/vllm"))
     monkeypatch.setattr(launcher, "_installed_vllm_version", lambda: "0.11.0")
-    monkeypatch.setattr(launcher.secrets, "token_urlsafe", lambda _: "generated-token")
 
     def fake_wait_for_vllm_ready(
         base_url: str,
@@ -198,6 +219,8 @@ def test_run_serve_remote_mode_starts_only_rust_and_uses_selected_gateway_key(
         "/pkg/bin/agentic-server",
         "--llm-api-base",
         "https://upstream.example.com/base",
+        "--llm-ready-timeout-s",
+        "600.0",
         "--gateway-host",
         "0.0.0.0",
         "--gateway-port",
@@ -218,7 +241,6 @@ def test_run_serve_reports_startup_failure_and_cleans_up_started_children(
     monkeypatch.setattr(launcher, "find_packaged_binary", lambda name: Path("/pkg/bin/agentic-server"))
     monkeypatch.setattr(launcher, "find_active_environment_executable", lambda name: Path("/venv/bin/vllm"))
     monkeypatch.setattr(launcher, "_installed_vllm_version", lambda: "0.11.0")
-    monkeypatch.setattr(launcher.secrets, "token_urlsafe", lambda _: "generated-token")
     monkeypatch.setattr(
         launcher,
         "wait_for_vllm_ready",
@@ -262,7 +284,6 @@ def test_run_serve_reports_readiness_timeout_without_traceback(
     monkeypatch.setattr(launcher, "ProcessSupervisor", lambda: supervisor)
     monkeypatch.setattr(launcher, "find_active_environment_executable", lambda name: Path("/venv/bin/vllm"))
     monkeypatch.setattr(launcher, "_installed_vllm_version", lambda: "0.11.0")
-    monkeypatch.setattr(launcher.secrets, "token_urlsafe", lambda _: "generated-token")
     monkeypatch.setattr(
         launcher,
         "wait_for_vllm_ready",
