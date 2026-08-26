@@ -72,7 +72,6 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
           key: cargo-python-${{ runner.os }}-${{ matrix.python-version }}-${{ hashFiles('Cargo.lock', 'python-build-constraints.txt') }}
           restore-keys: |
             cargo-python-${{ runner.os }}-${{ matrix.python-version }}-
