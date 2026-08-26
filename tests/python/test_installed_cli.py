@@ -10,6 +10,8 @@ from pathlib import Path
 
 import pytest
 
+from agentic_api import __version__
+
 
 COMMAND_TIMEOUT_S = 20
 
@@ -168,4 +170,4 @@ def test_agentic_api_entry_point_works_in_prefix_without_sibling_python(tmp_path
     )
 
     assert result.returncode == 0, result.stderr
-    assert "agentic-api version: 0.4.0" in result.stdout
+    assert f"agentic-api version: {__version__}" in result.stdout
