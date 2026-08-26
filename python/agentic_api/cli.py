@@ -117,6 +117,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 def _build_serve_options(parser: argparse.ArgumentParser, namespace: argparse.Namespace) -> ServeOptions:
+    if namespace.model is not None and not namespace.model.strip():
+        parser.error("--model must not be empty")
+
     source_count = int(bool(namespace.model)) + int(bool(namespace.vllm_base_url))
     if source_count != 1:
         parser.error("exactly one of --model or --vllm-base-url is required")

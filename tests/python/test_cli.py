@@ -78,6 +78,15 @@ def test_serve_requires_exactly_one_source_option(args: list[str], message: str,
     assert message in capsys.readouterr().err
 
 
+@pytest.mark.parametrize("model", ["", "   "])
+def test_serve_rejects_empty_model(capsys: pytest.CaptureFixture[str], model: str) -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        build_parser().parse_args(["serve", "--model", model])
+
+    assert exc_info.value.code == 2
+    assert "--model must not be empty" in capsys.readouterr().err
+
+
 def test_serve_preserves_passthrough_after_double_dash() -> None:
     options = parse_serve_args(
         "--model",
