@@ -39,10 +39,54 @@ pub enum Command {
         #[command(subcommand)]
         harness: HarnessCommand,
     },
+    /// Launch a coding harness against an already-running Agentic API gateway
+    Harness {
+        #[command(subcommand)]
+        harness: AttachedHarnessCommand,
+    },
     /// Start Agentic API without launching a harness
     Serve(ServeOptions),
     /// Validate the local Agentic API session prerequisites
     Validate(ValidateOptions),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AttachedHarnessCommand {
+    /// Launch Codex with an isolated provider configuration
+    Codex(AttachedHarnessOptions),
+    /// Launch Claude Code with isolated provider and model configuration
+    Claude(AttachedHarnessOptions),
+}
+
+#[derive(Args, Clone, Debug)]
+pub struct AttachedHarnessOptions {
+    /// URL of an already-running Agentic API gateway
+    #[arg(long, value_parser = parse_upstream_url)]
+    pub gateway_url: String,
+
+    /// Model ID served by the gateway
+    #[arg(long)]
+    pub model: String,
+
+    /// API key forwarded to the gateway and harness when configured
+    #[arg(long, env = "OPENAI_API_KEY", hide_env_values = true)]
+    pub api_key: Option<String>,
+
+    /// Suppress lifecycle output
+    #[arg(long)]
+    pub quiet: bool,
+
+    /// Skip harness permission prompts and sandbox restrictions
+    #[arg(long)]
+    pub yolo: bool,
+
+    /// Disable ANSI color output
+    #[arg(long)]
+    pub no_color: bool,
+
+    /// Arguments forwarded to the selected harness after `--`
+    #[arg(last = true, allow_hyphen_values = true)]
+    pub harness_args: Vec<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -226,7 +270,7 @@ impl HarnessCommand {
 mod tests {
     use clap::Parser;
 
-    use super::{Cli, Command, DEFAULT_DATABASE_URL, HarnessCommand};
+    use super::{AttachedHarnessCommand, Cli, Command, DEFAULT_DATABASE_URL, HarnessCommand};
 
     #[test]
     fn run_codex_uses_sqlite_by_default_and_preserves_arguments() {
@@ -335,5 +379,74 @@ mod tests {
             panic!("expected run command");
         };
         assert!(harness.options().common.yolo);
+    }
+
+    #[test]
+    fn harness_claude_accepts_gateway_and_namespaced_model() {
+        let cli = Cli::try_parse_from([
+            "agentic",
+            "harness",
+            "claude",
+            "--gateway-url",
+            "http://127.0.0.1:9000/",
+            "--model",
+            "Qwen/Qwen3-8B",
+            "--",
+            "--resume",
+        ])
+        .expect("valid attached Claude CLI");
+
+        let Command::Harness { harness } = cli.command else {
+            panic!("expected harness command");
+        };
+        let AttachedHarnessCommand::Claude(options) = harness else {
+            panic!("expected Claude harness");
+        };
+        assert_eq!(options.gateway_url, "http://127.0.0.1:9000");
+        assert_eq!(options.model, "Qwen/Qwen3-8B");
+        assert_eq!(options.harness_args, ["--resume"]);
+    }
+
+    #[test]
+    fn harness_claude_rejects_malformed_gateway_urls() {
+        let error = Cli::try_parse_from([
+            "agentic",
+            "harness",
+            "claude",
+            "--gateway-url",
+            "127.0.0.1:9000",
+            "--model",
+            "Qwen/Qwen3-8B",
+        ])
+        .expect_err("malformed gateway URL should be rejected");
+
+        assert!(error.to_string().contains("invalid upstream URL"));
+    }
+
+    #[test]
+    fn harness_codex_accepts_gateway_model_and_passthrough() {
+        let cli = Cli::try_parse_from([
+            "agentic",
+            "harness",
+            "codex",
+            "--gateway-url",
+            "http://127.0.0.1:9000/",
+            "--model",
+            "Qwen/Qwen3-8B",
+            "--",
+            "exec",
+            "say hello",
+        ])
+        .expect("valid attached Codex CLI");
+
+        let Command::Harness { harness } = cli.command else {
+            panic!("expected harness command");
+        };
+        let AttachedHarnessCommand::Codex(options) = harness else {
+            panic!("expected Codex harness");
+        };
+        assert_eq!(options.gateway_url, "http://127.0.0.1:9000");
+        assert_eq!(options.model, "Qwen/Qwen3-8B");
+        assert_eq!(options.harness_args, ["exec", "say hello"]);
     }
 }

@@ -2,9 +2,9 @@ use std::{ffi::OsStr, io::IsTerminal, path::Path, process::ExitCode};
 
 use agentic_core::error::Error;
 use agentic_server::{
-    agentic_cli::{Cli, Command, HarnessCommand},
+    agentic_cli::{AttachedHarnessCommand, Cli, Command, HarnessCommand},
     agentic_output::{colorize_help, redact_url, render_banner, render_help},
-    agentic_process::{run_session, server_args, server_binary_path},
+    agentic_process::{run_attached_harness, run_session, server_args, server_binary_path},
 };
 use clap::{Parser, error::ErrorKind};
 
@@ -22,9 +22,27 @@ async fn main() -> Result<ExitCode, Error> {
     };
     match cli.command {
         Command::Run { harness } => run_harness(harness).await,
+        Command::Harness { harness } => attach_harness(harness).await,
         Command::Serve(options) => serve(options.source, options.common).await,
         Command::Validate(options) => validate(options).await,
     }
+}
+
+async fn attach_harness(harness: AttachedHarnessCommand) -> Result<ExitCode, Error> {
+    let (selected, options) = match harness {
+        AttachedHarnessCommand::Codex(options) => (agentic_server::agentic_cli::Harness::Codex, options),
+        AttachedHarnessCommand::Claude(options) => (agentic_server::agentic_cli::Harness::Claude, options),
+    };
+    if !options.quiet {
+        println!("{}", render_banner(!options.no_color));
+        if options.no_color {
+            println!("Starting {selected:?} via {}", redact_url(&options.gateway_url));
+        } else {
+            println!("\u{1b}[35mStarting {selected:?}\u{1b}[0m");
+        }
+    }
+    let status = run_attached_harness(selected, options).await?;
+    Ok(ExitCode::from(status.code().unwrap_or(1).try_into().unwrap_or(1)))
 }
 
 async fn run_harness(harness: HarnessCommand) -> Result<ExitCode, Error> {

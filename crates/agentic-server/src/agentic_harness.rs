@@ -7,9 +7,12 @@ use std::{
 #[derive(Debug)]
 pub struct HarnessEnv {
     pub environment: BTreeMap<String, String>,
+    pub environment_remove: Vec<String>,
     pub files: Vec<PathBuf>,
     pub summary: String,
 }
+
+pub const CLAUDE_CANONICAL_MODEL: &str = "claude-sonnet-4-5-20250929";
 
 /// Write an isolated Codex home for an Agentic API session.
 ///
@@ -96,59 +99,85 @@ wire_api = \"responses\"\nrequires_openai_auth = {requires_auth}\nsupports_webso
 
     Ok(HarnessEnv {
         environment,
+        environment_remove: Vec::new(),
         files: vec![config_path, catalog_path],
         summary: format!("Codex home: {} (model: {model})", root.display()),
     })
 }
 
-#[must_use]
-pub fn prepare_claude_env(gateway_url: &str, model: &str, api_key: Option<&str>) -> HarnessEnv {
-    let auth_token = std::env::var("ANTHROPIC_AUTH_TOKEN")
-        .ok()
-        .or_else(|| api_key.map(str::to_owned))
-        .unwrap_or_else(|| "agentic-api-local".to_owned());
+/// Write an isolated Claude Code configuration for an Agentic API session.
+///
+/// # Errors
+///
+/// Returns an I/O error when the temporary configuration directory or settings file cannot be written.
+pub fn prepare_claude_home(
+    root: &Path,
+    gateway_url: &str,
+    model: &str,
+    api_key: Option<&str>,
+) -> Result<HarnessEnv, io::Error> {
+    fs::create_dir_all(root)?;
+    let settings_path = root.join("settings.json");
+    let settings = serde_json::json!({
+        "modelOverrides": {
+            CLAUDE_CANONICAL_MODEL: model,
+        }
+    });
+    let settings_bytes = serde_json::to_vec_pretty(&settings).map_err(io::Error::other)?;
+    fs::write(&settings_path, settings_bytes).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "failed to write Claude Code settings {}: {error}",
+                settings_path.display()
+            ),
+        )
+    })?;
+
+    let auth_token = api_key.unwrap_or("agentic-api-local");
     let mut environment = BTreeMap::from([
         (
             "ANTHROPIC_BASE_URL".to_owned(),
             gateway_url.trim_end_matches('/').to_owned(),
         ),
-        ("ANTHROPIC_MODEL".to_owned(), model.to_owned()),
-        ("ANTHROPIC_SMALL_FAST_MODEL".to_owned(), model.to_owned()),
-        ("ANTHROPIC_DEFAULT_OPUS_MODEL".to_owned(), model.to_owned()),
-        ("ANTHROPIC_DEFAULT_SONNET_MODEL".to_owned(), model.to_owned()),
-        ("ANTHROPIC_DEFAULT_HAIKU_MODEL".to_owned(), model.to_owned()),
-        (
-            "ANTHROPIC_API_KEY".to_owned(),
-            api_key.unwrap_or("agentic-api-local").to_owned(),
-        ),
-        ("ANTHROPIC_AUTH_TOKEN".to_owned(), auth_token),
+        ("ANTHROPIC_API_KEY".to_owned(), auth_token.to_owned()),
+        ("ANTHROPIC_AUTH_TOKEN".to_owned(), auth_token.to_owned()),
+        ("CLAUDE_CONFIG_DIR".to_owned(), root.display().to_string()),
+        ("CLAUDE_CODE_MAX_CONTEXT_TOKENS".to_owned(), "32768".to_owned()),
+        ("CLAUDE_CODE_MAX_OUTPUT_TOKENS".to_owned(), "2048".to_owned()),
+        ("MAX_THINKING_TOKENS".to_owned(), "0".to_owned()),
     ]);
     if let Some(api_key) = api_key {
         environment.insert("OPENAI_API_KEY".to_owned(), api_key.to_owned());
     }
-    HarnessEnv {
+    Ok(HarnessEnv {
         environment,
-        files: Vec::new(),
+        environment_remove: [
+            "CLAUDE_CODE_USE_VERTEX",
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_USE_FOUNDRY",
+            "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+            "CLAUDE_CODE_USE_MANTLE",
+            "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST",
+            "ANTHROPIC_VERTEX_PROJECT_ID",
+            "CLOUD_ML_REGION",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "ANTHROPIC_MODEL",
+            "ANTHROPIC_SMALL_FAST_MODEL",
+            "ANTHROPIC_DEFAULT_OPUS_MODEL",
+            "ANTHROPIC_DEFAULT_SONNET_MODEL",
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect(),
+        files: vec![settings_path],
         summary: format!(
-            "Claude Code gateway: {} (model: {model})",
+            "Claude Code config: {} (gateway: {}, model: {model})",
+            root.display(),
             gateway_url.trim_end_matches('/')
         ),
-    }
-}
-
-/// Validates that a Claude Code model name is a slash-free served alias.
-///
-/// # Errors
-///
-/// Returns an error when the model name contains `/`, which Claude Code does not
-/// accept for custom model names.
-pub fn validate_claude_model(model: &str) -> Result<(), String> {
-    if model.contains('/') {
-        return Err(format!(
-            "Claude Code requires a slash-free served model alias; start vLLM with --served-model-name and set --model to that alias (received {model})"
-        ));
-    }
-    Ok(())
+    })
 }
 
 fn toml_escape(value: &str) -> String {
@@ -159,7 +188,7 @@ fn toml_escape(value: &str) -> String {
 mod tests {
     use std::fs;
 
-    use super::{prepare_claude_env, prepare_codex_home};
+    use super::{prepare_claude_home, prepare_codex_home};
 
     #[test]
     fn codex_config_is_isolated_and_contains_gateway_provider() {
@@ -178,38 +207,73 @@ mod tests {
     }
 
     #[test]
-    fn claude_environment_uses_gateway_and_does_not_expose_key() {
-        let env = prepare_claude_env("http://127.0.0.1:3000", "Qwen/test", Some("secret-key"));
+    fn claude_home_is_isolated_and_maps_the_canonical_model() {
+        let root = unique_temp_dir("claude");
+        let env = prepare_claude_home(&root, "http://127.0.0.1:3000", "Qwen/test", Some("secret-key"))
+            .expect("Claude config");
+        let settings = fs::read_to_string(root.join("settings.json")).expect("settings file");
+        let settings: serde_json::Value = serde_json::from_str(&settings).expect("valid settings JSON");
 
         assert_eq!(
             env.environment.get("ANTHROPIC_BASE_URL"),
             Some(&"http://127.0.0.1:3000".to_owned())
         );
-        assert_eq!(env.environment.get("ANTHROPIC_MODEL"), Some(&"Qwen/test".to_owned()));
         assert_eq!(
-            env.environment.get("ANTHROPIC_DEFAULT_OPUS_MODEL"),
-            Some(&"Qwen/test".to_owned())
+            env.environment.get("CLAUDE_CONFIG_DIR"),
+            Some(&root.display().to_string())
         );
         assert_eq!(
-            env.environment.get("ANTHROPIC_DEFAULT_SONNET_MODEL"),
-            Some(&"Qwen/test".to_owned())
+            env.environment.get("CLAUDE_CODE_MAX_CONTEXT_TOKENS"),
+            Some(&"32768".to_owned())
         );
         assert_eq!(
-            env.environment.get("ANTHROPIC_DEFAULT_HAIKU_MODEL"),
-            Some(&"Qwen/test".to_owned())
+            env.environment.get("CLAUDE_CODE_MAX_OUTPUT_TOKENS"),
+            Some(&"2048".to_owned())
         );
+        assert_eq!(env.environment.get("MAX_THINKING_TOKENS"), Some(&"0".to_owned()));
         assert_eq!(env.environment.get("ANTHROPIC_API_KEY"), Some(&"secret-key".to_owned()));
         assert_eq!(
             env.environment.get("ANTHROPIC_AUTH_TOKEN"),
             Some(&"secret-key".to_owned())
         );
+        assert_eq!(settings["modelOverrides"]["claude-sonnet-4-5-20250929"], "Qwen/test");
+        assert!(env.environment_remove.contains(&"CLAUDE_CODE_USE_VERTEX".to_owned()));
+        assert!(
+            env.environment_remove
+                .contains(&"CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST".to_owned())
+        );
+        assert!(
+            env.environment_remove
+                .contains(&"CLAUDE_CODE_USE_ANTHROPIC_AWS".to_owned())
+        );
+        assert!(env.environment_remove.contains(&"CLAUDE_CODE_USE_MANTLE".to_owned()));
+        assert!(
+            env.environment_remove
+                .contains(&"ANTHROPIC_VERTEX_PROJECT_ID".to_owned())
+        );
+        assert!(env.environment_remove.contains(&"CLOUD_ML_REGION".to_owned()));
+        assert!(env.environment_remove.contains(&"ANTHROPIC_MODEL".to_owned()));
         assert!(!env.summary.contains("secret-key"));
+
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
-    fn claude_model_requires_a_served_alias() {
-        assert!(super::validate_claude_model("Qwen/test").is_err());
-        assert!(super::validate_claude_model("Qwen-test").is_ok());
+    fn claude_home_uses_a_local_placeholder_without_inherited_auth() {
+        let root = unique_temp_dir("claude-no-key");
+        let env = prepare_claude_home(&root, "http://127.0.0.1:3000", "Qwen/test", None).expect("Claude config");
+
+        assert_eq!(
+            env.environment.get("ANTHROPIC_API_KEY"),
+            Some(&"agentic-api-local".to_owned())
+        );
+        assert_eq!(
+            env.environment.get("ANTHROPIC_AUTH_TOKEN"),
+            Some(&"agentic-api-local".to_owned())
+        );
+        assert!(!env.environment.contains_key("OPENAI_API_KEY"));
+
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     fn unique_temp_dir(name: &str) -> std::path::PathBuf {
