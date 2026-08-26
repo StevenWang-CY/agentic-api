@@ -7,6 +7,7 @@ from dataclasses import asdict, dataclass
 from importlib.metadata import PackageNotFoundError, version as metadata_version
 from pathlib import Path
 
+from agentic_api import __version__
 from agentic_api.binary import (
     PackagedBinaryNotFoundError,
     PackagedBinaryVersionError,
@@ -123,8 +124,8 @@ def _rust_binary_details() -> tuple[str, bool, str]:
 
 def _local_health(installed_vllm_version: str, vllm_executable_path: str) -> tuple[bool, str]:
     install_hint = (
-        "Install the 0.4.0 wheel artifact with its local extra: "
-        '`uv pip install "agentic-api[local] @ file:///path/to/agentic_api-0.4.0-PLATFORM.whl"`.'
+        "Install the agentic-api wheel artifact with its local extra: "
+        '`uv pip install "agentic-api[local] @ file:///path/to/agentic_api-PLATFORM.whl"`.'
     )
     if installed_vllm_version == "not installed":
         return (False, install_hint)

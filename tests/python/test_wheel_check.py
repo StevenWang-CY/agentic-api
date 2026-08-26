@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import stat
 import subprocess
 import sys
@@ -14,6 +15,10 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CHECK_SCRIPT = REPO_ROOT / "scripts" / "check-python-wheel.sh"
 EXPECTED_VERSION = "0.4.0"
+WORKSPACE_VERSION = re.search(
+    r'(?ms)^\[workspace\.package\].*?^version\s*=\s*"([^"]+)"',
+    (REPO_ROOT / "Cargo.toml").read_text(encoding="utf-8"),
+).group(1)
 
 
 def test_check_python_wheel_accepts_expected_wheel_and_installed_environment(tmp_path: Path) -> None:
@@ -118,13 +123,22 @@ def test_check_python_wheel_rejects_an_unexpected_platform_tag(tmp_path: Path) -
 
 
 def test_check_python_wheel_validates_workspace_versions_outside_repository_cwd(tmp_path: Path) -> None:
-    wheel_path = _write_fake_wheel(tmp_path / "agentic_api-0.4.0-py3-none-any.whl")
-    site_packages = _write_fake_site_packages(tmp_path / "site-packages")
-    scripts_dir = _write_fake_scripts(tmp_path / "bin")
+    wheel_path = _write_fake_wheel(
+        tmp_path / f"agentic_api-{WORKSPACE_VERSION}-py3-none-any.whl",
+        version=WORKSPACE_VERSION,
+    )
+    site_packages = _write_fake_site_packages(tmp_path / "site-packages", version=WORKSPACE_VERSION)
+    scripts_dir = _write_fake_scripts(tmp_path / "bin", version=WORKSPACE_VERSION)
     outside_repo = tmp_path / "outside-repo"
     outside_repo.mkdir()
 
-    result = _run_check_script(wheel_path, site_packages, scripts_dir, cwd=outside_repo)
+    result = _run_check_script(
+        wheel_path,
+        site_packages,
+        scripts_dir,
+        cwd=outside_repo,
+        expected_version=WORKSPACE_VERSION,
+    )
 
     assert result.returncode == 0, result.stderr
     assert "wheel validation passed" in result.stdout
@@ -138,11 +152,12 @@ def _run_check_script(
     cargo_metadata_path: Path | None = None,
     expected_wheel_tag: str | None = None,
     cwd: Path = REPO_ROOT,
+    expected_version: str = EXPECTED_VERSION,
 ) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     env["AGENTIC_API_CHECK_PYTHON"] = sys.executable
     env["AGENTIC_API_CHECK_SCRIPTS_DIR"] = str(scripts_dir)
-    env["AGENTIC_API_EXPECTED_VERSION"] = EXPECTED_VERSION
+    env["AGENTIC_API_EXPECTED_VERSION"] = expected_version
     env["PYTHONPATH"] = str(site_packages)
     if cargo_metadata_path is not None:
         env["AGENTIC_API_CHECK_CARGO_METADATA_JSON"] = str(cargo_metadata_path)
@@ -159,24 +174,31 @@ def _run_check_script(
     )
 
 
-def _write_fake_wheel(path: Path, extra_entries: dict[str, str] | None = None) -> Path:
+def _write_fake_wheel(
+    path: Path,
+    extra_entries: dict[str, str] | None = None,
+    *,
+    version: str = EXPECTED_VERSION,
+) -> Path:
+    dist_info = f"agentic_api-{version}.dist-info"
+    data_dir = f"agentic_api-{version}.data"
     entries = {
-        "agentic_api/__init__.py": "__version__ = '0.4.0'\n",
-        "agentic_api-0.4.0.dist-info/METADATA": textwrap.dedent(
-            """\
+        "agentic_api/__init__.py": f"__version__ = '{version}'\n",
+        f"{dist_info}/METADATA": textwrap.dedent(
+            f"""\
             Metadata-Version: 2.3
             Name: agentic-api
-            Version: 0.4.0
+            Version: {version}
             """
         ),
-        "agentic_api-0.4.0.dist-info/entry_points.txt": textwrap.dedent(
+        f"{dist_info}/entry_points.txt": textwrap.dedent(
             """\
             [console_scripts]
             agentic-api = agentic_api.cli:main
             """
         ),
-        "agentic_api-0.4.0.data/scripts/agentic": "",
-        "agentic_api-0.4.0.data/scripts/agentic-server": "",
+        f"{data_dir}/scripts/agentic": "",
+        f"{data_dir}/scripts/agentic-server": "",
     }
     if extra_entries is not None:
         entries.update(extra_entries)
@@ -187,19 +209,19 @@ def _write_fake_wheel(path: Path, extra_entries: dict[str, str] | None = None) -
     return path
 
 
-def _write_fake_site_packages(path: Path) -> Path:
+def _write_fake_site_packages(path: Path, *, version: str = EXPECTED_VERSION) -> Path:
     package_dir = path / "agentic_api"
     package_dir.mkdir(parents=True)
-    (package_dir / "__init__.py").write_text("__version__ = '0.4.0'\n", encoding="utf-8")
+    (package_dir / "__init__.py").write_text(f"__version__ = '{version}'\n", encoding="utf-8")
 
-    dist_info = path / "agentic_api-0.4.0.dist-info"
+    dist_info = path / f"agentic_api-{version}.dist-info"
     dist_info.mkdir()
     (dist_info / "METADATA").write_text(
         textwrap.dedent(
-            """\
+            f"""\
             Metadata-Version: 2.3
             Name: agentic-api
-            Version: 0.4.0
+            Version: {version}
             """
         ),
         encoding="utf-8",
@@ -230,41 +252,41 @@ def _write_fake_cargo_metadata(
     return path
 
 
-def _write_fake_scripts(path: Path) -> Path:
+def _write_fake_scripts(path: Path, *, version: str = EXPECTED_VERSION) -> Path:
     path.mkdir(parents=True)
     _write_executable(
         path / "agentic",
-        """
+        f"""
         #!/usr/bin/env python3
         import sys
 
         if sys.argv[1:] == ["--version"]:
-            print("agentic 0.4.0")
+            print("agentic {version}")
             raise SystemExit(0)
         raise SystemExit(1)
         """,
     )
     _write_executable(
         path / "agentic-server",
-        """
+        f"""
         #!/usr/bin/env python3
         import sys
 
         if sys.argv[1:] == ["--version"]:
-            print("agentic-server 0.4.0")
+            print("agentic-server {version}")
             raise SystemExit(0)
         raise SystemExit(1)
         """,
     )
     _write_executable(
         path / "agentic-api",
-        """
+        f"""
         #!/usr/bin/env python3
         import sys
 
         if sys.argv[1:] == ["version"]:
-            print("agentic-api version: 0.4.0")
-            print("Rust binary version: agentic-server 0.4.0")
+            print("agentic-api version: {version}")
+            print("Rust binary version: agentic-server {version}")
             print("Supported vLLM version: 0.11.0")
             print("Installed vLLM version: not installed")
             raise SystemExit(0)

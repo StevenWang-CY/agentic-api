@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -10,11 +11,14 @@ VALIDATOR = REPO_ROOT / "scripts" / "validate-python-release-version.sh"
 RELEASE_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "release-python.yml"
 PYTHON_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "python.yml"
 BUILD_CONSTRAINTS = REPO_ROOT / "python-build-constraints.txt"
+WORKSPACE_VERSION = re.search(
+    r"(?ms)^\[workspace\.package\].*?^version\s*=\s*\"([^\"]+)\"", (REPO_ROOT / "Cargo.toml").read_text()
+).group(1)
 
 
 def test_release_version_validator_accepts_build_only_version() -> None:
     env = os.environ.copy()
-    env["AGENTIC_API_RELEASE_VERSION"] = "0.4.0"
+    env["AGENTIC_API_RELEASE_VERSION"] = WORKSPACE_VERSION
 
     result = subprocess.run(["/bin/bash", str(VALIDATOR)], env=env, capture_output=True, text=True, check=False)
 
@@ -24,13 +28,13 @@ def test_release_version_validator_accepts_build_only_version() -> None:
 def test_release_version_validator_rejects_shell_payload_without_executing_it(tmp_path: Path) -> None:
     marker = tmp_path / "injected"
     env = os.environ.copy()
-    env["AGENTIC_API_RELEASE_VERSION"] = f"0.4.0; touch {marker}"
+    env["AGENTIC_API_RELEASE_VERSION"] = f"{WORKSPACE_VERSION}; touch {marker}"
 
     result = subprocess.run(["/bin/bash", str(VALIDATOR)], env=env, capture_output=True, text=True, check=False)
 
     assert result.returncode != 0
     assert not marker.exists()
-    assert "0.4.0 build-only workflow" in result.stderr
+    assert f"{WORKSPACE_VERSION} build-only workflow" in result.stderr
 
 
 def test_release_workflow_keeps_dispatch_version_out_of_shell_source() -> None:

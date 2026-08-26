@@ -2,7 +2,18 @@
 set -euo pipefail
 
 requested_version="${AGENTIC_API_RELEASE_VERSION:-}"
-if [[ "$requested_version" != "0.4.0" ]]; then
-  echo "release-python.yml is a 0.4.0 build-only workflow; other versions are rejected" >&2
+workspace_version="$(awk '
+  $0 == "[workspace.package]" { in_section = 1; next }
+  in_section && /^\[/ { in_section = 0 }
+  in_section && $1 == "version" { gsub(/"/, "", $3); print $3; exit }
+' Cargo.toml)"
+
+if [[ -z "$workspace_version" ]]; then
+  echo "unable to determine the Cargo workspace version" >&2
+  exit 1
+fi
+
+if [[ "$requested_version" != "$workspace_version" ]]; then
+  echo "release-python.yml is a ${workspace_version} build-only workflow; requested version does not match" >&2
   exit 1
 fi

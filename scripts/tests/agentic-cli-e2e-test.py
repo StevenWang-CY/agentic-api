@@ -174,7 +174,7 @@ def run_harness(agentic: Path, mode: str, upstream: str, temp: Path, harness: Pa
     assert result.read_text() == f"{mode} passed\n"
 
 
-def run_python_source_install(repo: Path, temp: Path) -> None:
+def run_python_source_install(repo: Path, temp: Path, expected_version: str) -> None:
     """Install the Python package from this checkout and exercise its public CLI."""
 
     environment = temp / "python-source-environment"
@@ -211,7 +211,7 @@ def run_python_source_install(repo: Path, temp: Path) -> None:
         )
 
     import_check = subprocess.run(
-        [str(python), "-c", "import agentic_api; assert agentic_api.__version__ == '0.4.0'"],
+        [str(python), "-c", f"import agentic_api; assert agentic_api.__version__ == {expected_version!r}"],
         capture_output=True,
         text=True,
         timeout=30,
@@ -227,7 +227,7 @@ def run_python_source_install(repo: Path, temp: Path) -> None:
         text=True,
         timeout=30,
     )
-    if version_check.returncode != 0 or version_check.stdout.strip() != "agentic-api 0.4.0":
+    if version_check.returncode != 0 or version_check.stdout.strip() != f"agentic-api {expected_version}":
         raise AssertionError(
             f"source-installed agentic-api --version failed\n{version_check.stdout}\n{version_check.stderr}"
         )
@@ -249,9 +249,20 @@ def main() -> None:
     agentic = Path(os.environ.get("AGENTIC_BIN", repo / "target/debug/agentic"))
     if not agentic.is_file():
         raise SystemExit(f"missing {agentic}; run cargo build --bins first")
+    metadata = subprocess.run(
+        ["cargo", "metadata", "--format-version", "1", "--no-deps", "--manifest-path", str(repo / "Cargo.toml")],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    expected_version = next(
+        package["version"]
+        for package in json.loads(metadata.stdout)["packages"]
+        if package["name"] == "agentic-server"
+    )
     with tempfile.TemporaryDirectory(prefix="agentic-cli-e2e-") as directory:
         temp = Path(directory)
-        run_python_source_install(repo, temp)
+        run_python_source_install(repo, temp, expected_version)
         harness = temp / "fake-harness"
         harness.write_text(HARNESS)
         harness.chmod(0o755)

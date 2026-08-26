@@ -18,7 +18,7 @@ def test_documented_python_install_commands_respect_release_publication_gate() -
 
     assert 'uv pip install "$WHEEL_PATH"' in combined
     assert 'agentic-api[local] @ file://$WHEEL_PATH' in combined
-    assert "0.4.0 is a build-only release" in combined
+    assert "This release produces wheel artifacts" in combined
     assert "Planned for 0.5.0" in combined
     assert "after the PyPI publication gate" in combined
     assert "uv pip install agentic-api" in combined

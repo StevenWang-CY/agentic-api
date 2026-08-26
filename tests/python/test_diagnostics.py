@@ -56,8 +56,8 @@ def test_local_doctor_reports_missing_vllm_installation(
     assert exit_code == 1
     assert "Selected mode: local" in output
     assert "Local mode health: unavailable" in output
-    assert "Install the 0.4.0 wheel artifact with its local extra" in output
-    assert "file:///path/to/agentic_api-0.4.0-PLATFORM.whl" in output
+    assert "Install the agentic-api wheel artifact with its local extra" in output
+    assert "file:///path/to/agentic_api-PLATFORM.whl" in output
 
 
 def test_local_doctor_reports_incompatible_vllm_version(

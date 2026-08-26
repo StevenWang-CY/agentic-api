@@ -4,6 +4,7 @@ from dataclasses import asdict
 
 import pytest
 
+from agentic_api import __version__
 from agentic_api.cli import ServeOptions, build_parser, main
 
 
@@ -206,7 +207,7 @@ def test_top_level_version_flag_prints_package_version(capsys: pytest.CaptureFix
     exit_code = main(["--version"])
 
     assert exit_code == 0
-    assert capsys.readouterr().out == "agentic-api 0.4.0\n"
+    assert capsys.readouterr().out == f"agentic-api {__version__}\n"
 
 
 def test_version_subcommand_reports_missing_binary_without_traceback(

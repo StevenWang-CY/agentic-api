@@ -6,13 +6,13 @@ backend, not part of the Agentic API product name. Use the base wheel when you w
 
 The Rust-native `agentic` CLI remains supported for `run codex`, `run claude`, `serve`, and `validate`.
 
-## Install the 0.4.0 artifact
+## Install the release artifact
 
-0.4.0 is a build-only release. It produces wheel artifacts for supported platforms but does not publish them to PyPI.
+This release produces wheel artifacts for supported platforms but does not publish them to PyPI.
 Download the wheel for your platform from the release workflow and use its absolute path below:
 
 ```bash
-WHEEL_PATH=/absolute/path/to/agentic_api-0.4.0-PLATFORM.whl
+WHEEL_PATH=/absolute/path/to/agentic_api-PLATFORM.whl
 ```
 
 ### Install the base package
@@ -50,7 +50,7 @@ agentic-api serve --model Qwen/Qwen3-30B-A3B-FP8 -- \
 ## Planned for 0.5.0
 
 The following public-index installation and `uvx` commands are planned for 0.5.0. Use them only after the PyPI
-publication gate has passed; they do not work for the unpublished 0.4.0 distribution:
+publication gate has passed; they do not work until the package is published:
 
 ```bash
 uv pip install agentic-api

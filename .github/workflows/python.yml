@@ -82,20 +82,25 @@ jobs:
         run: python -m pip install --constraint python-build-constraints.txt uv
 
       - name: Build and validate wheel
-        env:
-          AGENTIC_API_EXPECTED_VERSION: "0.4.0"
         run: |
           set -euo pipefail
+          expected_version="$(cargo metadata --format-version 1 --no-deps \
+            | jq -r '.packages[] | select(.name == "agentic-server") | .version')"
+          if [ -z "$expected_version" ] || [ "$expected_version" = "null" ]; then
+            echo "::error::agentic-server workspace version could not be determined"
+            exit 1
+          fi
           uv venv --python "${{ matrix.python-version }}" .venv
           uv pip install --python .venv/bin/python --constraint python-build-constraints.txt maturin pytest
           wheel_dir="$RUNNER_TEMP/agentic-api-wheels-${{ matrix.python-version }}"
           mkdir -p "$wheel_dir"
           .venv/bin/python -m maturin build --release --locked --out "$wheel_dir"
           wheel_path="$(
-            .venv/bin/python -c 'from pathlib import Path; import sys; matches = sorted(Path(sys.argv[1]).glob("agentic_api-0.4.0-*.whl")); assert len(matches) == 1, f"expected exactly one wheel, found {[path.name for path in matches]}"; print(matches[0])' "$wheel_dir"
+            .venv/bin/python -c 'from pathlib import Path; import sys; matches = sorted(Path(sys.argv[1]).glob(f"agentic_api-{sys.argv[2]}-*.whl")); assert len(matches) == 1, f"expected exactly one wheel, found {[path.name for path in matches]}"; print(matches[0])' "$wheel_dir" "$expected_version"
           )"
           uv pip install --python .venv/bin/python "$wheel_path"
           AGENTIC_API_TEST_WHEEL="$wheel_path" .venv/bin/python -m pytest tests/python -q
           AGENTIC_API_CHECK_PYTHON=.venv/bin/python \
             AGENTIC_API_CHECK_SCRIPTS_DIR=.venv/bin \
+            AGENTIC_API_EXPECTED_VERSION="$expected_version" \
             scripts/check-python-wheel.sh "$wheel_path"
