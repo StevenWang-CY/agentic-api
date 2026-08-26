@@ -124,6 +124,8 @@ def test_agentic_api_serve_uses_discovered_packaged_server_without_importing_vll
             "argv": [
                 "--llm-api-base",
                 "https://upstream.example.test/base",
+                "--llm-ready-timeout-s",
+                "600.0",
                 "--gateway-host",
                 "127.0.0.1",
                 "--gateway-port",
