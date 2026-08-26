@@ -122,8 +122,8 @@ permission checks and disables Codex approvals and sandboxing.
 
 ### Python distribution
 
-The `agentic-api` wheel packages the Rust gateway and a small Python launcher. This release includes 0.5.0 build-only
-wheel artifacts: download the wheel for your platform from the release workflow, then install that local file. It is
+The `agentic-api` wheel packages the Rust gateway and a small Python launcher. This release produces wheel artifacts
+for 0.5.0 as a build-only release: download the wheel for your platform from the release workflow, then install that local file. It is
 not published on PyPI yet.
 
 ```bash
@@ -143,7 +143,7 @@ script needs machine-readable diagnostics.
 
 #### After PyPI publication
 
-These public-index and `uvx` examples apply only after a future PyPI publication:
+These public-index and `uvx` examples apply only after the PyPI publication gate for a future release:
 
 ```bash
 uv pip install agentic-api

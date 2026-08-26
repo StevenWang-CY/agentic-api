@@ -8,7 +8,7 @@ The Rust-native `agentic` CLI remains supported for `run codex`, `run claude`, `
 
 ## Install the release artifact
 
-This 0.5.0 release produces wheel artifacts for supported platforms but does not publish them to PyPI yet.
+This release produces wheel artifacts for 0.5.0 on supported platforms but does not publish them to PyPI yet.
 Download the wheel for your platform from the release workflow and use its absolute path below:
 
 ```bash
@@ -49,8 +49,8 @@ agentic-api serve --model Qwen/Qwen3-30B-A3B-FP8 -- \
 
 ## After PyPI publication
 
-The following public-index installation and `uvx` commands apply after a future PyPI publication. They do not work
-until the package is published:
+The following public-index installation and `uvx` commands apply after the PyPI publication gate for a future release.
+They do not work until the package is published:
 
 ```bash
 uv pip install agentic-api

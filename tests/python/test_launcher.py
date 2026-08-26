@@ -282,6 +282,7 @@ def test_run_serve_reports_readiness_timeout_without_traceback(
     supervisor = FakeSupervisor()
 
     monkeypatch.setattr(launcher, "ProcessSupervisor", lambda: supervisor)
+    monkeypatch.setattr(launcher, "find_packaged_binary", lambda name: Path("/pkg/bin/agentic-server"))
     monkeypatch.setattr(launcher, "find_active_environment_executable", lambda name: Path("/venv/bin/vllm"))
     monkeypatch.setattr(launcher, "_installed_vllm_version", lambda: "0.11.0")
     monkeypatch.setattr(
