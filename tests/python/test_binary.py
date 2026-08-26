@@ -69,6 +69,26 @@ def test_find_packaged_binary_does_not_use_an_ambient_path_binary(
         find_packaged_binary("agentic-server")
 
 
+def test_find_packaged_binary_finds_sibling_of_console_script(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    scripts_dir = tmp_path / "prefix" / "bin"
+    scripts_dir.mkdir(parents=True)
+    packaged_binary = scripts_dir / "agentic-server"
+    packaged_binary.write_text("#!/bin/sh\nexit 0\n")
+    packaged_binary.chmod(0o755)
+    console_script = scripts_dir / "agentic-api"
+    console_script.write_text("#!/bin/sh\nexit 0\n")
+    console_script.chmod(0o755)
+
+    monkeypatch.setattr("agentic_api.binary.sysconfig.get_path", lambda name: str(tmp_path / "host" / "bin"))
+    monkeypatch.setattr("agentic_api.binary.sys.executable", str(tmp_path / "host" / "bin" / "python"))
+    monkeypatch.setattr("agentic_api.binary.sys.argv", [str(console_script)])
+    monkeypatch.setattr("agentic_api.binary.shutil.which", lambda name: None)
+
+    assert find_packaged_binary("agentic-server") == packaged_binary
+
+
 def test_read_binary_version_returns_first_line_from_version_output(tmp_path: Path) -> None:
     binary = tmp_path / "agentic-server"
     binary.write_text("#!/bin/sh\nprintf 'agentic-server 0.4.0\\nextra detail\\n'\n")
