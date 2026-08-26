@@ -38,8 +38,8 @@ Our first milestone is implementing the [Responses API](https://platform.openai.
 The `agentic-api` wheel packages the Rust gateway and a small Python launcher. Use the base package for proxy-only
 installations, and the `[local]` extra when you want the launcher to manage a local vLLM process.
 
-- The 0.4.0 build-only release is installed from downloaded wheel artifacts and is not published on PyPI
-- [Python installation and workflows](guides/python-installation.md) for current artifact installs, the future 0.5.0 public-index gate, `doctor`, and known-good model profiles
+- The Python distribution is currently installed from downloaded wheel artifacts and is not published on PyPI
+- [Python installation and workflows](guides/python-installation.md) for current artifact installs, the PyPI publication gate, `doctor`, and known-good model profiles
 - The Rust-native `agentic` CLI remains supported for `serve`, `run codex`, `run claude`, and `validate`
 - vLLM is a supported backend, not part of the Agentic API product name
 

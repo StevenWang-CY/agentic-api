@@ -141,9 +141,9 @@ the launcher can manage a local vLLM process on supported Linux hosts.
 Use `agentic-api --version` for a quick install check and `agentic-api doctor --mode remote --json` when an agent or
 script needs machine-readable diagnostics.
 
-#### Planned for 0.5.0
+#### After PyPI publication
 
-These public-index and `uvx` examples apply only after the PyPI publication gate for 0.5.0 passes:
+These public-index and `uvx` examples apply only after the PyPI publication gate passes:
 
 ```bash
 uv pip install agentic-api

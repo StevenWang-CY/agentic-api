@@ -53,7 +53,7 @@ def run_serve(options: ServeOptions) -> int:
         signal_exit_code = _signal_exit_code(signal.SIGINT)
         supervisor.request_shutdown(signal.SIGINT)
         return signal_exit_code
-    except (FileNotFoundError, PackagedBinaryNotFoundError, RuntimeError, ValueError) as error:
+    except (OSError, PackagedBinaryNotFoundError, RuntimeError, ValueError) as error:
         if signal_exit_code is not None:
             return signal_exit_code
         print(str(error), file=sys.stderr)

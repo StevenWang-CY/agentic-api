@@ -47,10 +47,10 @@ agentic-api serve --model Qwen/Qwen3-30B-A3B-FP8 -- \
   --max-model-len=32768
 ```
 
-## Planned for 0.5.0
+## After PyPI publication
 
-The following public-index installation and `uvx` commands are planned for 0.5.0. Use them only after the PyPI
-publication gate has passed; they do not work until the package is published:
+The following public-index installation and `uvx` commands work after the PyPI publication gate has passed. They do
+not work until the package is published:
 
 ```bash
 uv pip install agentic-api

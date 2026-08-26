@@ -234,6 +234,32 @@ def test_run_serve_reports_startup_failure_and_cleans_up_started_children(
     assert supervisor.terminate_timeout == 10.0
 
 
+def test_run_serve_reports_readiness_timeout_without_traceback(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import agentic_api.launcher as launcher
+
+    supervisor = FakeSupervisor()
+
+    monkeypatch.setattr(launcher, "ProcessSupervisor", lambda: supervisor)
+    monkeypatch.setattr(launcher, "find_active_environment_executable", lambda name: Path("/venv/bin/vllm"))
+    monkeypatch.setattr(launcher, "_installed_vllm_version", lambda: "0.11.0")
+    monkeypatch.setattr(launcher.secrets, "token_urlsafe", lambda _: "generated-token")
+    monkeypatch.setattr(
+        launcher,
+        "wait_for_vllm_ready",
+        lambda *args, **kwargs: (_ for _ in ()).throw(TimeoutError("timed out waiting for vLLM readiness")),
+    )
+    monkeypatch.setattr(launcher.signal, "signal", lambda sig, handler: handler)
+
+    exit_code = launcher.run_serve(make_options())
+
+    assert exit_code == 1
+    assert capsys.readouterr().err == "timed out waiting for vLLM readiness\n"
+    assert len(supervisor.starts) == 1
+    assert supervisor.terminate_timeout == 10.0
+
+
 def test_run_serve_restores_prior_signal_handlers(monkeypatch: pytest.MonkeyPatch) -> None:
     import agentic_api.launcher as launcher
 
