@@ -9,6 +9,7 @@ from pathlib import Path
 
 
 REMEDIATION_MESSAGE = "Reinstall agentic-api for this platform"
+BINARY_VERSION_TIMEOUT_S = 5.0
 
 
 class PackagedBinaryNotFoundError(FileNotFoundError):
@@ -41,9 +42,12 @@ def read_binary_version(path: Path) -> str:
             check=True,
             capture_output=True,
             text=True,
+            timeout=BINARY_VERSION_TIMEOUT_S,
         )
     except OSError as error:  # pragma: no cover - exercised via unit tests.
         raise PackagedBinaryVersionError(f"unable to launch {path}: {error.strerror or error}") from error
+    except subprocess.TimeoutExpired as error:
+        raise PackagedBinaryVersionError(f"{path} timed out while reporting its version") from error
     except subprocess.CalledProcessError as error:
         raise PackagedBinaryVersionError(
             f"{path} exited with status {error.returncode} while reporting its version"

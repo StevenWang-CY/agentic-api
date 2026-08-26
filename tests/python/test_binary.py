@@ -57,3 +57,15 @@ def test_read_binary_version_returns_first_line_from_version_output(tmp_path: Pa
     binary.chmod(0o755)
 
     assert read_binary_version(binary) == "agentic-server 0.4.0"
+
+
+def test_read_binary_version_reports_a_hung_binary_without_waiting_forever(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    binary = tmp_path / "agentic-server"
+    binary.write_text("#!/bin/sh\nsleep 1\n")
+    binary.chmod(0o755)
+    monkeypatch.setattr("agentic_api.binary.BINARY_VERSION_TIMEOUT_S", 0.01)
+
+    with pytest.raises(RuntimeError, match="timed out while reporting its version"):
+        read_binary_version(binary)
