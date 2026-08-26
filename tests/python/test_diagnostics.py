@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 from pathlib import Path
 
 import pytest
@@ -149,6 +150,31 @@ def test_python_module_entrypoint_delegates_to_cli_main(monkeypatch: pytest.Monk
 
     assert module.main() == 7
     assert called == [None]
+
+
+def test_doctor_json_is_machine_readable_and_preserves_exit_status(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    rust_binary = tmp_path / "agentic-server"
+    rust_binary.write_text("")
+    rust_binary.chmod(0o755)
+
+    monkeypatch.setattr("agentic_api.diagnostics.find_packaged_binary", lambda name: rust_binary)
+    monkeypatch.setattr("agentic_api.diagnostics.read_binary_version", lambda path: "agentic-server 0.4.0")
+    monkeypatch.setattr("agentic_api.diagnostics.metadata_version", _metadata_version_without_vllm)
+    monkeypatch.setattr(
+        "agentic_api.diagnostics.find_active_environment_executable",
+        lambda name: (_ for _ in ()).throw(FileNotFoundError(name)),
+    )
+
+    exit_code = diagnostics.doctor("remote", json_output=True)
+    payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert payload["selected_mode"] == "remote"
+    assert payload["remote_ok"] is True
+    assert payload["local_ok"] is False
+    assert payload["package_version"] == "0.4.0"
 
 
 def _metadata_version_without_vllm(name: str) -> str:

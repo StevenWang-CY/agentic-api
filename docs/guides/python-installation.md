@@ -36,8 +36,8 @@ uv pip install "agentic-api[local] @ file://$WHEEL_PATH"
 agentic-api serve --model Qwen/Qwen3-30B-A3B-FP8
 ```
 
-The launcher still accepts arbitrary `--model` values. The `[local]` extra just supplies the tested vLLM dependency
-and makes the managed-vLLM workflow available.
+The launcher still accepts arbitrary `--model` values. The base package does not install vLLM; the `[local]` extra
+supplies the tested vLLM dependency and makes the managed-vLLM workflow available.
 
 Managed vLLM supports passthrough arguments after `--`:
 
@@ -68,6 +68,7 @@ whether the current mode is healthy.
 agentic-api doctor
 agentic-api doctor --mode remote
 agentic-api doctor --mode local
+agentic-api doctor --mode remote --json
 ```
 
 Use `--mode remote` when you only need the packaged Rust gateway checks. Use `--mode local` when you want to verify the

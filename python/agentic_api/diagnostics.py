@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import json
 import os
 import platform
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from importlib.metadata import PackageNotFoundError, version as metadata_version
 from pathlib import Path
 
@@ -33,9 +34,9 @@ class DoctorReport:
     remote_message: str
 
 
-def doctor(mode: str | None) -> int:
+def doctor(mode: str | None, *, json_output: bool = False) -> int:
     report = collect_doctor_report()
-    print(render_doctor_report(report, mode))
+    print(render_doctor_report(report, mode, json_output=json_output))
 
     if mode == "local":
         return 0 if report.local_ok else 1
@@ -71,7 +72,12 @@ def collect_doctor_report() -> DoctorReport:
     )
 
 
-def render_doctor_report(report: DoctorReport, mode: str | None) -> str:
+def render_doctor_report(report: DoctorReport, mode: str | None, *, json_output: bool = False) -> str:
+    if json_output:
+        payload = asdict(report)
+        payload["selected_mode"] = mode or "all"
+        return json.dumps(payload, sort_keys=True)
+
     local_health = "ok" if report.local_ok else "unavailable"
     remote_health = "ok" if report.remote_ok else "unavailable"
 

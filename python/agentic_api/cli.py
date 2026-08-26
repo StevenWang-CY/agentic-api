@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Sequence
 from urllib.parse import urlparse
 
+from agentic_api import __version__
 from agentic_api.diagnostics import doctor
 from agentic_api.version import version_report
 
@@ -52,6 +53,7 @@ class _AgenticArgumentParser(argparse.ArgumentParser):
 
 def build_parser() -> argparse.ArgumentParser:
     parser = _AgenticArgumentParser(prog="agentic-api", description="Python launcher for packaged Agentic API binaries")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     serve_parser = subparsers.add_parser("serve", help="Launch Agentic API in local or remote mode")
@@ -68,6 +70,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     doctor_parser = subparsers.add_parser("doctor", help="Report packaged binary and compatibility diagnostics")
     doctor_parser.add_argument("--mode", choices=("local", "remote"))
+    doctor_parser.add_argument(
+        "--json", action="store_true", dest="json_output", help="Emit a machine-readable JSON report"
+    )
 
     subparsers.add_parser("version", help="Print package and packaged binary versions")
     return parser
@@ -82,11 +87,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         return code if isinstance(code, int) else 1
 
     if namespace.command == "version":
-        print(version_report())
-        return 0
+        try:
+            print(version_report())
+            return 0
+        except (FileNotFoundError, RuntimeError) as error:
+            print(str(error), file=sys.stderr)
+            return 1
 
     if namespace.command == "doctor":
-        return doctor(namespace.mode)
+        return doctor(namespace.mode, json_output=namespace.json_output)
 
     if namespace.command == "serve":
         try:
@@ -171,9 +180,22 @@ def _bounded_timeout(value: str) -> float:
 
 
 def _normalize_base_url(parser: argparse.ArgumentParser, value: str) -> str:
-    parsed = urlparse(value)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+    if any(character.isspace() for character in value):
+        parser.error("--vllm-base-url must not contain whitespace")
+
+    try:
+        parsed = urlparse(value)
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError as error:
+        parser.error(f"--vllm-base-url is malformed: {error}")
+
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc or not hostname:
         parser.error("--vllm-base-url must be an http:// or https:// base URL")
+    if parsed.username is not None or parsed.password is not None:
+        parser.error("--vllm-base-url must not contain credentials; use an environment variable for API keys")
+    if port is not None and not 1 <= port <= 65_535:
+        parser.error("--vllm-base-url port must be between 1 and 65535")
     if parsed.query or parsed.fragment:
         parser.error("--vllm-base-url must not include a query string or fragment")
     return value.rstrip("/")

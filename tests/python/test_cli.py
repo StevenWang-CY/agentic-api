@@ -42,6 +42,23 @@ def test_serve_with_vllm_base_url_uses_remote_mode() -> None:
 
 
 @pytest.mark.parametrize(
+    "url",
+    [
+        "http://user:password@existing-vllm:8000",
+        "http://existing-vllm:99999",
+        "http://[invalid",
+        "http://existing vllm:8000",
+    ],
+)
+def test_serve_rejects_unsafe_or_malformed_remote_base_urls(url: str, capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        build_parser().parse_args(["serve", "--vllm-base-url", url])
+
+    assert exc_info.value.code == 2
+    assert "--vllm-base-url" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
     ("args", "message"),
     [
         ([], "exactly one of --model or --vllm-base-url is required"),
@@ -183,3 +200,32 @@ def test_version_subcommand_exits_successfully(
 
     assert exit_code == 0
     assert capsys.readouterr().out == "version report\n"
+
+
+def test_top_level_version_flag_prints_package_version(capsys: pytest.CaptureFixture[str]) -> None:
+    exit_code = main(["--version"])
+
+    assert exit_code == 0
+    assert capsys.readouterr().out == "agentic-api 0.4.0\n"
+
+
+def test_version_subcommand_reports_missing_binary_without_traceback(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(
+        "agentic_api.cli.version_report",
+        lambda: (_ for _ in ()).throw(FileNotFoundError("agentic-server not found")),
+    )
+
+    exit_code = main(["version"])
+
+    assert exit_code == 1
+    assert capsys.readouterr().err == "agentic-server not found\n"
+
+
+def test_doctor_json_flag_is_forwarded_to_diagnostics(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[str | None, bool]] = []
+    monkeypatch.setattr("agentic_api.cli.doctor", lambda mode, *, json_output: calls.append((mode, json_output)) or 0)
+
+    assert main(["doctor", "--mode", "remote", "--json"]) == 0
+    assert calls == [("remote", True)]

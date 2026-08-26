@@ -122,12 +122,12 @@ permission checks and disables Codex approvals and sandboxing.
 
 ### Python distribution
 
-The `agentic-api` wheel packages the Rust gateway and a small Python launcher. Version 0.4.0 is a build-only release:
-download the wheel artifact for your platform from the release workflow, then install that local file. It is not
+The `agentic-api` wheel packages the Rust gateway and a small Python launcher. This release includes build-only wheel
+artifacts: download the wheel for your platform from the release workflow, then install that local file. It is not
 published on PyPI.
 
 ```bash
-WHEEL_PATH=/absolute/path/to/agentic_api-0.4.0-PLATFORM.whl
+WHEEL_PATH=/absolute/path/to/agentic_api-PLATFORM.whl
 uv pip install "$WHEEL_PATH"
 agentic-api serve --vllm-base-url http://existing-vllm:8000
 
@@ -135,7 +135,11 @@ uv pip install "agentic-api[local] @ file://$WHEEL_PATH"
 agentic-api serve --model MODEL_ID
 ```
 
-The `[local]` extra is for supported Linux hosts where the launcher should manage a local vLLM process.
+The base install is for remote mode and does not install vLLM. The `[local]` extra installs the pinned vLLM runtime so
+the launcher can manage a local vLLM process on supported Linux hosts.
+
+Use `agentic-api --version` for a quick install check and `agentic-api doctor --mode remote --json` when an agent or
+script needs machine-readable diagnostics.
 
 #### Planned for 0.5.0
 
