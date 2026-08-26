@@ -440,7 +440,7 @@ def test_wait_for_vllm_ready_retries_request_timeouts_without_leaking_api_key(
     models_server: tuple[ThreadingHTTPServer, str]
 ) -> None:
     _, base_url = models_server
-    ModelsHandler.response_delay_s = 0.2
+    ModelsHandler.response_delay_s = 0.5
 
     with pytest.raises(TimeoutError) as exc_info:
         wait_for_vllm_ready(
