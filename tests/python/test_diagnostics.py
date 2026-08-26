@@ -49,6 +49,7 @@ def test_local_doctor_reports_missing_vllm_installation(
         "agentic_api.diagnostics.find_active_environment_executable",
         lambda name: (_ for _ in ()).throw(FileNotFoundError(name)),
     )
+    monkeypatch.setattr("agentic_api.diagnostics.platform.system", lambda: "Linux")
 
     exit_code = diagnostics.doctor("local")
     output = capsys.readouterr().out
@@ -58,6 +59,31 @@ def test_local_doctor_reports_missing_vllm_installation(
     assert "Local mode health: unavailable" in output
     assert "Install the agentic-api wheel artifact with its local extra" in output
     assert "file:///path/to/agentic_api-PLATFORM.whl" in output
+
+
+def test_local_doctor_explains_linux_only_extra_on_unsupported_platform(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    rust_binary = tmp_path / "agentic-server"
+    rust_binary.write_text("")
+    rust_binary.chmod(0o755)
+
+    monkeypatch.setattr("agentic_api.diagnostics.find_packaged_binary", lambda name: rust_binary)
+    monkeypatch.setattr("agentic_api.diagnostics.read_binary_version", lambda path: "agentic-server 0.5.0")
+    monkeypatch.setattr("agentic_api.diagnostics.metadata_version", _metadata_version_without_vllm)
+    monkeypatch.setattr(
+        "agentic_api.diagnostics.find_active_environment_executable",
+        lambda name: (_ for _ in ()).throw(FileNotFoundError(name)),
+    )
+    monkeypatch.setattr("agentic_api.diagnostics.platform.system", lambda: "Darwin")
+
+    exit_code = diagnostics.doctor("local")
+    output = capsys.readouterr().out
+
+    assert exit_code == 1
+    assert "Local mode health: unavailable" in output
+    assert "Local mode is currently supported only on Linux" in output
+    assert "remote mode" in output
 
 
 def test_local_doctor_reports_incompatible_vllm_version(

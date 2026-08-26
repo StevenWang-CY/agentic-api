@@ -54,7 +54,11 @@ def collect_doctor_report() -> DoctorReport:
         vllm_executable_path = str(find_active_environment_executable("vllm"))
     except FileNotFoundError:
         vllm_executable_path = "not found"
-    local_ok, local_message = _local_health(installed_vllm_version, vllm_executable_path)
+    local_ok, local_message = _local_health(
+        installed_vllm_version,
+        vllm_executable_path,
+        platform_name=platform.system(),
+    )
 
     return DoctorReport(
         python_version=platform.python_version(),
@@ -122,7 +126,19 @@ def _rust_binary_details() -> tuple[str, bool, str]:
     return (str(path), executable, version)
 
 
-def _local_health(installed_vllm_version: str, vllm_executable_path: str) -> tuple[bool, str]:
+def _local_health(
+    installed_vllm_version: str,
+    vllm_executable_path: str,
+    *,
+    platform_name: str,
+) -> tuple[bool, str]:
+    if platform_name != "Linux" and installed_vllm_version == "not installed":
+        return (
+            False,
+            "Local mode is currently supported only on Linux because the [local] extra installs vLLM only on Linux. "
+            "Use remote mode on this platform, or run local mode on Linux.",
+        )
+
     install_hint = (
         "Install the agentic-api wheel artifact with its local extra: "
         '`uv pip install "agentic-api[local] @ file:///path/to/agentic_api-PLATFORM.whl"`.'
