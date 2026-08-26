@@ -14,7 +14,7 @@ from threading import Lock
 
 
 POLL_INTERVAL_S = 0.05
-READY_REQUEST_TIMEOUT_S = 0.1
+READY_REQUEST_TIMEOUT_S = 5.0
 _IS_POSIX = os.name == "posix"
 
 

@@ -64,6 +64,9 @@ uvx --from agentic-api agentic-api serve --vllm-base-url http://existing-vllm:80
 `doctor` reports whether the packaged Rust executable is present, whether the tested local vLLM wheel is installed, and
 whether the current mode is healthy.
 
+With no mode selected, `doctor` reports both local and remote health but uses remote health for its exit status, so the
+base proxy-only install is considered healthy when its packaged gateway is available.
+
 ```bash
 agentic-api doctor
 agentic-api doctor --mode remote

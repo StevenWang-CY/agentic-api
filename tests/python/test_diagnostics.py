@@ -35,6 +35,29 @@ def test_remote_doctor_is_healthy_without_vllm(
     assert "Remote mode health: ok" in output
 
 
+def test_doctor_without_mode_succeeds_for_a_healthy_base_install(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    rust_binary = tmp_path / "agentic-server"
+    rust_binary.write_text("")
+    rust_binary.chmod(0o755)
+
+    monkeypatch.setattr("agentic_api.diagnostics.find_packaged_binary", lambda name: rust_binary)
+    monkeypatch.setattr("agentic_api.diagnostics.read_binary_version", lambda path: "agentic-server 0.4.0")
+    monkeypatch.setattr("agentic_api.diagnostics.metadata_version", _metadata_version_without_vllm)
+    monkeypatch.setattr(
+        "agentic_api.diagnostics.find_active_environment_executable",
+        lambda name: (_ for _ in ()).throw(FileNotFoundError(name)),
+    )
+
+    exit_code = diagnostics.doctor(None)
+    output = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "Selected mode: all" in output
+    assert "Remote mode health: ok" in output
+
+
 def test_local_doctor_reports_missing_vllm_installation(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:

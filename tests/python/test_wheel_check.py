@@ -33,6 +33,29 @@ def test_check_python_wheel_accepts_expected_wheel_and_installed_environment(tmp
     assert "wheel validation passed" in result.stdout
 
 
+def test_check_python_wheel_derives_version_for_bare_invocation(tmp_path: Path) -> None:
+    wheel_path = _write_fake_wheel(
+        tmp_path / f"agentic_api-{WORKSPACE_VERSION}-py3-none-any.whl",
+        version=WORKSPACE_VERSION,
+    )
+    cargo_metadata_path = _write_fake_cargo_metadata(
+        tmp_path / "cargo-metadata.json",
+        package_versions={name: WORKSPACE_VERSION for name in ("agentic-praxis", "agentic-server-core", "agentic-server")},
+    )
+    site_packages = _write_fake_site_packages(tmp_path / "site-packages", version=WORKSPACE_VERSION)
+    scripts_dir = _write_fake_scripts(tmp_path / "bin", version=WORKSPACE_VERSION)
+
+    result = _run_check_script(
+        wheel_path,
+        site_packages,
+        scripts_dir,
+        cargo_metadata_path=cargo_metadata_path,
+        expected_version=None,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
 def test_check_python_wheel_rejects_vllm_payloads(tmp_path: Path) -> None:
     wheel_path = _write_fake_wheel(
         tmp_path / "agentic_api-0.4.0-py3-none-any.whl",
@@ -144,6 +167,22 @@ def test_check_python_wheel_validates_workspace_versions_outside_repository_cwd(
     assert "wheel validation passed" in result.stdout
 
 
+def test_check_python_wheel_does_not_accept_a_similar_script_name(tmp_path: Path) -> None:
+    wheel_path = _write_fake_wheel(
+        tmp_path / "agentic_api-0.4.0-py3-none-any.whl",
+        packaged_scripts=("agentic-server",),
+        extra_entries={"agentic_api-0.4.0.data/scripts/agentic-api": ""},
+    )
+    cargo_metadata_path = _write_fake_cargo_metadata(tmp_path / "cargo-metadata.json")
+    site_packages = _write_fake_site_packages(tmp_path / "site-packages")
+    scripts_dir = _write_fake_scripts(tmp_path / "bin")
+
+    result = _run_check_script(wheel_path, site_packages, scripts_dir, cargo_metadata_path=cargo_metadata_path)
+
+    assert result.returncode != 0
+    assert "wheel missing packaged executable: agentic" in result.stderr
+
+
 def _run_check_script(
     wheel_path: Path,
     site_packages: Path,
@@ -152,12 +191,13 @@ def _run_check_script(
     cargo_metadata_path: Path | None = None,
     expected_wheel_tag: str | None = None,
     cwd: Path = REPO_ROOT,
-    expected_version: str = EXPECTED_VERSION,
+    expected_version: str | None = EXPECTED_VERSION,
 ) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     env["AGENTIC_API_CHECK_PYTHON"] = sys.executable
     env["AGENTIC_API_CHECK_SCRIPTS_DIR"] = str(scripts_dir)
-    env["AGENTIC_API_EXPECTED_VERSION"] = expected_version
+    if expected_version is not None:
+        env["AGENTIC_API_EXPECTED_VERSION"] = expected_version
     env["PYTHONPATH"] = str(site_packages)
     if cargo_metadata_path is not None:
         env["AGENTIC_API_CHECK_CARGO_METADATA_JSON"] = str(cargo_metadata_path)
@@ -179,6 +219,7 @@ def _write_fake_wheel(
     extra_entries: dict[str, str] | None = None,
     *,
     version: str = EXPECTED_VERSION,
+    packaged_scripts: tuple[str, ...] = ("agentic", "agentic-server"),
 ) -> Path:
     dist_info = f"agentic_api-{version}.dist-info"
     data_dir = f"agentic_api-{version}.data"
@@ -197,9 +238,8 @@ def _write_fake_wheel(
             agentic-api = agentic_api.cli:main
             """
         ),
-        f"{data_dir}/scripts/agentic": "",
-        f"{data_dir}/scripts/agentic-server": "",
     }
+    entries.update({f"{data_dir}/scripts/{script_name}": "" for script_name in packaged_scripts})
     if extra_entries is not None:
         entries.update(extra_entries)
 

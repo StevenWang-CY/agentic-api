@@ -100,6 +100,16 @@ def test_serve_preserves_passthrough_after_double_dash() -> None:
     assert options.vllm_args == ["--dtype", "bfloat16", "--max-model-len=32768"]
 
 
+def test_remote_serve_rejects_vllm_passthrough_arguments(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        build_parser().parse_args(
+            ["serve", "--vllm-base-url", "http://existing-vllm:8000", "--", "--dtype", "bfloat16"]
+        )
+
+    assert exc_info.value.code == 2
+    assert "only supported with --model" in capsys.readouterr().err
+
+
 @pytest.mark.parametrize(
     "args",
     [
@@ -113,6 +123,9 @@ def test_serve_preserves_passthrough_after_double_dash() -> None:
         ["--model", "Qwen/Qwen3-4B", "--", "--api_key=secret"],
         ["--model", "Qwen/Qwen3-4B", "--", "--uds", "/tmp/vllm.sock"],
         ["--model", "Qwen/Qwen3-4B", "--", "--uds=/tmp/vllm.sock"],
+        ["--model", "Qwen/Qwen3-4B", "--", "--por", "9999"],
+        ["--model", "Qwen/Qwen3-4B", "--", "--api-ke", "secret"],
+        ["--model", "Qwen/Qwen3-4B", "--", "--ud", "/tmp/vllm.sock"],
     ],
 )
 def test_serve_rejects_launcher_owned_vllm_passthrough_flags(

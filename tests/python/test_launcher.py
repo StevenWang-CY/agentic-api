@@ -99,7 +99,7 @@ def test_run_serve_local_mode_starts_vllm_then_rust(monkeypatch: pytest.MonkeyPa
 
     supervisor = FakeSupervisor.instances[-1]
 
-    assert exit_code == 0
+    assert exit_code == 1
     assert supervisor.starts[0][0] == [
         "/venv/bin/vllm",
         "serve",
@@ -111,9 +111,9 @@ def test_run_serve_local_mode_starts_vllm_then_rust(monkeypatch: pytest.MonkeyPa
         "127.0.0.1",
         "--port",
         "8000",
-        "--api-key",
-        "generated-token",
     ]
+    assert supervisor.starts[0][1]["VLLM_API_KEY"] == "generated-token"
+    assert "generated-token" not in supervisor.starts[0][0]
     assert supervisor.starts[1][0] == [
         "/pkg/bin/agentic-server",
         "--llm-api-base",
@@ -234,6 +234,24 @@ def test_run_serve_reports_startup_failure_and_cleans_up_started_children(
     assert supervisor.terminate_timeout == 10.0
 
 
+def test_run_serve_reports_clean_child_exit_as_unexpected_failure(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import agentic_api.launcher as launcher
+
+    supervisor = FakeSupervisor()
+    monkeypatch.setattr(launcher, "ProcessSupervisor", lambda: supervisor)
+    monkeypatch.setattr(launcher, "find_packaged_binary", lambda name: Path("/pkg/bin/agentic-server"))
+    monkeypatch.setattr(launcher.signal, "signal", lambda sig, handler: handler)
+
+    exit_code = launcher.run_serve(
+        make_options(mode="remote", model=None, vllm_base_url="https://upstream.example.com/base")
+    )
+
+    assert exit_code == 1
+    assert "agentic-server exited unexpectedly with status 0" in capsys.readouterr().err
+
+
 def test_run_serve_reports_readiness_timeout_without_traceback(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -284,7 +302,7 @@ def test_run_serve_restores_prior_signal_handlers(monkeypatch: pytest.MonkeyPatc
         make_options(mode="remote", model=None, vllm_base_url="https://upstream.example.com/base")
     )
 
-    assert exit_code == 0
+    assert exit_code == 1
     assert registered_handlers[signal.SIGINT] is previous_sigint
     assert registered_handlers[signal.SIGTERM] is previous_sigterm
 

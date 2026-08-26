@@ -251,6 +251,23 @@ def test_wait_for_failure_returns_exited_child_status(monkeypatch: pytest.Monkey
     )
 
 
+def test_wait_for_vllm_ready_allows_a_slow_successful_probe(
+    models_server: tuple[ThreadingHTTPServer, str],
+) -> None:
+    server, base_url = models_server
+    ModelsHandler.response_delay_s = 0.2
+
+    wait_for_vllm_ready(
+        base_url=base_url,
+        api_key=None,
+        process=DummyProcess([None]),
+        timeout=0.5,
+        interval=0.01,
+    )
+
+    assert server is not None
+
+
 def test_wait_for_failure_raises_shutdown_requested(monkeypatch: pytest.MonkeyPatch) -> None:
     fake_process = FakePopen(pid=77, poll_values=[None, None, None])
 

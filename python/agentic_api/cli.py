@@ -52,11 +52,17 @@ class _AgenticArgumentParser(argparse.ArgumentParser):
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = _AgenticArgumentParser(prog="agentic-api", description="Python launcher for packaged Agentic API binaries")
+    parser = _AgenticArgumentParser(
+        prog="agentic-api",
+        description="Python launcher for packaged Agentic API binaries",
+        allow_abbrev=False,
+    )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    serve_parser = subparsers.add_parser("serve", help="Launch Agentic API in local or remote mode")
+    serve_parser = subparsers.add_parser(
+        "serve", help="Launch Agentic API in local or remote mode", allow_abbrev=False
+    )
     serve_parser.add_argument("--model")
     serve_parser.add_argument("--vllm-base-url")
     serve_parser.add_argument("--host", default=DEFAULT_HOST)
@@ -68,7 +74,9 @@ def build_parser() -> argparse.ArgumentParser:
     serve_parser.add_argument("--vllm-api-key-env", default=DEFAULT_VLLM_API_KEY_ENV)
     serve_parser.add_argument("vllm_args", nargs=argparse.REMAINDER)
 
-    doctor_parser = subparsers.add_parser("doctor", help="Report packaged binary and compatibility diagnostics")
+    doctor_parser = subparsers.add_parser(
+        "doctor", help="Report packaged binary and compatibility diagnostics", allow_abbrev=False
+    )
     doctor_parser.add_argument("--mode", choices=("local", "remote"))
     doctor_parser.add_argument(
         "--json", action="store_true", dest="json_output", help="Emit a machine-readable JSON report"
@@ -135,6 +143,9 @@ def _build_serve_options(parser: argparse.ArgumentParser, namespace: argparse.Na
         vllm_base_url = _normalize_base_url(parser, namespace.vllm_base_url)
         mode = "remote"
 
+    if mode == "remote" and vllm_args:
+        parser.error("vLLM passthrough arguments are only supported with --model (local mode)")
+
     return ServeOptions(
         mode=mode,
         model=namespace.model,
@@ -161,7 +172,9 @@ def _reserved_vllm_flag(values: Sequence[str]) -> str | None:
         if not value.startswith("--"):
             continue
         option_name = value.partition("=")[0].replace("_", "-")
-        if option_name in RESERVED_VLLM_FLAGS or option_name in INCOMPATIBLE_VLLM_FLAGS:
+        if len(option_name) > 2 and any(
+            reserved.startswith(option_name) for reserved in RESERVED_VLLM_FLAGS | INCOMPATIBLE_VLLM_FLAGS
+        ):
             return option_name
     return None
 

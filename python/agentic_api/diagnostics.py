@@ -43,7 +43,7 @@ def doctor(mode: str | None, *, json_output: bool = False) -> int:
         return 0 if report.local_ok else 1
     if mode == "remote":
         return 0 if report.remote_ok else 1
-    return 0 if report.local_ok and report.remote_ok else 1
+    return 0 if report.remote_ok else 1
 
 
 def collect_doctor_report() -> DoctorReport:

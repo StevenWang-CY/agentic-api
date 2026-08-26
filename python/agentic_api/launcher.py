@@ -88,10 +88,8 @@ def _run_local_mode(supervisor: ProcessSupervisor, options: ServeOptions) -> Chi
             "127.0.0.1",
             "--port",
             str(options.vllm_port),
-            "--api-key",
-            vllm_api_key,
         ],
-        os.environ.copy(),
+        _vllm_environment(vllm_api_key),
     )
     wait_for_vllm_ready(
         base_url=vllm_url,
@@ -143,6 +141,12 @@ def _rust_environment(gateway_api_key_env: str, api_key_override: str | None) ->
     return env
 
 
+def _vllm_environment(api_key: str) -> dict[str, str]:
+    env = os.environ.copy()
+    env["VLLM_API_KEY"] = api_key
+    return env
+
+
 def _installed_vllm_version() -> str:
     try:
         return version("vllm")
@@ -153,6 +157,9 @@ def _installed_vllm_version() -> str:
 
 
 def _normalize_exit_code(result: ChildResult) -> int:
+    if result.returncode == 0:
+        print(f"{result.name} exited unexpectedly with status 0", file=sys.stderr)
+        return 1
     if result.returncode >= 0:
         return result.returncode
     return _signal_exit_code(-result.returncode)

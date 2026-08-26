@@ -21,10 +21,9 @@ class PackagedBinaryVersionError(RuntimeError):
 
 
 def find_packaged_binary(name: str) -> Path:
-    try:
-        return find_active_environment_executable(name)
-    except FileNotFoundError:
-        pass
+    for candidate in _candidate_paths(name, include_ambient_path=False):
+        if _is_executable_file(candidate):
+            return candidate
     raise PackagedBinaryNotFoundError(f"{name} not found; {REMEDIATION_MESSAGE}")
 
 
@@ -59,7 +58,7 @@ def read_binary_version(path: Path) -> str:
     return output.splitlines()[0].strip()
 
 
-def _candidate_paths(name: str) -> list[Path]:
+def _candidate_paths(name: str, *, include_ambient_path: bool = True) -> list[Path]:
     candidates: list[Path] = []
 
     scripts_dir = sysconfig.get_path("scripts")
@@ -68,9 +67,10 @@ def _candidate_paths(name: str) -> list[Path]:
 
     candidates.append(Path(sys.executable).resolve().parent / name)
 
-    which_path = shutil.which(name)
-    if which_path:
-        candidates.append(Path(which_path))
+    if include_ambient_path:
+        which_path = shutil.which(name)
+        if which_path:
+            candidates.append(Path(which_path))
 
     unique_candidates: list[Path] = []
     seen: set[Path] = set()

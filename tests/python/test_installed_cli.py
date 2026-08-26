@@ -110,7 +110,8 @@ def test_agentic_api_serve_uses_discovered_packaged_server_without_importing_vll
             env=env,
         )
 
-        assert result.returncode == 0, result.stderr
+        assert result.returncode == 1, result.stderr
+        assert "agentic-server exited unexpectedly with status 0" in result.stderr
         record = json.loads(record_path.read_text(encoding="utf-8"))
         assert record == {
             "argv": [

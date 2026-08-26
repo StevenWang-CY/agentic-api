@@ -8,12 +8,24 @@ fi
 
 wheel_path="$1"
 check_python="${AGENTIC_API_CHECK_PYTHON:-python}"
-expected_version="${AGENTIC_API_EXPECTED_VERSION:-0.4.0}"
 expected_wheel_tag="${AGENTIC_API_EXPECTED_WHEEL_TAG:-}"
 scripts_dir="${AGENTIC_API_CHECK_SCRIPTS_DIR:-}"
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 repo_root="$(cd -- "$script_dir/.." && pwd -P)"
 cargo_manifest_path="$repo_root/Cargo.toml"
+
+if [ -n "${AGENTIC_API_EXPECTED_VERSION:-}" ]; then
+  expected_version="$AGENTIC_API_EXPECTED_VERSION"
+else
+  cargo_metadata="$(cargo metadata --format-version 1 --no-deps --manifest-path "$cargo_manifest_path")"
+  expected_version="$(printf '%s\n' "$cargo_metadata" | "$check_python" -c '
+import json
+import sys
+
+packages = json.load(sys.stdin)["packages"]
+print(next(package["version"] for package in packages if package["name"] == "agentic-server"))
+')"
+fi
 
 if [ ! -f "$wheel_path" ]; then
   echo "wheel file not found: $wheel_path" >&2
@@ -189,7 +201,7 @@ with zipfile.ZipFile(wheel_path) as archive:
 
     def has_packaged_script(script_name: str) -> bool:
         return any(
-            f"/scripts/{script_name}" in f"/{name}" and ".data/" in name
+            name.endswith(f".data/scripts/{script_name}")
             for name in normalized_names
         )
 
