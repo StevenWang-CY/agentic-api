@@ -100,8 +100,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     if namespace.command == "serve":
         try:
             from agentic_api.launcher import run_serve
-        except ModuleNotFoundError:
-            print("agentic-api serve is not implemented in this build yet.", file=sys.stderr)
+        except ModuleNotFoundError as error:
+            if error.name != "agentic_api.launcher":
+                raise
+            print(
+                "agentic-api serve is unavailable because the Python launcher is missing; "
+                "reinstall agentic-api for this platform.",
+                file=sys.stderr,
+            )
             return 1
 
         return run_serve(namespace.options)

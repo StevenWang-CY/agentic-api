@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import builtins
 from dataclasses import asdict
 
 import pytest
@@ -230,3 +231,24 @@ def test_doctor_json_flag_is_forwarded_to_diagnostics(monkeypatch: pytest.Monkey
 
     assert main(["doctor", "--mode", "remote", "--json"]) == 0
     assert calls == [("remote", True)]
+
+
+def test_serve_reports_a_missing_packaged_launcher_with_remediation(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    real_import = builtins.__import__
+
+    def missing_launcher(name: str, *args: object, **kwargs: object) -> object:
+        if name == "agentic_api.launcher":
+            raise ModuleNotFoundError("agentic_api.launcher", name="agentic_api.launcher")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", missing_launcher)
+
+    exit_code = main(["serve", "--vllm-base-url", "http://existing-vllm:8000"])
+
+    assert exit_code == 1
+    assert capsys.readouterr().err == (
+        "agentic-api serve is unavailable because the Python launcher is missing; "
+        "reinstall agentic-api for this platform.\n"
+    )
