@@ -128,3 +128,43 @@ jobs:
 
       - name: Verify PostgreSQL migrations and restart persistence
         run: cargo test -p agentic-server-core --test postgres_storage_integration -- --ignored --test-threads=1
+
+  dynamo-upstream:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: 1.98.0
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-bin: false
+
+      - name: Validate recorded Dynamo cassettes
+        run: |
+          python3 -m pip install 'PyYAML==6.0.3'
+          python3 - <<'PY'
+          import pathlib, yaml
+          base = pathlib.Path("crates/agentic-server-core/tests/cassettes/dynamo")
+          for path in sorted(base.glob("*.yaml")):
+              turns = yaml.safe_load(path.read_text())["turns"]
+              expected = 2 if "stateful" in path.name else 1
+              assert len(turns) == expected, f"{path.name}: {len(turns)} turns, expected {expected}"
+              for turn in turns:
+                  assert turn["request"]["path"] == "/v1/responses", path.name
+                  assert "previous_response_id" not in turn["request"]["body"], f"{path.name}: Dynamo rejects previous_response_id"
+                  assert turn["response"]["status_code"] == 200, path.name
+              print(f"ok {path.name}: {len(turns)} turn(s)")
+          PY
+
+      - name: Replay Dynamo upstream cassettes
+        run: cargo test -p agentic-server-core --test dynamo_cassette_test
