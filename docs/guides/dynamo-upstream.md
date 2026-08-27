@@ -124,7 +124,8 @@ call and the application runs it.
 ## Recorded cassettes and CI
 
 The interactions above are recorded in `crates/agentic-server-core/tests/cassettes/dynamo/` and replayed by
-`tests/dynamo_cassette_test.rs` on every `cargo test`, so CI covers the Dynamo upstream without a GPU. To re-record
+`tests/dynamo_cassette_test.rs` on every `cargo test`, so CI covers the Dynamo upstream without a GPU. The
+`dynamo-upstream` CI job also runs `scripts/validate-cassettes.py`, a structural check over every recorded cassette. To re-record
 against a live Dynamo (for example after a Dynamo release changes the response shape):
 
 ```bash

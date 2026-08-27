@@ -11,7 +11,8 @@ All notable changes to Agentic API are documented here.
 
 ### Testing
 
-- Added Dynamo upstream replay tests and a dedicated CI job for them.
+- Added Dynamo upstream replay tests, a generic cassette validator (`scripts/validate-cassettes.py`), and a dedicated
+  CI job for them.
 
 ## [0.5.0] - 2026-08-25
 

@@ -149,22 +149,10 @@ jobs:
         with:
           cache-bin: false
 
-      - name: Validate recorded Dynamo cassettes
+      - name: Validate recorded cassettes
         run: |
           python3 -m pip install 'PyYAML==6.0.3'
-          python3 - <<'PY'
-          import pathlib, yaml
-          base = pathlib.Path("crates/agentic-server-core/tests/cassettes/dynamo")
-          for path in sorted(base.glob("*.yaml")):
-              turns = yaml.safe_load(path.read_text())["turns"]
-              expected = 2 if "stateful" in path.name else 1
-              assert len(turns) == expected, f"{path.name}: {len(turns)} turns, expected {expected}"
-              for turn in turns:
-                  assert turn["request"]["path"] == "/v1/responses", path.name
-                  assert "previous_response_id" not in turn["request"]["body"], f"{path.name}: Dynamo rejects previous_response_id"
-                  assert turn["response"]["status_code"] == 200, path.name
-              print(f"ok {path.name}: {len(turns)} turn(s)")
-          PY
+          python3 scripts/validate-cassettes.py
 
       - name: Replay Dynamo upstream cassettes
         run: cargo test -p agentic-server-core --test dynamo_cassette_test
