@@ -103,7 +103,7 @@ gateway_pid=$!
 wait_until_ready "agentic-server" "http://127.0.0.1:${GATEWAY_PORT}/ready"
 
 env \
-  -u OPENAI_API_KEY \
+  OPENAI_API_KEY=must-not-be-forwarded \
   AGENTIC_CODEX_BIN="$CODEX_BIN" \
   RUST_LOG=warn \
   "$AGENTIC_BIN" harness codex \

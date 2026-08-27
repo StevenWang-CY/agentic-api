@@ -3,7 +3,7 @@ use std::{ffi::OsStr, io::IsTerminal, path::Path, process::ExitCode};
 use agentic_core::error::Error;
 use agentic_server::{
     agentic_cli::{AttachedHarnessCommand, Cli, Command, HarnessCommand},
-    agentic_output::{colorize_help, redact_url, render_banner, render_help},
+    agentic_output::{colorize_help, redact_url, redact_urls, render_banner, render_help},
     agentic_process::{run_attached_harness, run_session, server_args, server_binary_path},
 };
 use clap::{Parser, error::ErrorKind};
@@ -18,7 +18,14 @@ async fn main() -> Result<ExitCode, Error> {
             println!("{}", render_help(&help, color));
             return Ok(ExitCode::SUCCESS);
         }
-        Err(error) => error.exit(),
+        Err(error) if error.kind() == ErrorKind::DisplayVersion => {
+            print!("{}", error.render());
+            return Ok(ExitCode::SUCCESS);
+        }
+        Err(error) => {
+            eprint!("{}", redact_urls(&error.render().to_string()));
+            return Ok(ExitCode::from(2));
+        }
     };
     match cli.command {
         Command::Run { harness } => run_harness(harness).await,

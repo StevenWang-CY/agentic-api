@@ -107,6 +107,7 @@ wait_until_ready "agentic-server" "http://127.0.0.1:${GATEWAY_PORT}/ready"
 
 env \
   AGENTIC_CLAUDE_BIN="$CLAUDE_BIN" \
+  ANTHROPIC_CUSTOM_HEADERS='Authorization: Bearer must-not-be-forwarded' \
   CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
   DISABLE_AUTOUPDATER=1 \
   "$AGENTIC_BIN" harness claude \

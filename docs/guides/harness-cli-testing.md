@@ -40,12 +40,12 @@ Responses answer. Run the same checks locally with `bash scripts/claude-code-smo
 |---|---|
 | `--upstream` must be a full URL | `http://` or `https://` with a host. A typo such as `http//127.0.0.1:8000` is rejected at parse time with `invalid upstream URL`. |
 | `--model` is optional with `--upstream` | When omitted, the CLI calls `GET {upstream}/v1/models` and uses the first model listed. Pass `--model` to pick another when the upstream serves several. |
-| Claude uses an isolated model override | The CLI maps Claude Code's canonical `claude-sonnet-4-5-20250929` identifier to the exact served model ID, so names such as `Qwen/Qwen3-8B` work without a vLLM alias. It also isolates `CLAUDE_CONFIG_DIR` and removes inherited Vertex, Bedrock, and Foundry routing switches. |
+| Claude uses isolated settings and state | Per-run settings map Claude Code's canonical `claude-sonnet-4-5-20250929` identifier to the exact served model ID, while every default and small/fast model tier is pinned to that served model. Session history is isolated from the user's normal Claude home under `$AGENTIC_API_HOME/harnesses/claude` (default `~/.agentic-api/harnesses/claude`) so `--resume` and `--continue` work across invocations. Inherited Vertex, Bedrock, and Foundry routing switches are removed. |
 | Claude effort is pinned to `medium` | Claude Code defaults to `high`, which Qwen's vLLM chat template rejects (`ValueError`). The CLI always passes `--effort medium` and sets `CLAUDE_CODE_EFFORT_LEVEL=medium` (the env var wins inside Claude Code). Override both with `AGENTIC_CLAUDE_EFFORT=low|medium|xhigh`. |
 | Claude resource limits are pinned | The generated environment sets a 32,768-token context, 2,048 output tokens, and disables extended thinking. These conservative defaults fit the tested Qwen deployment. |
 | `--yolo` | Adds `--dangerously-skip-permissions` (Claude) or `--dangerously-bypass-approvals-and-sandbox` (Codex). Use only in an externally isolated environment. |
 | `--skip-llm-ready-check` | Skips the upstream `/health` probe. Avoid it while testing: the probe is what surfaces an unreachable upstream before the harness starts. |
-| Arguments after `--` | Forwarded to the harness (`-p`, `--resume`, `exec`, ...). Claude's `--model`, `--settings`, `--setting-sources`, and `--bare` are rejected because they would bypass the generated model and provider isolation. |
+| Arguments after `--` | Forwarded to the harness (`-p`, `--resume`, `exec`, ...). Claude's `--model`, `--settings`, `--setting-sources`, and `--bare` are rejected because they would bypass the generated model and provider isolation. Generated settings are temporary, but Claude session history persists in the isolated Agentic API home. |
 
 ## 1. Validate the configuration
 
@@ -180,23 +180,26 @@ agentic harness claude \
   -- -p "Reply with exactly one word: pong"
 ```
 
-The Claude command waits for `/health` and `/ready`, creates a temporary isolated Claude configuration, removes
-inherited cloud-provider routing variables, launches Claude Code, and deletes the temporary configuration when Claude exits.
+The Claude command waits for `/health` and `/ready` without following redirects, creates owner-only temporary settings,
+removes inherited cloud-provider routing variables, and deletes the temporary settings when Claude exits. Claude's session
+history persists under `$AGENTIC_API_HOME/harnesses/claude`, separate from the user's normal Claude Code configuration.
 It advertises the compact `Bash,Edit,Read,WebSearch` tool set. There is intentionally no `--web-search` switch:
 whether Claude Code's `WebSearch` function is gateway-owned is a deployment policy controlled by
 `MESSAGES_GATEWAY_TOOL_ALIASES=WebSearch=web_search`.
 
-For a raw-command diagnosis, the critical pieces are an isolated `CLAUDE_CONFIG_DIR`, a `settings.json` whose
+For a raw-command diagnosis, the critical pieces are a persistent isolated `CLAUDE_CONFIG_DIR`, a temporary `settings.json` whose
 `modelOverrides` maps the full canonical ID `claude-sonnet-4-5-20250929` to the served model, removal of inherited
 `CLAUDE_CODE_USE_VERTEX`/`CLAUDE_CODE_USE_BEDROCK`/`CLAUDE_CODE_USE_FOUNDRY`, and passing the canonical ID to
 `claude --model`. Short aliases such as `claude-sonnet-4-5` are not sufficient for this override.
 
 ```console
-CLAUDE_SMOKE_HOME=$(mktemp -d)
-trap 'rm -rf -- "$CLAUDE_SMOKE_HOME"' EXIT
+CLAUDE_SETTINGS_HOME=$(mktemp -d)
+CLAUDE_STATE_HOME="${AGENTIC_API_HOME:-$HOME/.agentic-api}/harnesses/claude"
+mkdir -p -m 700 "$CLAUDE_STATE_HOME"
+trap 'rm -rf -- "$CLAUDE_SETTINGS_HOME"' EXIT
 jq --null-input --arg model 'Qwen/Qwen3.8-27B-FP8' \
   '{modelOverrides: {"claude-sonnet-4-5-20250929": $model}}' \
-  >"$CLAUDE_SMOKE_HOME/settings.json"
+  >"$CLAUDE_SETTINGS_HOME/settings.json"
 
 env -u CLAUDE_CODE_USE_VERTEX \
   -u CLAUDE_CODE_USE_BEDROCK \
@@ -206,8 +209,13 @@ env -u CLAUDE_CODE_USE_VERTEX \
   -u CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST \
   -u ANTHROPIC_VERTEX_PROJECT_ID \
   -u CLOUD_ML_REGION \
-  CLAUDE_CONFIG_DIR="$CLAUDE_SMOKE_HOME" \
+  CLAUDE_CONFIG_DIR="$CLAUDE_STATE_HOME" \
   ANTHROPIC_BASE_URL=http://127.0.0.1:9000 \
+  ANTHROPIC_MODEL=Qwen/Qwen3.8-27B-FP8 \
+  ANTHROPIC_SMALL_FAST_MODEL=Qwen/Qwen3.8-27B-FP8 \
+  ANTHROPIC_DEFAULT_OPUS_MODEL=Qwen/Qwen3.8-27B-FP8 \
+  ANTHROPIC_DEFAULT_SONNET_MODEL=Qwen/Qwen3.8-27B-FP8 \
+  ANTHROPIC_DEFAULT_HAIKU_MODEL=Qwen/Qwen3.8-27B-FP8 \
   ANTHROPIC_API_KEY=agentic-api-local \
   ANTHROPIC_AUTH_TOKEN=agentic-api-local \
   CLAUDE_CODE_MAX_CONTEXT_TOKENS=32768 \
@@ -215,7 +223,8 @@ env -u CLAUDE_CODE_USE_VERTEX \
   MAX_THINKING_TOKENS=0 \
   CLAUDE_CODE_EFFORT_LEVEL=medium \
   claude --model claude-sonnet-4-5-20250929 \
-    --tools Bash,Edit,Read,WebSearch --setting-sources user --effort medium
+    --tools Bash,Edit,Read,WebSearch --setting-sources user --effort medium \
+    --settings "$CLAUDE_SETTINGS_HOME/settings.json"
 ```
 
 Codex uses the same attach-only workflow. The CLI generates an isolated `CODEX_HOME`, Responses provider
@@ -240,7 +249,9 @@ start, shell tool calls fail inside Codex itself; that is unrelated to the gatew
 (or the CLI's `--yolo`) confirms the gateway side. Codex declares web search structurally through the Responses API,
 so it does not require `MESSAGES_GATEWAY_TOOL_ALIASES`.
 
-Replace `agentic-api-local` with a real key when the deployment enforces inbound authentication. Finish by
+Replace `agentic-api-local` with a real key when the deployment enforces inbound authentication. For `agentic harness`,
+pass it explicitly with `--api-key` or set `AGENTIC_GATEWAY_API_KEY`; ambient `OPENAI_API_KEY` and
+`ANTHROPIC_CUSTOM_HEADERS` are deliberately ignored because they commonly carry unrelated provider credentials. Finish by
 confirming the gateway logged no errors during the run:
 
 ```console
