@@ -228,7 +228,7 @@ hydrated item history the gateway sends upstream), records it, and merges both i
 [docs/guides/dynamo-upstream.md](../../../../docs/guides/dynamo-upstream.md) for the Dynamo launch commands.
 
 ```bash
-DYNAMO_URL=http://127.0.0.1:8001 MODEL=openai/gpt-oss-20b bash tests/cassettes/record_dynamo_cassettes.sh
+DYNAMO_URL=http://127.0.0.1:8000 MODEL=openai/gpt-oss-20b bash tests/cassettes/record_dynamo_cassettes.sh
 ```
 
 ### Web search (gateway and OpenAI)

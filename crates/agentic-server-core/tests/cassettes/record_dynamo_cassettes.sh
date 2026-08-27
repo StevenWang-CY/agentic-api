@@ -10,20 +10,20 @@
 # real gateway traffic including the item id.
 #
 # Prerequisites (see docs/guides/dynamo-upstream.md):
-#   python -m dynamo.frontend --http-port 8001 --discovery-backend file
+#   python -m dynamo.frontend --http-port 8000 --discovery-backend file
 #   python -m dynamo.vllm --model openai/gpt-oss-20b --discovery-backend file \
 #       --kv-events-config '{"enable_kv_cache_events": false}' \
 #       --dyn-reasoning-parser gpt_oss --dyn-tool-call-parser harmony
 #
 # Usage:
-#   DYNAMO_URL=http://127.0.0.1:8001 MODEL=openai/gpt-oss-20b bash tests/cassettes/record_dynamo_cassettes.sh
+#   DYNAMO_URL=http://127.0.0.1:8000 MODEL=openai/gpt-oss-20b bash tests/cassettes/record_dynamo_cassettes.sh
 
 set -euo pipefail
 
 SCRIPTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BASE_DIR="$SCRIPTS_DIR/dynamo"
 TOOLS_FILE="$SCRIPTS_DIR/tool_calls/tools.json"
-DYNAMO_URL="${DYNAMO_URL:-http://127.0.0.1:8001}"
+DYNAMO_URL="${DYNAMO_URL:-http://127.0.0.1:8000}"
 MODEL="${MODEL:-openai/gpt-oss-20b}"
 MODEL_SLUG="$(echo "$MODEL" | tr '/: ' '---')"
 PYTHON="${PYTHON:-python}"
