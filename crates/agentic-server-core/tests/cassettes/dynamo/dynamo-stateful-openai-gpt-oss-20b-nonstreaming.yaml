@@ -18,12 +18,12 @@ turns:
     body:
       background: false
       billing: null
-      completed_at: 1787828049
+      completed_at: 1787829072
       conversation: null
-      created_at: 1787828049
+      created_at: 1787829072
       error: null
       frequency_penalty: 0.0
-      id: resp_8f5cd5b7762647338deee1d8c4b9bb6a
+      id: resp_e823dacfde14451baad50ab4915bd39b
       incomplete_details: null
       instructions: null
       max_output_tokens: 2048
@@ -37,7 +37,7 @@ turns:
           logprobs: []
           text: OK
           type: output_text
-        id: msg_276de1a040c547ef9aace8319ece0fc8
+        id: msg_aeb098ffaa8c4c0092ed38e3586e8e24
         role: assistant
         status: completed
         type: message
@@ -64,11 +64,11 @@ turns:
       usage:
         input_tokens: 77
         input_tokens_details:
-          cached_tokens: 64
-        output_tokens: 47
+          cached_tokens: 0
+        output_tokens: 35
         output_tokens_details:
           reasoning_tokens: 0
-        total_tokens: 124
+        total_tokens: 112
     headers:
       content-type: application/json
     status_code: 200
@@ -82,7 +82,7 @@ turns:
       - content:
         - text: OK
           type: output_text
-        id: msg_276de1a040c547ef9aace8319ece0fc8
+        id: msg_aeb098ffaa8c4c0092ed38e3586e8e24
         role: assistant
         status: completed
         type: message
@@ -104,12 +104,12 @@ turns:
     body:
       background: false
       billing: null
-      completed_at: 1787828051
+      completed_at: 1787829074
       conversation: null
-      created_at: 1787828051
+      created_at: 1787829074
       error: null
       frequency_penalty: 0.0
-      id: resp_b268d1d78a4a4f039169a37fbaab61c7
+      id: resp_f24a1d1897c74063bfcbbd6fc91b5667
       incomplete_details: null
       instructions: null
       max_output_tokens: 2048
@@ -123,7 +123,7 @@ turns:
           logprobs: []
           text: APPLE
           type: output_text
-        id: msg_508101c6db244500a707042e0c6c46dc
+        id: msg_a52548907c8844198586ba7ce6eef89e
         role: assistant
         status: completed
         type: message
@@ -150,11 +150,11 @@ turns:
       usage:
         input_tokens: 103
         input_tokens_details:
-          cached_tokens: 96
-        output_tokens: 66
+          cached_tokens: 64
+        output_tokens: 35
         output_tokens_details:
           reasoning_tokens: 0
-        total_tokens: 169
+        total_tokens: 138
     headers:
       content-type: application/json
     status_code: 200

@@ -14,6 +14,7 @@
 #   python -m dynamo.vllm --model openai/gpt-oss-20b --discovery-backend file \
 #       --kv-events-config '{"enable_kv_cache_events": false}' \
 #       --dyn-reasoning-parser gpt_oss --dyn-tool-call-parser harmony
+#   (recorded with ai-dynamo==1.4.1; pin the version, --prerelease=allow selects dev builds)
 #
 # Usage:
 #   DYNAMO_URL=http://127.0.0.1:8000 MODEL=openai/gpt-oss-20b bash tests/cassettes/record_dynamo_cassettes.sh

@@ -27,21 +27,28 @@ message. The replay tests in `crates/agentic-server-core/tests/dynamo_cassette_t
 ## 1. Install Dynamo
 
 Dynamo publishes wheels on PyPI. The `[vllm]` extra pulls in the vLLM version Dynamo's worker is built against, so use
-a dedicated virtual environment:
+a dedicated virtual environment, and pin the Dynamo release:
 
 ```bash
 mkdir -p ~/dev/dynamo && cd ~/dev/dynamo
 uv venv --python 3.12 .venv
-VIRTUAL_ENV=$PWD/.venv uv pip install --prerelease=allow "ai-dynamo[vllm]"
+VIRTUAL_ENV=$PWD/.venv uv pip install "ai-dynamo[vllm]==1.4.1"
 ```
 
-This was verified with `ai-dynamo==1.4.1` (which installs `vllm==0.26.0` and `torch` cu130) on an aarch64 host with a
-single GB10 GPU. No etcd or NATS is needed for a single-host setup when the components use file-based discovery.
+Pin the version. Dynamo's README suggests `uv pip install --prerelease=allow "ai-dynamo[vllm]"`, but that flag lets uv
+resolve *any* dependency to a pre-release and, with an unpinned `ai-dynamo`, installs the latest `1.5.0.devYYYYMMDD`
+build rather than a release. Check what you got with `python -c 'import importlib.metadata as m; print(m.version("ai-dynamo"))'`.
+
+This guide was verified with `ai-dynamo==1.4.1` (which installs `vllm==0.26.0` and `torch` cu130) on an aarch64 host
+with a single GB10 GPU. See Dynamo's [release artifacts](https://docs.nvidia.com/dynamo/resources/release-artifacts)
+and [support matrix](https://docs.nvidia.com/dynamo/resources/support-matrix) for the wheel/CUDA combinations of other
+releases. No etcd or NATS is needed for a single-host setup when the components use file-based discovery.
 
 ## 2. Start the Dynamo frontend and a worker
 
-Run each in its own terminal (or tmux window). The frontend is the HTTP entry point; the worker loads the model.
-Models are resolved from the Hugging Face cache, so anything already downloaded for vLLM is reused.
+Run each in its own terminal (or tmux window). The frontend is the HTTP entry point (default port 8000, round-robin
+routing across whatever workers register); the worker loads the model. Models are resolved from the Hugging Face
+cache, so anything already downloaded for vLLM is reused.
 
 ```bash
 # Frontend: OpenAI-compatible HTTP on :8000
@@ -54,8 +61,11 @@ Models are resolved from the Hugging Face cache, so anything already downloaded 
   --kv-events-config '{"enable_kv_cache_events": false}' \
   --dyn-reasoning-parser gpt_oss \
   --dyn-tool-call-parser harmony \
-  --enforce-eager --max-model-len 32768 --gpu-memory-utilization 0.15
+  --max-model-len 32768
 ```
+
+`openai/gpt-oss-20b` needs roughly 16 GB of GPU memory for weights plus KV cache, so it fits a single 24 GB GPU with
+vLLM's default `--gpu-memory-utilization 0.9`. Lower that only when the GPU is shared (see below).
 
 Flags worth knowing:
 
@@ -63,8 +73,8 @@ Flags worth knowing:
 |---|---|
 | `--discovery-backend file` | Lets the frontend and worker find each other via `/tmp/dynamo_store_kv` instead of etcd. Pass it to both. |
 | `--kv-events-config '{"enable_kv_cache_events": false}'` | Required for the vLLM worker without NATS. |
-| `--dyn-reasoning-parser` / `--dyn-tool-call-parser` | The Dynamo *frontend* parses model output, not vLLM. vLLM's `--reasoning-parser` is ignored and `--tool-call-parser` / `--enable-auto-tool-choice` are rejected as unknown arguments. Without the `--dyn-*` flags, gpt-oss "analysis" text leaks into `content` and tool calls are returned as plain text. Use `gpt_oss` + `harmony` for gpt-oss models and `qwen3` + `qwen3_coder` / `hermes` for Qwen. |
-| `--gpu-memory-utilization` | Standard vLLM engine flag (the worker accepts vLLM engine arguments). It is a fraction of *total* device memory and must fit in the memory currently free, or the engine fails at startup. |
+| `--dyn-reasoning-parser` / `--dyn-tool-call-parser` | The Dynamo *frontend* parses model output, not vLLM. vLLM's `--reasoning-parser` is ignored and `--tool-call-parser` / `--enable-auto-tool-choice` are rejected as unknown arguments. Without the `--dyn-*` flags, gpt-oss "analysis" text leaks into `content` and tool calls come back as plain text. `gpt_oss` + `harmony` is the verified pair for gpt-oss models; `python -m dynamo.vllm --help` lists the parsers for other model families. |
+| `--gpu-memory-utilization` | Standard vLLM engine flag (the worker accepts vLLM engine arguments). It is a fraction of *total* device memory and must fit in the memory currently free, or the engine fails at startup. On a dedicated GPU keep the default; on a shared GPU size it to what is actually free (the recordings for this guide used `0.15` on a 121 GB unified-memory host that was also running another model). |
 
 Confirm the worker registered and parsing works:
 
@@ -87,8 +97,17 @@ cargo build -p agentic-server --bins
 ./target/debug/agentic-server --llm-api-base http://127.0.0.1:8000
 ```
 
-The readiness probe uses Dynamo's `/health`, so no `--skip-llm-ready-check` is needed. The harness CLI works the same
-way: `./target/debug/agentic run codex --upstream http://127.0.0.1:8000`.
+Agentic API's startup probe uses Dynamo's `/health`, so no `--skip-llm-ready-check` is needed. Be aware of what that
+probe means: Dynamo returns `200 {"status":"healthy", ...}` as soon as the frontend's HTTP service is up, even with no
+worker registered (the `instances` list is simply empty). It does **not** mean a model is loaded. Wait for the
+per-model readiness endpoint before sending traffic:
+
+```bash
+curl -s localhost:8000/v1/models/openai%2Fgpt-oss-20b/ready   # 404 "Model not found" until the worker registers,
+                                                                # then {"model": "...", "ready": true, ...}
+```
+
+The harness CLI works the same way: `./target/debug/agentic run codex --upstream http://127.0.0.1:8000`.
 
 ## 4. Verify a stateful conversation and a tool call
 
@@ -149,3 +168,5 @@ stateless upstream.
 | `Free memory on device … is less than desired GPU memory utilization` | Lower `--gpu-memory-utilization`; it is a fraction of total memory. |
 | `CUDA error: out of memory` right after restarting a worker | A previous `dynamo.vllm` process is still alive and holding memory; `pkill -f "python -m dynamo.vllm"` before relaunching. Closing its terminal or tmux window does not kill it. |
 | `501 Validation: previous_response_id is not supported.` | You are calling Dynamo directly. Send the request to the gateway. |
+| Gateway logs `LLM ready` but requests fail with no model / `model not found` | `/health` is green before the worker registers. Check `/v1/models` or `/v1/models/{model}/ready` and the worker log. |
+| Installed version is `1.5.0.dev…` | `--prerelease=allow` with an unpinned `ai-dynamo` picked a dev build. Reinstall with `"ai-dynamo[vllm]==1.4.1"`. |

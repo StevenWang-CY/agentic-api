@@ -165,12 +165,12 @@ turns:
     body:
       background: false
       billing: null
-      completed_at: 1787828054
+      completed_at: 1787829076
       conversation: null
-      created_at: 1787828054
+      created_at: 1787829076
       error: null
       frequency_penalty: 0.0
-      id: resp_37f05074ff694f08aebeaed1dbb32d54
+      id: resp_18180aae3e7849a098b11367649c1e96
       incomplete_details: null
       instructions: null
       max_output_tokens: 2048
@@ -180,8 +180,8 @@ turns:
       object: response
       output:
       - arguments: '{"ticker":"NVDA"}'
-        call_id: call-bb8f7c35-a7f6-423d-91c0-433955a742d6
-        id: fc_69b93717f20845a3abd97c5bebd52387
+        call_id: call-4be0f84c-b6d7-4321-89db-29c4bc7d46dc
+        id: fc_7469dd39282341ce9406eb3efba386d7
         name: get_stock_price
         status: completed
         type: function_call
@@ -353,11 +353,11 @@ turns:
       usage:
         input_tokens: 507
         input_tokens_details:
-          cached_tokens: 496
-        output_tokens: 66
+          cached_tokens: 48
+        output_tokens: 54
         output_tokens_details:
           reasoning_tokens: 0
-        total_tokens: 573
+        total_tokens: 561
     headers:
       content-type: application/json
     status_code: 200
