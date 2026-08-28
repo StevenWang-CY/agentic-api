@@ -603,9 +603,9 @@ impl TryFrom<&EventPayload> for ReasoningOutput {
 
 /// Applies a `*Done` event payload onto an in-flight output item.
 ///
-/// `buffer` holds accumulated delta text/arguments. If the payload's own field
-/// is empty the buffer is used as the final value and then cleared; otherwise
-/// the buffer is discarded and the payload value is used directly.
+/// `buffer` holds accumulated delta text/arguments when an output type needs
+/// fallback reconstruction. Implementations clear it when the done payload is
+/// authoritative.
 pub trait ApplyDone {
     fn apply_done(&mut self, payload: &EventPayload, buffer: &mut String);
 }
@@ -616,7 +616,7 @@ impl ApplyDone for ReasoningOutput {
             EventPayload::ReasoningTextDone {
                 text, content_index, ..
             } => {
-                let text = final_text(text, buffer);
+                buffer.clear();
                 if !text.is_empty() {
                     insert_at_part_index(&mut self.content, *content_index, ReasoningTextContent::new(text));
                 }
@@ -624,7 +624,7 @@ impl ApplyDone for ReasoningOutput {
             EventPayload::ReasoningSummaryTextDone {
                 text, summary_index, ..
             } => {
-                let text = final_text(text, buffer);
+                buffer.clear();
                 if !text.is_empty() {
                     insert_at_part_index(
                         &mut self.summary,
@@ -655,17 +655,10 @@ impl ApplyDone for ReasoningOutput {
 }
 
 fn insert_at_part_index<T>(parts: &mut Vec<T>, part_index: u32, part: T) {
+    // Part indexes address a contiguous wire array. Clamp malformed sparse
+    // indexes instead of manufacturing placeholder parts that never arrived.
     let index = usize::try_from(part_index).unwrap_or(usize::MAX).min(parts.len());
     parts.insert(index, part);
-}
-
-fn final_text(text: &str, buffer: &mut String) -> String {
-    if text.is_empty() {
-        std::mem::take(buffer)
-    } else {
-        buffer.clear();
-        text.to_owned()
-    }
 }
 
 impl ApplyDone for FunctionToolCall {
@@ -1020,6 +1013,39 @@ mod tests {
         };
         item.apply_done(&malformed, &mut String::new());
         assert_eq!(serde_json::to_value(item).unwrap(), before);
+    }
+
+    #[test]
+    fn reasoning_done_text_is_authoritative_even_when_empty() {
+        let mut item = ReasoningOutput::new("rs_1");
+        let mut stale_delta = "partial reasoning".to_owned();
+
+        item.apply_done(
+            &EventPayload::ReasoningTextDone {
+                text: String::new(),
+                item_id: "rs_1".to_owned(),
+                output_index: 0,
+                content_index: 0,
+            },
+            &mut stale_delta,
+        );
+
+        assert!(item.content.is_empty());
+        assert!(stale_delta.is_empty());
+
+        let mut stale_summary_delta = "partial summary".to_owned();
+        item.apply_done(
+            &EventPayload::ReasoningSummaryTextDone {
+                text: String::new(),
+                item_id: "rs_1".to_owned(),
+                output_index: 0,
+                summary_index: 0,
+            },
+            &mut stale_summary_delta,
+        );
+
+        assert!(item.summary.is_empty());
+        assert!(stale_summary_delta.is_empty());
     }
 
     #[test]
