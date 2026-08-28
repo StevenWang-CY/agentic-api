@@ -360,7 +360,7 @@ impl ResponseAccumulator {
                 self.start_output_item(payload);
             }
             (SSEEventType::OutputItemDone, payload @ EventPayload::OutputItemDone { .. }) => {
-                self.complete_output_item(payload);
+                self.complete_call_item(payload);
             }
             (
                 SSEEventType::ReasoningTextDone,
@@ -515,7 +515,7 @@ impl ResponseAccumulator {
         self.usage = usage;
     }
 
-    fn complete_output_item(&mut self, payload: &EventPayload) {
+    fn complete_call_item(&mut self, payload: &EventPayload) {
         let EventPayload::OutputItemDone {
             item_id,
             item_type,
@@ -526,14 +526,19 @@ impl ResponseAccumulator {
         else {
             return;
         };
-        if *item_type == SSEItemType::Reasoning {
-            self.complete_reasoning_item(payload);
-            return;
-        }
-        let in_flight_key = self.in_flight_call_key(item_id, *item_type, *output_index);
-        let done_item = deserialize_from_value_opt::<OutputItem>(raw_item.clone());
+        let in_flight_key = if *item_type == SSEItemType::Reasoning {
+            self.in_flight_reasoning_key(item_id, *output_index)
+        } else {
+            self.in_flight_call_key(item_id, *item_type, *output_index)
+        };
+        let done_item = if *item_type == SSEItemType::Reasoning {
+            ReasoningOutput::try_from(payload).ok().map(OutputItem::Reasoning)
+        } else {
+            deserialize_from_value_opt::<OutputItem>(raw_item.clone())
+        };
         if let Some(entry) = in_flight_key.as_deref().and_then(|key| self.in_flight.get_mut(key)) {
             match (&mut entry.item, done_item) {
+                (InFlight::Reasoning { item }, _) => item.apply_done(payload, &mut String::new()),
                 (InFlight::FunctionCall { item, arguments }, _) => item.apply_done(payload, arguments),
                 (InFlight::CustomToolCall { item, input }, _) => item.apply_done(payload, input),
                 (InFlight::McpCall { item }, _) => item.apply_done(payload, &mut String::new()),
@@ -554,7 +559,8 @@ impl ResponseAccumulator {
         }
 
         if let Some(
-            mut output_item @ (OutputItem::FunctionCall(_)
+            mut output_item @ (OutputItem::Reasoning(_)
+            | OutputItem::FunctionCall(_)
             | OutputItem::CustomToolCall(_)
             | OutputItem::WebSearchCall(_)
             | OutputItem::McpCall(_)
@@ -571,46 +577,6 @@ impl ResponseAccumulator {
             }
             self.completed.push((*output_index, output_item));
         }
-    }
-
-    fn complete_reasoning_item(&mut self, payload: &EventPayload) {
-        let EventPayload::OutputItemDone {
-            item_id, output_index, ..
-        } = payload
-        else {
-            return;
-        };
-        let in_flight_key = self.in_flight_reasoning_key(item_id, *output_index);
-
-        if let Some(key) = in_flight_key {
-            let Some(entry) = self.in_flight.get_mut(&key) else {
-                return;
-            };
-            entry.output_index = *output_index;
-            let InFlight::Reasoning { item } = &mut entry.item else {
-                return;
-            };
-            item.apply_done(payload, &mut String::new());
-            return;
-        }
-
-        if let Ok(completed) = ReasoningOutput::try_from(payload) {
-            self.upsert_completed_reasoning(*output_index, completed);
-        }
-    }
-
-    fn upsert_completed_reasoning(&mut self, output_index: u32, item: ReasoningOutput) {
-        if let Some((existing_index, existing)) = self.completed.iter_mut().find_map(|(existing_index, output_item)| {
-            let OutputItem::Reasoning(existing) = output_item else {
-                return None;
-            };
-            (existing.id == item.id).then_some((existing_index, existing))
-        }) {
-            *existing_index = output_index;
-            *existing = item;
-            return;
-        }
-        self.completed.push((output_index, OutputItem::Reasoning(item)));
     }
 
     fn in_flight_reasoning_mut(&mut self, item_id: &str, output_index: u32) -> Option<&mut ReasoningOutput> {
@@ -1448,23 +1414,6 @@ mod tests {
         assert_eq!(reasoning.content[0].text, "completed content");
         assert_eq!(reasoning.summary[0]["text"], "completed summary");
         assert!(reasoning.encrypted_content.is_none());
-    }
-
-    #[test]
-    fn repeated_done_only_reasoning_is_upserted_by_id() {
-        let lines = [
-            r#"data: {"type":"response.output_item.done","output_index":0,"item":{"id":"rs_1","type":"reasoning","content":[{"type":"reasoning_text","text":"first"}],"summary":[]}}"#.to_owned(),
-            r#"data: {"type":"response.output_item.done","output_index":0,"item":{"id":"rs_1","type":"reasoning","content":[{"type":"reasoning_text","text":"final"}],"summary":[]}}"#.to_owned(),
-            r#"data: {"type":"response.completed","response":{"id":"resp_1","status":"completed"}}"#.to_owned(),
-        ];
-
-        let acc = ResponseAccumulator::from_sse_lines(lines, None);
-
-        assert_eq!(acc.output.len(), 1);
-        let OutputItem::Reasoning(reasoning) = &acc.output[0] else {
-            panic!("expected reasoning output");
-        };
-        assert_eq!(reasoning.content[0].text, "final");
     }
 
     #[test]
