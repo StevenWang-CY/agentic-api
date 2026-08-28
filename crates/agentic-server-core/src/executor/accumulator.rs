@@ -7,7 +7,6 @@
 //! runs on a blocking thread while the async task continues reading from the
 //! network — keeping the tokio executor thread free between chunk arrivals.
 
-use std::collections::BTreeMap;
 use std::pin::Pin;
 use std::sync::mpsc;
 
@@ -29,83 +28,17 @@ use crate::types::request_response::{IncompleteDetails, ResponsePayload};
 use crate::utils::common::{deserialize_from_str, deserialize_from_value_opt};
 use crate::utils::uuid7_str;
 
-#[derive(Default)]
-struct ReasoningBuffers {
-    content: BTreeMap<u32, String>,
-    summary: BTreeMap<u32, String>,
-}
-
-impl ReasoningBuffers {
-    fn push_content_delta(&mut self, content_index: u32, delta: &str) {
-        self.content.entry(content_index).or_default().push_str(delta);
-    }
-
-    fn take_content(&mut self, content_index: u32) -> String {
-        self.content.remove(&content_index).unwrap_or_default()
-    }
-
-    fn push_summary_delta(&mut self, summary_index: u32, delta: &str) {
-        self.summary.entry(summary_index).or_default().push_str(delta);
-    }
-
-    fn take_summary(&mut self, summary_index: u32) -> String {
-        self.summary.remove(&summary_index).unwrap_or_default()
-    }
-}
-
-fn apply_reasoning_buffers(item: &mut ReasoningOutput, buffers: ReasoningBuffers, output_index: u32) {
-    for (content_index, mut buffer) in buffers.content {
-        let done = EventPayload::ReasoningTextDone {
-            text: String::new(),
-            item_id: item.id.clone(),
-            output_index,
-            content_index,
-        };
-        item.apply_done(&done, &mut buffer);
-    }
-
-    for (summary_index, mut buffer) in buffers.summary {
-        let done = EventPayload::ReasoningSummaryTextDone {
-            text: String::new(),
-            item_id: item.id.clone(),
-            output_index,
-            summary_index,
-        };
-        item.apply_done(&done, &mut buffer);
-    }
-}
-
 /// Tracks a single output item currently being streamed, together with its
 /// accumulated text/arguments buffer.
 enum InFlight {
-    Message {
-        item: OutputMessage,
-        text: String,
-    },
-    Reasoning {
-        item: ReasoningOutput,
-        buffers: ReasoningBuffers,
-    },
-    FunctionCall {
-        item: FunctionToolCall,
-        arguments: String,
-    },
-    CustomToolCall {
-        item: CustomToolCall,
-        input: String,
-    },
-    WebSearchCall {
-        item: Option<WebSearchCall>,
-    },
-    McpCall {
-        item: McpCall,
-    },
-    McpListTools {
-        item: McpListTools,
-    },
-    Compaction {
-        item: CompactionItem,
-    },
+    Message { item: OutputMessage, text: String },
+    Reasoning { item: ReasoningOutput },
+    FunctionCall { item: FunctionToolCall, arguments: String },
+    CustomToolCall { item: CustomToolCall, input: String },
+    WebSearchCall { item: Option<WebSearchCall> },
+    McpCall { item: McpCall },
+    McpListTools { item: McpListTools },
+    Compaction { item: CompactionItem },
 }
 
 impl std::fmt::Debug for InFlight {
@@ -124,12 +57,9 @@ impl std::fmt::Debug for InFlight {
 }
 
 impl InFlight {
-    fn finalize(self, output_index: u32) -> Option<OutputItem> {
+    fn finalize(self) -> Option<OutputItem> {
         match self {
-            Self::Reasoning { mut item, buffers } => {
-                apply_reasoning_buffers(&mut item, buffers, output_index);
-                Some(OutputItem::Reasoning(item))
-            }
+            Self::Reasoning { item } => Some(OutputItem::Reasoning(item)),
             Self::FunctionCall { mut item, arguments } => {
                 if !arguments.is_empty() && item.arguments.is_empty() {
                     item.arguments = arguments;
@@ -324,12 +254,11 @@ impl ResponseAccumulator {
 
     /// Finalizes all streaming items in upstream `output_index` order.
     pub(crate) fn finalize_all(&mut self) {
-        self.completed.extend(self.in_flight.drain(..).filter_map(|(_, entry)| {
-            entry
-                .item
-                .finalize(entry.output_index)
-                .map(|item| (entry.output_index, item))
-        }));
+        self.completed.extend(
+            self.in_flight
+                .drain(..)
+                .filter_map(|(_, entry)| entry.item.finalize().map(|item| (entry.output_index, item))),
+        );
         self.completed.sort_by_key(|(output_index, _)| *output_index);
         self.output
             .extend(self.completed.drain(..).map(|(_, output_item)| output_item));
@@ -423,9 +352,6 @@ impl ResponseAccumulator {
     /// frame (e.g. [`StreamTee`](future)) can call this directly without
     /// re-parsing from a raw line.
     pub(crate) fn process_event(&mut self, frame: &EventFrame) {
-        if self.route_reasoning_event(frame) {
-            return;
-        }
         match (&frame.event_type, &frame.payload) {
             (SSEEventType::ResponseCreated, EventPayload::Response { id, .. }) if !id.is_empty() => {
                 self.response_id.clone_from(id);
@@ -435,6 +361,22 @@ impl ResponseAccumulator {
             }
             (SSEEventType::OutputItemDone, payload @ EventPayload::OutputItemDone { .. }) => {
                 self.complete_output_item(payload);
+            }
+            (
+                SSEEventType::ReasoningTextDone,
+                payload @ EventPayload::ReasoningTextDone {
+                    item_id, output_index, ..
+                },
+            )
+            | (
+                SSEEventType::ReasoningSummaryTextDone,
+                payload @ EventPayload::ReasoningSummaryTextDone {
+                    item_id, output_index, ..
+                },
+            ) => {
+                if let Some(item) = self.in_flight_reasoning_mut(item_id, *output_index) {
+                    item.apply_done(payload, &mut String::new());
+                }
             }
             (
                 SSEEventType::FunctionCallArgumentsDelta,
@@ -503,67 +445,6 @@ impl ResponseAccumulator {
         }
     }
 
-    fn route_reasoning_event(&mut self, frame: &EventFrame) -> bool {
-        match (&frame.event_type, &frame.payload) {
-            (
-                SSEEventType::ReasoningTextDelta,
-                EventPayload::ReasoningTextDelta {
-                    delta,
-                    item_id,
-                    output_index,
-                    content_index,
-                },
-            ) => {
-                if let Some((_, buffers)) = self.in_flight_reasoning_mut(item_id, *output_index) {
-                    buffers.push_content_delta(*content_index, delta);
-                }
-            }
-            (
-                SSEEventType::ReasoningTextDone,
-                payload @ EventPayload::ReasoningTextDone {
-                    item_id,
-                    output_index,
-                    content_index,
-                    ..
-                },
-            ) => {
-                if let Some((item, buffers)) = self.in_flight_reasoning_mut(item_id, *output_index) {
-                    let mut buffer = buffers.take_content(*content_index);
-                    item.apply_done(payload, &mut buffer);
-                }
-            }
-            (
-                SSEEventType::ReasoningSummaryTextDelta,
-                EventPayload::ReasoningSummaryTextDelta {
-                    delta,
-                    item_id,
-                    output_index,
-                    summary_index,
-                },
-            ) => {
-                if let Some((_, buffers)) = self.in_flight_reasoning_mut(item_id, *output_index) {
-                    buffers.push_summary_delta(*summary_index, delta);
-                }
-            }
-            (
-                SSEEventType::ReasoningSummaryTextDone,
-                payload @ EventPayload::ReasoningSummaryTextDone {
-                    item_id,
-                    output_index,
-                    summary_index,
-                    ..
-                },
-            ) => {
-                if let Some((item, buffers)) = self.in_flight_reasoning_mut(item_id, *output_index) {
-                    let mut buffer = buffers.take_summary(*summary_index);
-                    item.apply_done(payload, &mut buffer);
-                }
-            }
-            _ => return false,
-        }
-        true
-    }
-
     fn start_output_item(&mut self, payload: &EventPayload) {
         let EventPayload::OutputItemAdded {
             item_id,
@@ -575,10 +456,9 @@ impl ResponseAccumulator {
             return;
         };
         let item = match item_type {
-            SSEItemType::Reasoning => ReasoningOutput::try_from(payload).ok().map(|item| InFlight::Reasoning {
-                item,
-                buffers: ReasoningBuffers::default(),
-            }),
+            SSEItemType::Reasoning => ReasoningOutput::try_from(payload)
+                .ok()
+                .map(|item| InFlight::Reasoning { item }),
             SSEItemType::FunctionCall => FunctionToolCall::try_from(payload)
                 .ok()
                 .map(|item| InFlight::FunctionCall {
@@ -707,10 +587,9 @@ impl ResponseAccumulator {
                 return;
             };
             entry.output_index = *output_index;
-            let InFlight::Reasoning { item, buffers } = &mut entry.item else {
+            let InFlight::Reasoning { item } = &mut entry.item else {
                 return;
             };
-            apply_reasoning_buffers(item, std::mem::take(buffers), *output_index);
             item.apply_done(payload, &mut String::new());
             return;
         }
@@ -734,22 +613,18 @@ impl ResponseAccumulator {
         self.completed.push((output_index, OutputItem::Reasoning(item)));
     }
 
-    fn in_flight_reasoning_mut(
-        &mut self,
-        item_id: &str,
-        output_index: u32,
-    ) -> Option<(&mut ReasoningOutput, &mut ReasoningBuffers)> {
+    fn in_flight_reasoning_mut(&mut self, item_id: &str, output_index: u32) -> Option<&mut ReasoningOutput> {
         let key = self.in_flight_reasoning_key(item_id, output_index)?;
-        let InFlight::Reasoning { item, buffers } = &mut self.in_flight.get_mut(&key)?.item else {
+        let InFlight::Reasoning { item } = &mut self.in_flight.get_mut(&key)?.item else {
             return None;
         };
-        Some((item, buffers))
+        Some(item)
     }
 
     fn in_flight_reasoning_key(&self, item_id: &str, output_index: u32) -> Option<String> {
         self.in_flight
             .get(item_id)
-            .filter(|entry| matches!(entry.item, InFlight::Reasoning { .. }))
+            .filter(|entry| entry.output_index == output_index && matches!(entry.item, InFlight::Reasoning { .. }))
             .map(|_| item_id.to_owned())
             .or_else(|| {
                 self.in_flight.iter().find_map(|(key, entry)| {
@@ -1432,13 +1307,12 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_content_and_summary_buffers_keep_index_order() {
+    fn reasoning_done_events_keep_part_index_order() {
         let lines = [
             r#"data: {"type":"response.output_item.added","output_index":0,"item":{"id":"rs_1","type":"reasoning"}}"#.to_owned(),
-            r#"data: {"type":"response.reasoning_text.delta","item_id":"rs_1","output_index":0,"content_index":1,"delta":"second"}"#.to_owned(),
             r#"data: {"type":"response.reasoning_text.done","item_id":"rs_1","output_index":0,"content_index":1,"text":"second content"}"#.to_owned(),
-            r#"data: {"type":"response.reasoning_text.delta","item_id":"rs_1","output_index":0,"content_index":0,"delta":"first content"}"#.to_owned(),
-            r#"data: {"type":"response.reasoning_summary_text.delta","item_id":"rs_1","output_index":0,"summary_index":1,"delta":"second summary"}"#.to_owned(),
+            r#"data: {"type":"response.reasoning_text.done","item_id":"rs_1","output_index":0,"content_index":0,"text":"first content"}"#.to_owned(),
+            r#"data: {"type":"response.reasoning_summary_text.done","item_id":"rs_1","output_index":0,"summary_index":1,"text":"second summary"}"#.to_owned(),
             r#"data: {"type":"response.reasoning_summary_text.done","item_id":"rs_1","output_index":0,"summary_index":0,"text":"first summary"}"#.to_owned(),
             r#"data: {"type":"response.completed","response":{"id":"resp_1","status":"completed"}}"#.to_owned(),
         ];
@@ -1466,11 +1340,11 @@ mod tests {
     }
 
     #[test]
-    fn completed_reasoning_uses_buffered_text_only_for_omitted_fields() {
+    fn completed_reasoning_preserves_done_fields_when_omitted() {
         let lines = [
             r#"data: {"type":"response.output_item.added","output_index":0,"item":{"id":"rs_1","type":"reasoning"}}"#.to_owned(),
-            r#"data: {"type":"response.reasoning_text.delta","item_id":"rs_1","output_index":0,"content_index":0,"delta":"fallback content"}"#.to_owned(),
-            r#"data: {"type":"response.reasoning_summary_text.delta","item_id":"rs_1","output_index":0,"summary_index":0,"delta":"fallback summary"}"#.to_owned(),
+            r#"data: {"type":"response.reasoning_text.done","item_id":"rs_1","output_index":0,"content_index":0,"text":"completed content"}"#.to_owned(),
+            r#"data: {"type":"response.reasoning_summary_text.done","item_id":"rs_1","output_index":0,"summary_index":0,"text":"completed summary"}"#.to_owned(),
             r#"data: {"type":"response.output_item.done","output_index":0,"item":{"id":"rs_1","type":"reasoning","encrypted_content":{"token":"opaque"},"status":"completed"}}"#.to_owned(),
             r#"data: {"type":"response.completed","response":{"id":"resp_1","status":"completed"}}"#.to_owned(),
         ];
@@ -1480,10 +1354,10 @@ mod tests {
             panic!("expected reasoning output");
         };
 
-        assert_eq!(reasoning.content[0].text, "fallback content");
+        assert_eq!(reasoning.content[0].text, "completed content");
         assert_eq!(
             reasoning.summary,
-            [serde_json::json!({"type": "summary_text", "text": "fallback summary"})]
+            [serde_json::json!({"type": "summary_text", "text": "completed summary"})]
         );
         assert_eq!(
             reasoning.encrypted_content,
@@ -1496,14 +1370,14 @@ mod tests {
     fn completed_reasoning_null_and_empty_fields_are_authoritative_independently() {
         let content_null = [
             r#"data: {"type":"response.output_item.added","output_index":0,"item":{"id":"rs_content_null","type":"reasoning"}}"#.to_owned(),
-            r#"data: {"type":"response.reasoning_text.delta","item_id":"rs_content_null","output_index":0,"content_index":0,"delta":"discarded content"}"#.to_owned(),
-            r#"data: {"type":"response.reasoning_summary_text.delta","item_id":"rs_content_null","output_index":0,"summary_index":0,"delta":"kept summary"}"#.to_owned(),
+            r#"data: {"type":"response.reasoning_text.done","item_id":"rs_content_null","output_index":0,"content_index":0,"text":"discarded content"}"#.to_owned(),
+            r#"data: {"type":"response.reasoning_summary_text.done","item_id":"rs_content_null","output_index":0,"summary_index":0,"text":"kept summary"}"#.to_owned(),
             r#"data: {"type":"response.output_item.done","output_index":0,"item":{"id":"rs_content_null","type":"reasoning","content":null}}"#.to_owned(),
         ];
         let summary_empty = [
             r#"data: {"type":"response.output_item.added","output_index":0,"item":{"id":"rs_summary_empty","type":"reasoning"}}"#.to_owned(),
-            r#"data: {"type":"response.reasoning_text.delta","item_id":"rs_summary_empty","output_index":0,"content_index":0,"delta":"kept content"}"#.to_owned(),
-            r#"data: {"type":"response.reasoning_summary_text.delta","item_id":"rs_summary_empty","output_index":0,"summary_index":0,"delta":"discarded summary"}"#.to_owned(),
+            r#"data: {"type":"response.reasoning_text.done","item_id":"rs_summary_empty","output_index":0,"content_index":0,"text":"kept content"}"#.to_owned(),
+            r#"data: {"type":"response.reasoning_summary_text.done","item_id":"rs_summary_empty","output_index":0,"summary_index":0,"text":"discarded summary"}"#.to_owned(),
             r#"data: {"type":"response.output_item.done","output_index":0,"item":{"id":"rs_summary_empty","type":"reasoning","summary":[]}}"#.to_owned(),
         ];
 
@@ -1557,11 +1431,11 @@ mod tests {
     }
 
     #[test]
-    fn malformed_completed_reasoning_retains_buffered_text() {
+    fn malformed_completed_reasoning_retains_done_fields() {
         let lines = [
             r#"data: {"type":"response.output_item.added","output_index":0,"item":{"id":"rs_1","type":"reasoning"}}"#.to_owned(),
-            r#"data: {"type":"response.reasoning_text.delta","item_id":"rs_1","output_index":0,"content_index":0,"delta":"fallback content"}"#.to_owned(),
-            r#"data: {"type":"response.reasoning_summary_text.delta","item_id":"rs_1","output_index":0,"summary_index":0,"delta":"fallback summary"}"#.to_owned(),
+            r#"data: {"type":"response.reasoning_text.done","item_id":"rs_1","output_index":0,"content_index":0,"text":"completed content"}"#.to_owned(),
+            r#"data: {"type":"response.reasoning_summary_text.done","item_id":"rs_1","output_index":0,"summary_index":0,"text":"completed summary"}"#.to_owned(),
             r#"data: {"type":"response.output_item.done","output_index":0,"item":{"id":"rs_1","type":"reasoning","content":"malformed","summary":[{"type":"summary_text","text":"ignored completion"}],"encrypted_content":"ignored"}}"#.to_owned(),
             r#"data: {"type":"response.completed","response":{"id":"resp_1","status":"completed"}}"#.to_owned(),
         ];
@@ -1571,8 +1445,8 @@ mod tests {
             panic!("expected reasoning output");
         };
 
-        assert_eq!(reasoning.content[0].text, "fallback content");
-        assert_eq!(reasoning.summary[0]["text"], "fallback summary");
+        assert_eq!(reasoning.content[0].text, "completed content");
+        assert_eq!(reasoning.summary[0]["text"], "completed summary");
         assert!(reasoning.encrypted_content.is_none());
     }
 
