@@ -572,15 +572,32 @@ impl TryFrom<&EventPayload> for ReasoningOutput {
     type Error = ExecutorError;
 
     fn try_from(payload: &EventPayload) -> Result<Self, Self::Error> {
-        let EventPayload::OutputItemAdded { item_id, .. } = payload else {
-            return Err(ExecutorError::ParseError("expected OutputItemAdded payload".into()));
-        };
-        let id = if item_id.is_empty() {
-            uuid7_str("rs_")
-        } else {
-            item_id.clone()
-        };
-        Ok(Self::new(id))
+        match payload {
+            EventPayload::OutputItemAdded { item_id, .. } => {
+                let id = if item_id.is_empty() {
+                    uuid7_str("rs_")
+                } else {
+                    item_id.clone()
+                };
+                Ok(Self::new(id))
+            }
+            EventPayload::OutputItemDone { item, .. } => {
+                let Some(OutputItem::Reasoning(item)) = deserialize_from_value_opt::<OutputItem>(item.clone()) else {
+                    return Err(ExecutorError::ParseError(
+                        "expected a complete reasoning output item".into(),
+                    ));
+                };
+                if item.id.is_empty() {
+                    return Err(ExecutorError::ParseError(
+                        "complete reasoning output item is missing its id".into(),
+                    ));
+                }
+                Ok(item)
+            }
+            _ => Err(ExecutorError::ParseError(
+                "expected a reasoning output-item lifecycle payload".into(),
+            )),
+        }
     }
 }
 
@@ -596,22 +613,50 @@ pub trait ApplyDone {
 impl ApplyDone for ReasoningOutput {
     fn apply_done(&mut self, payload: &EventPayload, buffer: &mut String) {
         match payload {
-            EventPayload::ReasoningTextDone { text, .. } => {
+            EventPayload::ReasoningTextDone {
+                text, content_index, ..
+            } => {
                 let text = final_text(text, buffer);
                 if !text.is_empty() {
-                    self.content.push(ReasoningTextContent::new(text));
+                    insert_at_part_index(&mut self.content, *content_index, ReasoningTextContent::new(text));
                 }
             }
-            EventPayload::ReasoningSummaryTextDone { text, .. } => {
+            EventPayload::ReasoningSummaryTextDone {
+                text, summary_index, ..
+            } => {
                 let text = final_text(text, buffer);
                 if !text.is_empty() {
-                    self.summary
-                        .push(serde_json::json!({"type": "summary_text", "text": text}));
+                    insert_at_part_index(
+                        &mut self.summary,
+                        *summary_index,
+                        serde_json::json!({"type": "summary_text", "text": text}),
+                    );
                 }
+            }
+            EventPayload::OutputItemDone { item, .. } => {
+                let Some(raw_item) = item.as_object() else {
+                    return;
+                };
+                let Ok(mut completed) = Self::try_from(payload) else {
+                    return;
+                };
+
+                if !raw_item.contains_key("content") {
+                    completed.content = std::mem::take(&mut self.content);
+                }
+                if !raw_item.contains_key("summary") {
+                    completed.summary = std::mem::take(&mut self.summary);
+                }
+                *self = completed;
             }
             _ => {}
         }
     }
+}
+
+fn insert_at_part_index<T>(parts: &mut Vec<T>, part_index: u32, part: T) {
+    let index = usize::try_from(part_index).unwrap_or(usize::MAX).min(parts.len());
+    parts.insert(index, part);
 }
 
 fn final_text(text: &str, buffer: &mut String) -> String {
@@ -887,6 +932,94 @@ mod tests {
         let serialized = serde_json::to_value(&item).unwrap();
         assert_eq!(serialized["type"], "reasoning");
         assert_eq!(serialized["id"], "rs_abc");
+    }
+
+    #[test]
+    fn reasoning_output_builds_from_added_and_applies_indexed_done_events() {
+        let added = EventPayload::OutputItemAdded {
+            item_id: "rs_1".to_owned(),
+            item_type: crate::events::SSEItemType::Reasoning,
+            output_index: 2,
+            name: None,
+            namespace: None,
+            call_id: None,
+        };
+        let mut item = ReasoningOutput::try_from(&added).unwrap();
+
+        for (content_index, text) in [(1, "second thought"), (0, "first thought")] {
+            item.apply_done(
+                &EventPayload::ReasoningTextDone {
+                    text: text.to_owned(),
+                    item_id: "rs_1".to_owned(),
+                    output_index: 2,
+                    content_index,
+                },
+                &mut String::new(),
+            );
+        }
+        for (summary_index, text) in [(1, "second summary"), (0, "first summary")] {
+            item.apply_done(
+                &EventPayload::ReasoningSummaryTextDone {
+                    text: text.to_owned(),
+                    item_id: "rs_1".to_owned(),
+                    output_index: 2,
+                    summary_index,
+                },
+                &mut String::new(),
+            );
+        }
+
+        assert_eq!(item.id, "rs_1");
+        assert_eq!(
+            item.content.iter().map(|part| part.text.as_str()).collect::<Vec<_>>(),
+            ["first thought", "second thought"]
+        );
+        assert_eq!(item.summary[0]["text"], "first summary");
+        assert_eq!(item.summary[1]["text"], "second summary");
+    }
+
+    #[test]
+    fn reasoning_output_done_owns_authoritative_field_reconciliation() {
+        let mut item = ReasoningOutput::new("rs_1");
+        item.content.push(ReasoningTextContent::new("buffered thought"));
+        item.summary
+            .push(serde_json::json!({"type": "summary_text", "text": "buffered summary"}));
+        let done = EventPayload::OutputItemDone {
+            item_id: "rs_1".to_owned(),
+            item_type: crate::events::SSEItemType::Reasoning,
+            output_index: 0,
+            item: serde_json::json!({
+                "id": "rs_1",
+                "type": "reasoning",
+                "summary": null,
+                "encrypted_content": "opaque-state",
+                "status": "completed",
+            }),
+        };
+
+        let parsed = ReasoningOutput::try_from(&done).unwrap();
+        assert!(parsed.content.is_empty());
+        assert!(parsed.summary.is_empty());
+
+        item.apply_done(&done, &mut String::new());
+        assert_eq!(item.content[0].text, "buffered thought");
+        assert!(item.summary.is_empty());
+        assert_eq!(item.encrypted_content, Some(serde_json::json!("opaque-state")));
+        assert_eq!(item.status.as_deref(), Some("completed"));
+
+        let before = serde_json::to_value(&item).unwrap();
+        let malformed = EventPayload::OutputItemDone {
+            item_id: "rs_1".to_owned(),
+            item_type: crate::events::SSEItemType::Reasoning,
+            output_index: 0,
+            item: serde_json::json!({
+                "id": "rs_1",
+                "type": "reasoning",
+                "content": "not-an-array",
+            }),
+        };
+        item.apply_done(&malformed, &mut String::new());
+        assert_eq!(serde_json::to_value(item).unwrap(), before);
     }
 
     #[test]

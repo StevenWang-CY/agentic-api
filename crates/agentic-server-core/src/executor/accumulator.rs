@@ -22,7 +22,7 @@ use crate::types::event::{MessageStatus, ResponseStatus};
 use crate::types::io::output::McpListTools;
 use crate::types::io::{
     ApplyDone, CompactionItem, CustomToolCall, FunctionToolCall, OutputItem, OutputMessage, OutputTextContent,
-    ReasoningOutput, ReasoningTextContent, ResponseUsage,
+    ReasoningOutput, ResponseUsage,
 };
 use crate::types::io::{McpCall, WebSearchCall};
 use crate::types::request_response::{IncompleteDetails, ResponsePayload};
@@ -30,78 +30,49 @@ use crate::utils::common::{deserialize_from_str, deserialize_from_value_opt};
 use crate::utils::uuid7_str;
 
 #[derive(Default)]
-struct ReasoningFallback {
+struct ReasoningBuffers {
     content: BTreeMap<u32, String>,
     summary: BTreeMap<u32, String>,
 }
 
-impl ReasoningFallback {
+impl ReasoningBuffers {
     fn push_content_delta(&mut self, content_index: u32, delta: &str) {
         self.content.entry(content_index).or_default().push_str(delta);
     }
 
-    fn finish_content(&mut self, content_index: u32, text: &str) {
-        finish_indexed_text(&mut self.content, content_index, text);
+    fn take_content(&mut self, content_index: u32) -> String {
+        self.content.remove(&content_index).unwrap_or_default()
     }
 
     fn push_summary_delta(&mut self, summary_index: u32, delta: &str) {
         self.summary.entry(summary_index).or_default().push_str(delta);
     }
 
-    fn finish_summary(&mut self, summary_index: u32, text: &str) {
-        finish_indexed_text(&mut self.summary, summary_index, text);
-    }
-
-    fn append_content_to(&mut self, content: &mut Vec<ReasoningTextContent>) {
-        content.extend(
-            std::mem::take(&mut self.content)
-                .into_values()
-                .filter(|text| !text.is_empty())
-                .map(ReasoningTextContent::new),
-        );
-    }
-
-    fn append_summary_to(&mut self, summary: &mut Vec<serde_json::Value>) {
-        summary.extend(
-            std::mem::take(&mut self.summary)
-                .into_values()
-                .filter(|text| !text.is_empty())
-                .map(|text| serde_json::json!({"type": "summary_text", "text": text})),
-        );
-    }
-
-    fn append_to(mut self, item: &mut ReasoningOutput) {
-        self.append_content_to(&mut item.content);
-        self.append_summary_to(&mut item.summary);
+    fn take_summary(&mut self, summary_index: u32) -> String {
+        self.summary.remove(&summary_index).unwrap_or_default()
     }
 }
 
-fn finish_indexed_text(parts: &mut BTreeMap<u32, String>, index: u32, text: &str) {
-    let part = parts.entry(index).or_default();
-    if !text.is_empty() {
-        text.clone_into(part);
+fn apply_reasoning_buffers(item: &mut ReasoningOutput, buffers: ReasoningBuffers, output_index: u32) {
+    for (content_index, mut buffer) in buffers.content {
+        let done = EventPayload::ReasoningTextDone {
+            text: String::new(),
+            item_id: item.id.clone(),
+            output_index,
+            content_index,
+        };
+        item.apply_done(&done, &mut buffer);
     }
-}
 
-#[derive(Clone, Copy)]
-struct ReasoningFieldPresence {
-    content: bool,
-    summary: bool,
-}
-
-fn parse_completed_reasoning(raw_item: &serde_json::Value) -> Option<(ReasoningOutput, ReasoningFieldPresence)> {
-    let raw_object = raw_item.as_object()?;
-    let presence = ReasoningFieldPresence {
-        content: raw_object.contains_key("content"),
-        summary: raw_object.contains_key("summary"),
-    };
-    let OutputItem::Reasoning(item) = deserialize_from_value_opt::<OutputItem>(raw_item.clone())? else {
-        return None;
-    };
-    if item.id.is_empty() {
-        return None;
+    for (summary_index, mut buffer) in buffers.summary {
+        let done = EventPayload::ReasoningSummaryTextDone {
+            text: String::new(),
+            item_id: item.id.clone(),
+            output_index,
+            summary_index,
+        };
+        item.apply_done(&done, &mut buffer);
     }
-    Some((item, presence))
 }
 
 /// Tracks a single output item currently being streamed, together with its
@@ -113,7 +84,7 @@ enum InFlight {
     },
     Reasoning {
         item: ReasoningOutput,
-        fallback: ReasoningFallback,
+        buffers: ReasoningBuffers,
     },
     FunctionCall {
         item: FunctionToolCall,
@@ -153,10 +124,10 @@ impl std::fmt::Debug for InFlight {
 }
 
 impl InFlight {
-    fn finalize(self) -> Option<OutputItem> {
+    fn finalize(self, output_index: u32) -> Option<OutputItem> {
         match self {
-            Self::Reasoning { mut item, fallback } => {
-                fallback.append_to(&mut item);
+            Self::Reasoning { mut item, buffers } => {
+                apply_reasoning_buffers(&mut item, buffers, output_index);
                 Some(OutputItem::Reasoning(item))
             }
             Self::FunctionCall { mut item, arguments } => {
@@ -353,11 +324,12 @@ impl ResponseAccumulator {
 
     /// Finalizes all streaming items in upstream `output_index` order.
     pub(crate) fn finalize_all(&mut self) {
-        self.completed.extend(
-            self.in_flight
-                .drain(..)
-                .filter_map(|(_, entry)| entry.item.finalize().map(|item| (entry.output_index, item))),
-        );
+        self.completed.extend(self.in_flight.drain(..).filter_map(|(_, entry)| {
+            entry
+                .item
+                .finalize(entry.output_index)
+                .map(|item| (entry.output_index, item))
+        }));
         self.completed.sort_by_key(|(output_index, _)| *output_index);
         self.output
             .extend(self.completed.drain(..).map(|(_, output_item)| output_item));
@@ -451,7 +423,7 @@ impl ResponseAccumulator {
     /// frame (e.g. [`StreamTee`](future)) can call this directly without
     /// re-parsing from a raw line.
     pub(crate) fn process_event(&mut self, frame: &EventFrame) {
-        if self.process_reasoning_event(frame) {
+        if self.route_reasoning_event(frame) {
             return;
         }
         match (&frame.event_type, &frame.payload) {
@@ -531,7 +503,7 @@ impl ResponseAccumulator {
         }
     }
 
-    fn process_reasoning_event(&mut self, frame: &EventFrame) -> bool {
+    fn route_reasoning_event(&mut self, frame: &EventFrame) -> bool {
         match (&frame.event_type, &frame.payload) {
             (
                 SSEEventType::ReasoningTextDelta,
@@ -542,21 +514,22 @@ impl ResponseAccumulator {
                     content_index,
                 },
             ) => {
-                if let Some(fallback) = self.in_flight_reasoning_fallback_mut(item_id, *output_index) {
-                    fallback.push_content_delta(*content_index, delta);
+                if let Some((_, buffers)) = self.in_flight_reasoning_mut(item_id, *output_index) {
+                    buffers.push_content_delta(*content_index, delta);
                 }
             }
             (
                 SSEEventType::ReasoningTextDone,
-                EventPayload::ReasoningTextDone {
-                    text,
+                payload @ EventPayload::ReasoningTextDone {
                     item_id,
                     output_index,
                     content_index,
+                    ..
                 },
             ) => {
-                if let Some(fallback) = self.in_flight_reasoning_fallback_mut(item_id, *output_index) {
-                    fallback.finish_content(*content_index, text);
+                if let Some((item, buffers)) = self.in_flight_reasoning_mut(item_id, *output_index) {
+                    let mut buffer = buffers.take_content(*content_index);
+                    item.apply_done(payload, &mut buffer);
                 }
             }
             (
@@ -568,21 +541,22 @@ impl ResponseAccumulator {
                     summary_index,
                 },
             ) => {
-                if let Some(fallback) = self.in_flight_reasoning_fallback_mut(item_id, *output_index) {
-                    fallback.push_summary_delta(*summary_index, delta);
+                if let Some((_, buffers)) = self.in_flight_reasoning_mut(item_id, *output_index) {
+                    buffers.push_summary_delta(*summary_index, delta);
                 }
             }
             (
                 SSEEventType::ReasoningSummaryTextDone,
-                EventPayload::ReasoningSummaryTextDone {
-                    text,
+                payload @ EventPayload::ReasoningSummaryTextDone {
                     item_id,
                     output_index,
                     summary_index,
+                    ..
                 },
             ) => {
-                if let Some(fallback) = self.in_flight_reasoning_fallback_mut(item_id, *output_index) {
-                    fallback.finish_summary(*summary_index, text);
+                if let Some((item, buffers)) = self.in_flight_reasoning_mut(item_id, *output_index) {
+                    let mut buffer = buffers.take_summary(*summary_index);
+                    item.apply_done(payload, &mut buffer);
                 }
             }
             _ => return false,
@@ -603,7 +577,7 @@ impl ResponseAccumulator {
         let item = match item_type {
             SSEItemType::Reasoning => ReasoningOutput::try_from(payload).ok().map(|item| InFlight::Reasoning {
                 item,
-                fallback: ReasoningFallback::default(),
+                buffers: ReasoningBuffers::default(),
             }),
             SSEItemType::FunctionCall => FunctionToolCall::try_from(payload)
                 .ok()
@@ -673,7 +647,7 @@ impl ResponseAccumulator {
             return;
         };
         if *item_type == SSEItemType::Reasoning {
-            self.complete_reasoning_item(item_id, *output_index, raw_item);
+            self.complete_reasoning_item(payload);
             return;
         }
         let in_flight_key = self.in_flight_call_key(item_id, *item_type, *output_index);
@@ -719,40 +693,30 @@ impl ResponseAccumulator {
         }
     }
 
-    fn complete_reasoning_item(&mut self, item_id: &str, output_index: u32, raw_item: &serde_json::Value) {
-        let in_flight_key = self.in_flight_reasoning_key(item_id, output_index);
-        let completed = parse_completed_reasoning(raw_item);
+    fn complete_reasoning_item(&mut self, payload: &EventPayload) {
+        let EventPayload::OutputItemDone {
+            item_id, output_index, ..
+        } = payload
+        else {
+            return;
+        };
+        let in_flight_key = self.in_flight_reasoning_key(item_id, *output_index);
 
         if let Some(key) = in_flight_key {
-            let Some((mut completed, presence)) = completed else {
-                return;
-            };
             let Some(entry) = self.in_flight.get_mut(&key) else {
                 return;
             };
-            entry.output_index = output_index;
-            let InFlight::Reasoning { item, fallback } = &mut entry.item else {
+            entry.output_index = *output_index;
+            let InFlight::Reasoning { item, buffers } = &mut entry.item else {
                 return;
             };
-
-            if presence.content {
-                fallback.content.clear();
-            } else {
-                completed.content = std::mem::take(&mut item.content);
-                fallback.append_content_to(&mut completed.content);
-            }
-            if presence.summary {
-                fallback.summary.clear();
-            } else {
-                completed.summary = std::mem::take(&mut item.summary);
-                fallback.append_summary_to(&mut completed.summary);
-            }
-            *item = completed;
+            apply_reasoning_buffers(item, std::mem::take(buffers), *output_index);
+            item.apply_done(payload, &mut String::new());
             return;
         }
 
-        if let Some((completed, _)) = completed {
-            self.upsert_completed_reasoning(output_index, completed);
+        if let Ok(completed) = ReasoningOutput::try_from(payload) {
+            self.upsert_completed_reasoning(*output_index, completed);
         }
     }
 
@@ -770,12 +734,16 @@ impl ResponseAccumulator {
         self.completed.push((output_index, OutputItem::Reasoning(item)));
     }
 
-    fn in_flight_reasoning_fallback_mut(&mut self, item_id: &str, output_index: u32) -> Option<&mut ReasoningFallback> {
+    fn in_flight_reasoning_mut(
+        &mut self,
+        item_id: &str,
+        output_index: u32,
+    ) -> Option<(&mut ReasoningOutput, &mut ReasoningBuffers)> {
         let key = self.in_flight_reasoning_key(item_id, output_index)?;
-        let InFlight::Reasoning { fallback, .. } = &mut self.in_flight.get_mut(&key)?.item else {
+        let InFlight::Reasoning { item, buffers } = &mut self.in_flight.get_mut(&key)?.item else {
             return None;
         };
-        Some(fallback)
+        Some((item, buffers))
     }
 
     fn in_flight_reasoning_key(&self, item_id: &str, output_index: u32) -> Option<String> {
@@ -1464,7 +1432,7 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_content_and_summary_fallbacks_keep_index_order() {
+    fn reasoning_content_and_summary_buffers_keep_index_order() {
         let lines = [
             r#"data: {"type":"response.output_item.added","output_index":0,"item":{"id":"rs_1","type":"reasoning"}}"#.to_owned(),
             r#"data: {"type":"response.reasoning_text.delta","item_id":"rs_1","output_index":0,"content_index":1,"delta":"second"}"#.to_owned(),
@@ -1498,7 +1466,7 @@ mod tests {
     }
 
     #[test]
-    fn completed_reasoning_uses_fallback_only_for_omitted_fields() {
+    fn completed_reasoning_uses_buffered_text_only_for_omitted_fields() {
         let lines = [
             r#"data: {"type":"response.output_item.added","output_index":0,"item":{"id":"rs_1","type":"reasoning"}}"#.to_owned(),
             r#"data: {"type":"response.reasoning_text.delta","item_id":"rs_1","output_index":0,"content_index":0,"delta":"fallback content"}"#.to_owned(),
@@ -1589,7 +1557,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_completed_reasoning_retains_valid_fallbacks() {
+    fn malformed_completed_reasoning_retains_buffered_text() {
         let lines = [
             r#"data: {"type":"response.output_item.added","output_index":0,"item":{"id":"rs_1","type":"reasoning"}}"#.to_owned(),
             r#"data: {"type":"response.reasoning_text.delta","item_id":"rs_1","output_index":0,"content_index":0,"delta":"fallback content"}"#.to_owned(),
