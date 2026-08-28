@@ -540,12 +540,20 @@ impl ReasoningTextContent {
 pub struct ReasoningOutput {
     #[serde(default)]
     pub id: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_nullable_vec")]
     pub content: Vec<ReasoningTextContent>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_nullable_vec")]
     pub summary: Vec<Value>,
     pub encrypted_content: Option<Value>,
     pub status: Option<String>,
+}
+
+fn deserialize_nullable_vec<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<Vec<T>>::deserialize(deserializer).map(Option::unwrap_or_default)
 }
 
 impl ReasoningOutput {
@@ -587,18 +595,31 @@ pub trait ApplyDone {
 
 impl ApplyDone for ReasoningOutput {
     fn apply_done(&mut self, payload: &EventPayload, buffer: &mut String) {
-        let EventPayload::ReasoningDone { text, .. } = payload else {
-            return;
-        };
-        let text = if text.is_empty() {
-            std::mem::take(buffer)
-        } else {
-            buffer.clear();
-            text.clone()
-        };
-        if !text.is_empty() {
-            self.content.push(ReasoningTextContent::new(text));
+        match payload {
+            EventPayload::ReasoningTextDone { text, .. } => {
+                let text = final_text(text, buffer);
+                if !text.is_empty() {
+                    self.content.push(ReasoningTextContent::new(text));
+                }
+            }
+            EventPayload::ReasoningSummaryTextDone { text, .. } => {
+                let text = final_text(text, buffer);
+                if !text.is_empty() {
+                    self.summary
+                        .push(serde_json::json!({"type": "summary_text", "text": text}));
+                }
+            }
+            _ => {}
         }
+    }
+}
+
+fn final_text(text: &str, buffer: &mut String) -> String {
+    if text.is_empty() {
+        std::mem::take(buffer)
+    } else {
+        buffer.clear();
+        text.to_owned()
     }
 }
 

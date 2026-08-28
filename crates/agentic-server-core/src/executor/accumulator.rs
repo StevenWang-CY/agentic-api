@@ -7,6 +7,7 @@
 //! runs on a blocking thread while the async task continues reading from the
 //! network — keeping the tokio executor thread free between chunk arrivals.
 
+use std::collections::BTreeMap;
 use std::pin::Pin;
 use std::sync::mpsc;
 
@@ -28,17 +29,112 @@ use crate::types::request_response::{IncompleteDetails, ResponsePayload};
 use crate::utils::common::{deserialize_from_str, deserialize_from_value_opt};
 use crate::utils::uuid7_str;
 
+#[derive(Default)]
+struct ReasoningFallback {
+    content: BTreeMap<u32, String>,
+    summary: BTreeMap<u32, String>,
+}
+
+impl ReasoningFallback {
+    fn push_content_delta(&mut self, content_index: u32, delta: &str) {
+        self.content.entry(content_index).or_default().push_str(delta);
+    }
+
+    fn finish_content(&mut self, content_index: u32, text: &str) {
+        finish_indexed_text(&mut self.content, content_index, text);
+    }
+
+    fn push_summary_delta(&mut self, summary_index: u32, delta: &str) {
+        self.summary.entry(summary_index).or_default().push_str(delta);
+    }
+
+    fn finish_summary(&mut self, summary_index: u32, text: &str) {
+        finish_indexed_text(&mut self.summary, summary_index, text);
+    }
+
+    fn append_content_to(&mut self, content: &mut Vec<ReasoningTextContent>) {
+        content.extend(
+            std::mem::take(&mut self.content)
+                .into_values()
+                .filter(|text| !text.is_empty())
+                .map(ReasoningTextContent::new),
+        );
+    }
+
+    fn append_summary_to(&mut self, summary: &mut Vec<serde_json::Value>) {
+        summary.extend(
+            std::mem::take(&mut self.summary)
+                .into_values()
+                .filter(|text| !text.is_empty())
+                .map(|text| serde_json::json!({"type": "summary_text", "text": text})),
+        );
+    }
+
+    fn append_to(mut self, item: &mut ReasoningOutput) {
+        self.append_content_to(&mut item.content);
+        self.append_summary_to(&mut item.summary);
+    }
+}
+
+fn finish_indexed_text(parts: &mut BTreeMap<u32, String>, index: u32, text: &str) {
+    let part = parts.entry(index).or_default();
+    if !text.is_empty() {
+        text.clone_into(part);
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ReasoningFieldPresence {
+    content: bool,
+    summary: bool,
+}
+
+fn parse_completed_reasoning(raw_item: &serde_json::Value) -> Option<(ReasoningOutput, ReasoningFieldPresence)> {
+    let raw_object = raw_item.as_object()?;
+    let presence = ReasoningFieldPresence {
+        content: raw_object.contains_key("content"),
+        summary: raw_object.contains_key("summary"),
+    };
+    let OutputItem::Reasoning(item) = deserialize_from_value_opt::<OutputItem>(raw_item.clone())? else {
+        return None;
+    };
+    if item.id.is_empty() {
+        return None;
+    }
+    Some((item, presence))
+}
+
 /// Tracks a single output item currently being streamed, together with its
 /// accumulated text/arguments buffer.
 enum InFlight {
-    Message { item: OutputMessage, text: String },
-    Reasoning { item: ReasoningOutput, text: String },
-    FunctionCall { item: FunctionToolCall, arguments: String },
-    CustomToolCall { item: CustomToolCall, input: String },
-    WebSearchCall { item: Option<WebSearchCall> },
-    McpCall { item: McpCall },
-    McpListTools { item: McpListTools },
-    Compaction { item: CompactionItem },
+    Message {
+        item: OutputMessage,
+        text: String,
+    },
+    Reasoning {
+        item: ReasoningOutput,
+        fallback: ReasoningFallback,
+    },
+    FunctionCall {
+        item: FunctionToolCall,
+        arguments: String,
+    },
+    CustomToolCall {
+        item: CustomToolCall,
+        input: String,
+    },
+    WebSearchCall {
+        item: Option<WebSearchCall>,
+    },
+    McpCall {
+        item: McpCall,
+    },
+    McpListTools {
+        item: McpListTools,
+    },
+    Compaction {
+        item: CompactionItem,
+    },
 }
 
 impl std::fmt::Debug for InFlight {
@@ -59,10 +155,8 @@ impl std::fmt::Debug for InFlight {
 impl InFlight {
     fn finalize(self) -> Option<OutputItem> {
         match self {
-            Self::Reasoning { mut item, text } => {
-                if !text.is_empty() {
-                    item.content.push(ReasoningTextContent::new(text));
-                }
+            Self::Reasoning { mut item, fallback } => {
+                fallback.append_to(&mut item);
                 Some(OutputItem::Reasoning(item))
             }
             Self::FunctionCall { mut item, arguments } => {
@@ -357,6 +451,9 @@ impl ResponseAccumulator {
     /// frame (e.g. [`StreamTee`](future)) can call this directly without
     /// re-parsing from a raw line.
     pub(crate) fn process_event(&mut self, frame: &EventFrame) {
+        if self.process_reasoning_event(frame) {
+            return;
+        }
         match (&frame.event_type, &frame.payload) {
             (SSEEventType::ResponseCreated, EventPayload::Response { id, .. }) if !id.is_empty() => {
                 self.response_id.clone_from(id);
@@ -365,21 +462,7 @@ impl ResponseAccumulator {
                 self.start_output_item(payload);
             }
             (SSEEventType::OutputItemDone, payload @ EventPayload::OutputItemDone { .. }) => {
-                self.complete_call_item(payload);
-            }
-            (SSEEventType::ReasoningTextDelta, EventPayload::ReasoningDelta { delta, item_id }) => {
-                if let Some(InFlight::Reasoning { text, .. }) =
-                    self.in_flight.get_mut(item_id).map(|entry| &mut entry.item)
-                {
-                    text.push_str(delta);
-                }
-            }
-            (SSEEventType::ReasoningTextDone, EventPayload::ReasoningDone { item_id, .. }) => {
-                if let Some(InFlight::Reasoning { item, text }) =
-                    self.in_flight.get_mut(item_id).map(|entry| &mut entry.item)
-                {
-                    item.apply_done(&frame.payload, text);
-                }
+                self.complete_output_item(payload);
             }
             (
                 SSEEventType::FunctionCallArgumentsDelta,
@@ -448,6 +531,65 @@ impl ResponseAccumulator {
         }
     }
 
+    fn process_reasoning_event(&mut self, frame: &EventFrame) -> bool {
+        match (&frame.event_type, &frame.payload) {
+            (
+                SSEEventType::ReasoningTextDelta,
+                EventPayload::ReasoningTextDelta {
+                    delta,
+                    item_id,
+                    output_index,
+                    content_index,
+                },
+            ) => {
+                if let Some(fallback) = self.in_flight_reasoning_fallback_mut(item_id, *output_index) {
+                    fallback.push_content_delta(*content_index, delta);
+                }
+            }
+            (
+                SSEEventType::ReasoningTextDone,
+                EventPayload::ReasoningTextDone {
+                    text,
+                    item_id,
+                    output_index,
+                    content_index,
+                },
+            ) => {
+                if let Some(fallback) = self.in_flight_reasoning_fallback_mut(item_id, *output_index) {
+                    fallback.finish_content(*content_index, text);
+                }
+            }
+            (
+                SSEEventType::ReasoningSummaryTextDelta,
+                EventPayload::ReasoningSummaryTextDelta {
+                    delta,
+                    item_id,
+                    output_index,
+                    summary_index,
+                },
+            ) => {
+                if let Some(fallback) = self.in_flight_reasoning_fallback_mut(item_id, *output_index) {
+                    fallback.push_summary_delta(*summary_index, delta);
+                }
+            }
+            (
+                SSEEventType::ReasoningSummaryTextDone,
+                EventPayload::ReasoningSummaryTextDone {
+                    text,
+                    item_id,
+                    output_index,
+                    summary_index,
+                },
+            ) => {
+                if let Some(fallback) = self.in_flight_reasoning_fallback_mut(item_id, *output_index) {
+                    fallback.finish_summary(*summary_index, text);
+                }
+            }
+            _ => return false,
+        }
+        true
+    }
+
     fn start_output_item(&mut self, payload: &EventPayload) {
         let EventPayload::OutputItemAdded {
             item_id,
@@ -461,7 +603,7 @@ impl ResponseAccumulator {
         let item = match item_type {
             SSEItemType::Reasoning => ReasoningOutput::try_from(payload).ok().map(|item| InFlight::Reasoning {
                 item,
-                text: String::with_capacity(256),
+                fallback: ReasoningFallback::default(),
             }),
             SSEItemType::FunctionCall => FunctionToolCall::try_from(payload)
                 .ok()
@@ -519,7 +661,7 @@ impl ResponseAccumulator {
         self.usage = usage;
     }
 
-    fn complete_call_item(&mut self, payload: &EventPayload) {
+    fn complete_output_item(&mut self, payload: &EventPayload) {
         let EventPayload::OutputItemDone {
             item_id,
             item_type,
@@ -530,6 +672,10 @@ impl ResponseAccumulator {
         else {
             return;
         };
+        if *item_type == SSEItemType::Reasoning {
+            self.complete_reasoning_item(item_id, *output_index, raw_item);
+            return;
+        }
         let in_flight_key = self.in_flight_call_key(item_id, *item_type, *output_index);
         let done_item = deserialize_from_value_opt::<OutputItem>(raw_item.clone());
         if let Some(entry) = in_flight_key.as_deref().and_then(|key| self.in_flight.get_mut(key)) {
@@ -571,6 +717,78 @@ impl ResponseAccumulator {
             }
             self.completed.push((*output_index, output_item));
         }
+    }
+
+    fn complete_reasoning_item(&mut self, item_id: &str, output_index: u32, raw_item: &serde_json::Value) {
+        let in_flight_key = self.in_flight_reasoning_key(item_id, output_index);
+        let completed = parse_completed_reasoning(raw_item);
+
+        if let Some(key) = in_flight_key {
+            let Some((mut completed, presence)) = completed else {
+                return;
+            };
+            let Some(entry) = self.in_flight.get_mut(&key) else {
+                return;
+            };
+            entry.output_index = output_index;
+            let InFlight::Reasoning { item, fallback } = &mut entry.item else {
+                return;
+            };
+
+            if presence.content {
+                fallback.content.clear();
+            } else {
+                completed.content = std::mem::take(&mut item.content);
+                fallback.append_content_to(&mut completed.content);
+            }
+            if presence.summary {
+                fallback.summary.clear();
+            } else {
+                completed.summary = std::mem::take(&mut item.summary);
+                fallback.append_summary_to(&mut completed.summary);
+            }
+            *item = completed;
+            return;
+        }
+
+        if let Some((completed, _)) = completed {
+            self.upsert_completed_reasoning(output_index, completed);
+        }
+    }
+
+    fn upsert_completed_reasoning(&mut self, output_index: u32, item: ReasoningOutput) {
+        if let Some((existing_index, existing)) = self.completed.iter_mut().find_map(|(existing_index, output_item)| {
+            let OutputItem::Reasoning(existing) = output_item else {
+                return None;
+            };
+            (existing.id == item.id).then_some((existing_index, existing))
+        }) {
+            *existing_index = output_index;
+            *existing = item;
+            return;
+        }
+        self.completed.push((output_index, OutputItem::Reasoning(item)));
+    }
+
+    fn in_flight_reasoning_fallback_mut(&mut self, item_id: &str, output_index: u32) -> Option<&mut ReasoningFallback> {
+        let key = self.in_flight_reasoning_key(item_id, output_index)?;
+        let InFlight::Reasoning { fallback, .. } = &mut self.in_flight.get_mut(&key)?.item else {
+            return None;
+        };
+        Some(fallback)
+    }
+
+    fn in_flight_reasoning_key(&self, item_id: &str, output_index: u32) -> Option<String> {
+        self.in_flight
+            .get(item_id)
+            .filter(|entry| matches!(entry.item, InFlight::Reasoning { .. }))
+            .map(|_| item_id.to_owned())
+            .or_else(|| {
+                self.in_flight.iter().find_map(|(key, entry)| {
+                    (entry.output_index == output_index && matches!(entry.item, InFlight::Reasoning { .. }))
+                        .then(|| key.clone())
+                })
+            })
     }
 
     fn in_flight_call_key(&self, item_id: &str, item_type: SSEItemType, output_index: u32) -> Option<String> {
@@ -1214,6 +1432,197 @@ mod tests {
         } else {
             panic!("expected OutputItem::Message");
         }
+    }
+
+    #[test]
+    fn completed_reasoning_replaces_partial_deltas_without_duplication() {
+        let lines = [
+            r#"data: {"type":"response.output_item.added","output_index":0,"item":{"id":"rs_1","type":"reasoning","content":[],"summary":[]}}"#.to_owned(),
+            r#"data: {"type":"response.reasoning_text.delta","item_id":"rs_1","output_index":0,"content_index":0,"delta":"partial content"}"#.to_owned(),
+            r#"data: {"type":"response.reasoning_summary_text.delta","item_id":"rs_1","output_index":0,"summary_index":0,"delta":"partial summary"}"#.to_owned(),
+            r#"data: {"type":"response.output_item.done","output_index":0,"item":{"id":"rs_1","type":"reasoning","content":[{"type":"reasoning_text","text":"complete content"},{"type":"reasoning_text","text":"second content"}],"summary":[{"type":"summary_text","text":"complete summary"}],"encrypted_content":"opaque-state","status":"completed"}}"#.to_owned(),
+            r#"data: {"type":"response.completed","response":{"id":"resp_1","status":"completed"}}"#.to_owned(),
+        ];
+
+        let acc = ResponseAccumulator::from_sse_lines(lines, None);
+
+        assert_eq!(acc.output.len(), 1);
+        assert_eq!(
+            serde_json::to_value(&acc.output[0]).unwrap(),
+            serde_json::json!({
+                "type": "reasoning",
+                "id": "rs_1",
+                "content": [
+                    {"type": "reasoning_text", "text": "complete content"},
+                    {"type": "reasoning_text", "text": "second content"},
+                ],
+                "summary": [{"type": "summary_text", "text": "complete summary"}],
+                "encrypted_content": "opaque-state",
+                "status": "completed",
+            })
+        );
+    }
+
+    #[test]
+    fn reasoning_content_and_summary_fallbacks_keep_index_order() {
+        let lines = [
+            r#"data: {"type":"response.output_item.added","output_index":0,"item":{"id":"rs_1","type":"reasoning"}}"#.to_owned(),
+            r#"data: {"type":"response.reasoning_text.delta","item_id":"rs_1","output_index":0,"content_index":1,"delta":"second"}"#.to_owned(),
+            r#"data: {"type":"response.reasoning_text.done","item_id":"rs_1","output_index":0,"content_index":1,"text":"second content"}"#.to_owned(),
+            r#"data: {"type":"response.reasoning_text.delta","item_id":"rs_1","output_index":0,"content_index":0,"delta":"first content"}"#.to_owned(),
+            r#"data: {"type":"response.reasoning_summary_text.delta","item_id":"rs_1","output_index":0,"summary_index":1,"delta":"second summary"}"#.to_owned(),
+            r#"data: {"type":"response.reasoning_summary_text.done","item_id":"rs_1","output_index":0,"summary_index":0,"text":"first summary"}"#.to_owned(),
+            r#"data: {"type":"response.completed","response":{"id":"resp_1","status":"completed"}}"#.to_owned(),
+        ];
+
+        let acc = ResponseAccumulator::from_sse_lines(lines, None);
+        let OutputItem::Reasoning(reasoning) = &acc.output[0] else {
+            panic!("expected reasoning output");
+        };
+
+        assert_eq!(
+            reasoning
+                .content
+                .iter()
+                .map(|part| part.text.as_str())
+                .collect::<Vec<_>>(),
+            ["first content", "second content"]
+        );
+        assert_eq!(
+            reasoning.summary,
+            [
+                serde_json::json!({"type": "summary_text", "text": "first summary"}),
+                serde_json::json!({"type": "summary_text", "text": "second summary"}),
+            ]
+        );
+    }
+
+    #[test]
+    fn completed_reasoning_uses_fallback_only_for_omitted_fields() {
+        let lines = [
+            r#"data: {"type":"response.output_item.added","output_index":0,"item":{"id":"rs_1","type":"reasoning"}}"#.to_owned(),
+            r#"data: {"type":"response.reasoning_text.delta","item_id":"rs_1","output_index":0,"content_index":0,"delta":"fallback content"}"#.to_owned(),
+            r#"data: {"type":"response.reasoning_summary_text.delta","item_id":"rs_1","output_index":0,"summary_index":0,"delta":"fallback summary"}"#.to_owned(),
+            r#"data: {"type":"response.output_item.done","output_index":0,"item":{"id":"rs_1","type":"reasoning","encrypted_content":{"token":"opaque"},"status":"completed"}}"#.to_owned(),
+            r#"data: {"type":"response.completed","response":{"id":"resp_1","status":"completed"}}"#.to_owned(),
+        ];
+
+        let acc = ResponseAccumulator::from_sse_lines(lines, None);
+        let OutputItem::Reasoning(reasoning) = &acc.output[0] else {
+            panic!("expected reasoning output");
+        };
+
+        assert_eq!(reasoning.content[0].text, "fallback content");
+        assert_eq!(
+            reasoning.summary,
+            [serde_json::json!({"type": "summary_text", "text": "fallback summary"})]
+        );
+        assert_eq!(
+            reasoning.encrypted_content,
+            Some(serde_json::json!({"token": "opaque"}))
+        );
+        assert_eq!(reasoning.status.as_deref(), Some("completed"));
+    }
+
+    #[test]
+    fn completed_reasoning_null_and_empty_fields_are_authoritative_independently() {
+        let content_null = [
+            r#"data: {"type":"response.output_item.added","output_index":0,"item":{"id":"rs_content_null","type":"reasoning"}}"#.to_owned(),
+            r#"data: {"type":"response.reasoning_text.delta","item_id":"rs_content_null","output_index":0,"content_index":0,"delta":"discarded content"}"#.to_owned(),
+            r#"data: {"type":"response.reasoning_summary_text.delta","item_id":"rs_content_null","output_index":0,"summary_index":0,"delta":"kept summary"}"#.to_owned(),
+            r#"data: {"type":"response.output_item.done","output_index":0,"item":{"id":"rs_content_null","type":"reasoning","content":null}}"#.to_owned(),
+        ];
+        let summary_empty = [
+            r#"data: {"type":"response.output_item.added","output_index":0,"item":{"id":"rs_summary_empty","type":"reasoning"}}"#.to_owned(),
+            r#"data: {"type":"response.reasoning_text.delta","item_id":"rs_summary_empty","output_index":0,"content_index":0,"delta":"kept content"}"#.to_owned(),
+            r#"data: {"type":"response.reasoning_summary_text.delta","item_id":"rs_summary_empty","output_index":0,"summary_index":0,"delta":"discarded summary"}"#.to_owned(),
+            r#"data: {"type":"response.output_item.done","output_index":0,"item":{"id":"rs_summary_empty","type":"reasoning","summary":[]}}"#.to_owned(),
+        ];
+
+        let content_null = ResponseAccumulator::from_sse_lines(content_null, None);
+        let OutputItem::Reasoning(content_null) = &content_null.output[0] else {
+            panic!("expected reasoning output");
+        };
+        assert!(content_null.content.is_empty());
+        assert_eq!(content_null.summary[0]["text"], "kept summary");
+
+        let summary_empty = ResponseAccumulator::from_sse_lines(summary_empty, None);
+        let OutputItem::Reasoning(summary_empty) = &summary_empty.output[0] else {
+            panic!("expected reasoning output");
+        };
+        assert_eq!(summary_empty.content[0].text, "kept content");
+        assert!(summary_empty.summary.is_empty());
+    }
+
+    #[test]
+    fn streaming_and_nonstreaming_nullable_reasoning_fields_are_equivalent() {
+        let streaming = ResponseAccumulator::from_sse_lines(
+            [r#"data: {"type":"response.output_item.done","output_index":0,"item":{"id":"rs_1","type":"reasoning","content":null,"summary":null,"encrypted_content":null,"status":"completed"}}"#.to_owned()],
+            None,
+        );
+        let nonstreaming = ResponseAccumulator::from_json(
+            r#"{"id":"resp_1","status":"completed","output":[{"id":"rs_1","type":"reasoning","content":null,"summary":null,"encrypted_content":null,"status":"completed"}]}"#,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            serde_json::to_value(&streaming.output).unwrap(),
+            serde_json::to_value(&nonstreaming.output).unwrap()
+        );
+    }
+
+    #[test]
+    fn done_only_reasoning_uses_output_index_order() {
+        let lines = [
+            r#"data: {"type":"response.output_item.added","output_index":1,"item":{"id":"msg_1","type":"message"}}"#.to_owned(),
+            r#"data: {"type":"response.output_text.delta","item_id":"msg_1","output_index":1,"content_index":0,"delta":"answer"}"#.to_owned(),
+            r#"data: {"type":"response.output_item.done","output_index":0,"item":{"id":"rs_1","type":"reasoning","content":[{"type":"reasoning_text","text":"thinking"}],"summary":[],"encrypted_content":null,"status":"completed"}}"#.to_owned(),
+            r#"data: {"type":"response.completed","response":{"id":"resp_1","status":"completed"}}"#.to_owned(),
+        ];
+
+        let acc = ResponseAccumulator::from_sse_lines(lines, None);
+
+        assert_eq!(acc.output.len(), 2);
+        assert!(matches!(acc.output[0], OutputItem::Reasoning(_)));
+        assert!(matches!(acc.output[1], OutputItem::Message(_)));
+    }
+
+    #[test]
+    fn malformed_completed_reasoning_retains_valid_fallbacks() {
+        let lines = [
+            r#"data: {"type":"response.output_item.added","output_index":0,"item":{"id":"rs_1","type":"reasoning"}}"#.to_owned(),
+            r#"data: {"type":"response.reasoning_text.delta","item_id":"rs_1","output_index":0,"content_index":0,"delta":"fallback content"}"#.to_owned(),
+            r#"data: {"type":"response.reasoning_summary_text.delta","item_id":"rs_1","output_index":0,"summary_index":0,"delta":"fallback summary"}"#.to_owned(),
+            r#"data: {"type":"response.output_item.done","output_index":0,"item":{"id":"rs_1","type":"reasoning","content":"malformed","summary":[{"type":"summary_text","text":"ignored completion"}],"encrypted_content":"ignored"}}"#.to_owned(),
+            r#"data: {"type":"response.completed","response":{"id":"resp_1","status":"completed"}}"#.to_owned(),
+        ];
+
+        let acc = ResponseAccumulator::from_sse_lines(lines, None);
+        let OutputItem::Reasoning(reasoning) = &acc.output[0] else {
+            panic!("expected reasoning output");
+        };
+
+        assert_eq!(reasoning.content[0].text, "fallback content");
+        assert_eq!(reasoning.summary[0]["text"], "fallback summary");
+        assert!(reasoning.encrypted_content.is_none());
+    }
+
+    #[test]
+    fn repeated_done_only_reasoning_is_upserted_by_id() {
+        let lines = [
+            r#"data: {"type":"response.output_item.done","output_index":0,"item":{"id":"rs_1","type":"reasoning","content":[{"type":"reasoning_text","text":"first"}],"summary":[]}}"#.to_owned(),
+            r#"data: {"type":"response.output_item.done","output_index":0,"item":{"id":"rs_1","type":"reasoning","content":[{"type":"reasoning_text","text":"final"}],"summary":[]}}"#.to_owned(),
+            r#"data: {"type":"response.completed","response":{"id":"resp_1","status":"completed"}}"#.to_owned(),
+        ];
+
+        let acc = ResponseAccumulator::from_sse_lines(lines, None);
+
+        assert_eq!(acc.output.len(), 1);
+        let OutputItem::Reasoning(reasoning) = &acc.output[0] else {
+            panic!("expected reasoning output");
+        };
+        assert_eq!(reasoning.content[0].text, "final");
     }
 
     #[test]
