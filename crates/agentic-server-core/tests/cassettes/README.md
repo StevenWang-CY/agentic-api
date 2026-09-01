@@ -217,18 +217,24 @@ handling from model differences. Use `REASONING_RECORD_SET=gateway`,
 `REASONING_RECORD_SET=openai`, or `REASONING_RECORD_SET=vllm` to record one
 provider. The gateway recording requires a running gateway and reasoning-capable
 upstream; the optional direct-vLLM set retains the legacy accumulator workflow.
+Every selected recording is staged and validated before any final fixture is
+replaced, so a failed provider or response cannot leave a partially refreshed
+comparison set.
 
 ```bash
-OPENAI_API_KEY=sk-... \
-bash crates/agentic-server-core/tests/cassettes/record_reasoning_cassettes.sh
-
 # Start the gateway against the same OpenAI ground-truth model in one terminal.
 OPENAI_API_KEY=sk-... \
 cargo run -p agentic-server -- \
   --llm-api-base https://api.openai.com \
   --skip-llm-ready-check
 
-# Record the gateway-facing pair from another terminal.
+# Record the OpenAI-reference and gateway pairs from another terminal.
+OPENAI_API_KEY=sk-... \
+GATEWAY_URL=http://localhost:9000 \
+MODEL=gpt-5.6 \
+bash crates/agentic-server-core/tests/cassettes/record_reasoning_cassettes.sh
+
+# To refresh only the gateway-facing pair instead:
 REASONING_RECORD_SET=gateway \
 GATEWAY_URL=http://localhost:9000 \
 MODEL=gpt-5.6 \

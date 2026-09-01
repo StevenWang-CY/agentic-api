@@ -16,7 +16,7 @@ use axum::routing::post;
 use either::Either;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
@@ -42,7 +42,7 @@ pub struct TurnRequest {
     pub body: TurnBody,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Default, PartialEq)]
 pub struct TurnBody {
     #[serde(default)]
     pub model: Option<String>,
@@ -60,6 +60,8 @@ pub struct TurnBody {
     pub max_output_tokens: Option<u64>,
     #[serde(default)]
     pub reasoning: Option<Value>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 fn default_true() -> bool {

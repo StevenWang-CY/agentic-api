@@ -17,7 +17,8 @@
 set -euo pipefail
 
 SCRIPTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BASE_DIR="$SCRIPTS_DIR/reasoning/responses"
+BASE_DIR="${REASONING_OUTPUT_DIR:-$SCRIPTS_DIR/reasoning/responses}"
+RECORDER="${RECORDER:-$SCRIPTS_DIR/record_cassette.py}"
 GATEWAY_URL="${GATEWAY_URL:-http://localhost:9000}"
 VLLM_URL="${VLLM_URL:-http://localhost:5050}"
 MODEL="${MODEL:-gpt-5.6}"
@@ -27,9 +28,20 @@ OPENAI_MODEL_SLUG="$(echo "$OPENAI_MODEL" | tr '/: ' '---')"
 REASONING_RECORD_SET="${REASONING_RECORD_SET:-all}"
 REASONING_CONFIG="${REASONING_CONFIG:-{\"effort\":\"high\",\"summary\":\"detailed\"}}"
 PROMPT='Determine whether 47 is the unique two-digit positive integer whose digits sum to 11 and whose reversal is 27 larger. Analyze the constraints, then reply with exactly one word: VALID or INVALID.'
+STAGING_DIR=""
+STAGED_OUTPUTS=()
+FINAL_OUTPUTS=()
 
 green() { printf '\033[32m%s\033[0m\n' "$*"; }
 bold()  { printf '\033[1m%s\033[0m\n'  "$*"; }
+
+cleanup_staging() {
+  if [[ -n "$STAGING_DIR" ]]; then
+    rm -rf -- "$STAGING_DIR"
+  fi
+}
+
+trap cleanup_staging EXIT
 
 validate_reasoning_config() {
   python - "$REASONING_CONFIG" <<'PY'
@@ -128,12 +140,14 @@ record_single_turn() {
   local model="$3"
   local output="$4"
   local stream_flag="$5"
+  local staged_output
   local temporary_output
 
-  temporary_output="$(mktemp "$BASE_DIR/.reasoning-cassette.XXXXXX")"
+  staged_output="$STAGING_DIR/$(basename "$output")"
+  temporary_output="$(mktemp "$STAGING_DIR/.reasoning-cassette.XXXXXX")"
 
   if ! printf '%s\n' "$PROMPT" \
-    | python "$SCRIPTS_DIR/record_cassette.py" \
+    | python "$RECORDER" \
         --mode responses \
         --turns 1 \
         "$stream_flag" \
@@ -151,8 +165,19 @@ record_single_turn() {
     rm -f -- "$temporary_output"
     return 1
   fi
-  mv -- "$temporary_output" "$output"
-  green "✓ reasoning cassette recorded -> $output"
+  mv -- "$temporary_output" "$staged_output"
+  STAGED_OUTPUTS+=("$staged_output")
+  FINAL_OUTPUTS+=("$output")
+  green "✓ reasoning cassette validated -> $output"
+}
+
+promote_recorded_suite() {
+  local index
+
+  for index in "${!STAGED_OUTPUTS[@]}"; do
+    mv -- "${STAGED_OUTPUTS[$index]}" "${FINAL_OUTPUTS[$index]}"
+    green "✓ reasoning cassette promoted -> ${FINAL_OUTPUTS[$index]}"
+  done
 }
 
 record_provider_suite() {
@@ -190,8 +215,8 @@ esac
 
 validate_reasoning_config
 
-# Validate OpenAI requirements before recording the gateway suite so a default
-# `all` run cannot leave only half of the comparison fixtures.
+# Validate OpenAI requirements before making any live requests. Final fixtures
+# remain unchanged until every selected recording has completed validation.
 if [[ "$REASONING_RECORD_SET" == "openai" || "$REASONING_RECORD_SET" == "all" ]]; then
   if [[ -z "${OPENAI_API_KEY:-}" ]]; then
     echo "ERROR: OPENAI_API_KEY must be set for REASONING_RECORD_SET=$REASONING_RECORD_SET" >&2
@@ -200,6 +225,7 @@ if [[ "$REASONING_RECORD_SET" == "openai" || "$REASONING_RECORD_SET" == "all" ]]
 fi
 
 mkdir -p "$BASE_DIR"
+STAGING_DIR="$(mktemp -d "$BASE_DIR/.reasoning-suite.XXXXXX")"
 
 if [[ "$REASONING_RECORD_SET" == "openai" || "$REASONING_RECORD_SET" == "all" ]]; then
   record_provider_suite \
@@ -224,3 +250,5 @@ if [[ "$REASONING_RECORD_SET" == "vllm" ]]; then
     "$MODEL" \
     "reasoning-single-${MODEL_SLUG}"
 fi
+
+promote_recorded_suite
