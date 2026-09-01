@@ -92,6 +92,7 @@ pub struct UpstreamRequest<'a> {
     pub metadata: Option<&'a Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parallel_tool_calls: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_salt: Option<&'a str>,
 }
 
@@ -349,7 +350,18 @@ mod tests {
     }
 
     #[test]
-    fn request_payload_forwards_cache_salt_upstream() {
+    fn request_payload_omits_absent_and_forwards_present_cache_salt_upstream() {
+        let payload: RequestPayload = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "input": "hello"
+        }))
+        .expect("request should deserialize");
+
+        let upstream = serde_json::to_value(payload.to_upstream_request(false).expect("request should normalize"))
+            .expect("upstream request should serialize");
+
+        assert!(upstream.get("cache_salt").is_none());
+
         let payload: RequestPayload = serde_json::from_value(serde_json::json!({
             "model": "test-model",
             "input": "hello",

@@ -58,6 +58,8 @@ pub struct TurnBody {
     pub tool_choice: Option<Value>,
     #[serde(default)]
     pub max_output_tokens: Option<u64>,
+    #[serde(default)]
+    pub reasoning: Option<Value>,
 }
 
 fn default_true() -> bool {
