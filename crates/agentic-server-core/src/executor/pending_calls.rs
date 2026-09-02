@@ -5,7 +5,7 @@
 //! after scanning a full item sequence is, by construction, something the
 //! *client* owed a resolution for.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 use indexmap::IndexMap;
 
@@ -42,19 +42,21 @@ pub(super) struct PendingCall {
 }
 
 /// Scans `items` in order and returns every call left unresolved, in emission
-/// order. Calls and outputs must have non-empty IDs and form a one-to-one,
-/// same-kind relationship. Namespace member calls are represented as
-/// `InputItem::FunctionCall`, so they're covered by the plain function check.
+/// order. Outstanding calls must have non-empty, unique IDs and form a
+/// one-to-one, same-kind relationship with their outputs. Once an output
+/// resolves a call, a later call of the same kind may reuse that ID. Namespace
+/// member calls are represented as `InputItem::FunctionCall`, so they're
+/// covered by the plain function check.
 pub(super) fn pending_calls(items: &[InputItem]) -> ExecutorResult<Vec<PendingCall>> {
-    let mut seen_call_ids = HashSet::new();
+    let mut call_kinds = HashMap::new();
     let mut pending = IndexMap::new();
     for item in items {
         match item {
             InputItem::FunctionCall(call) => {
-                add_call(&call.call_id, CallKind::Function, &mut seen_call_ids, &mut pending)?;
+                add_call(&call.call_id, CallKind::Function, &mut call_kinds, &mut pending)?;
             }
             InputItem::CustomToolCall(call) => {
-                add_call(&call.call_id, CallKind::Custom, &mut seen_call_ids, &mut pending)?;
+                add_call(&call.call_id, CallKind::Custom, &mut call_kinds, &mut pending)?;
             }
             InputItem::FunctionCallOutput(output) => {
                 resolve_call(&output.call_id, CallKind::Function, &mut pending)?;
@@ -76,7 +78,7 @@ pub(super) fn pending_calls(items: &[InputItem]) -> ExecutorResult<Vec<PendingCa
 fn add_call(
     call_id: &str,
     kind: CallKind,
-    seen_call_ids: &mut HashSet<String>,
+    call_kinds: &mut HashMap<String, CallKind>,
     pending: &mut IndexMap<String, CallKind>,
 ) -> ExecutorResult<()> {
     if call_id.is_empty() {
@@ -85,12 +87,17 @@ fn add_call(
             kind.call_item_name()
         )));
     }
-    if !seen_call_ids.insert(call_id.to_owned()) {
+    if pending.contains_key(call_id)
+        || call_kinds
+            .get(call_id)
+            .is_some_and(|previous_kind| *previous_kind != kind)
+    {
         return Err(ExecutorError::InvalidRequest(format!(
             "duplicate call_id '{call_id}' in {}",
             kind.call_item_name()
         )));
     }
+    call_kinds.insert(call_id.to_owned(), kind);
     pending.insert(call_id.to_owned(), kind);
     Ok(())
 }
@@ -167,6 +174,29 @@ mod tests {
         assert!(pending_calls(&items).expect("valid call/output pair").is_empty());
     }
 
+    /// Kimi K2 native tool-call IDs are derived from the function name and
+    /// per-response index, so the same call position can recur in later turns.
+    #[test]
+    fn resolved_call_id_can_be_reused_by_a_later_call() {
+        let mut items = vec![
+            function_call("functions.get_weather:0"),
+            function_call_output("functions.get_weather:0"),
+            function_call("functions.get_weather:0"),
+        ];
+
+        let pending = pending_calls(&items).expect("a resolved call ID can be reused by a later turn");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].call_id, "functions.get_weather:0");
+
+        items.push(function_call_output("functions.get_weather:0"));
+
+        assert!(
+            pending_calls(&items)
+                .expect("a resolved call ID can be reused by a later turn")
+                .is_empty()
+        );
+    }
+
     #[test]
     fn unresolved_function_call_is_reported_in_order() {
         let items = vec![
@@ -204,7 +234,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_and_duplicate_call_ids_are_rejected() {
+    fn empty_overlapping_and_cross_kind_call_ids_are_rejected() {
         assert_invalid(&[function_call("")], "function_call call_id must not be empty");
         assert_invalid(&[custom_tool_call("")], "custom_tool_call call_id must not be empty");
         assert_invalid(

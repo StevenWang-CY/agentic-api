@@ -446,6 +446,73 @@ async fn test_previous_response_id_rehydrates_function_call_before_tool_output()
 }
 
 #[tokio::test]
+async fn test_previous_response_id_allows_reused_resolved_call_id() {
+    assert_reused_resolved_call_id(false).await;
+}
+
+#[tokio::test]
+async fn test_conversation_allows_reused_resolved_call_id() {
+    assert_reused_resolved_call_id(true).await;
+}
+
+async fn assert_reused_resolved_call_id(conversation: bool) {
+    let call_id = "functions.get_weather:0";
+    let conversation_id = conversation.then(|| "conv_reused_call_id".to_owned());
+    let fixture = TestFixture::new_with_responses(vec![
+        client_function_call_response("resp_tool_1", "fc_1", call_id),
+        client_function_call_response("resp_tool_2", "fc_2", call_id),
+        text_response("both tool outputs handled"),
+    ])
+    .await;
+
+    let first = unwrap_blocking(
+        execute(
+            make_request("weather in Boston", true, false, None, conversation_id.clone()),
+            Arc::clone(&fixture.exec_ctx),
+        )
+        .await
+        .expect("first turn"),
+    );
+
+    let previous_response_id = (!conversation).then_some(first.id);
+    let mut second = make_request("ignored", true, false, previous_response_id, conversation_id.clone());
+    second.input = ResponsesInput::Items(vec![tool_output(call_id, "sunny")]);
+    let second = unwrap_blocking(
+        execute(second, Arc::clone(&fixture.exec_ctx))
+            .await
+            .expect("first tool output"),
+    );
+
+    let previous_response_id = (!conversation).then_some(second.id);
+    let mut third = make_request("ignored", true, false, previous_response_id, conversation_id);
+    third.input = ResponsesInput::Items(vec![tool_output(call_id, "rainy")]);
+    let third = unwrap_blocking(
+        execute(third, Arc::clone(&fixture.exec_ctx))
+            .await
+            .expect("a resolved call ID can be reused by a later turn"),
+    );
+
+    assert_eq!(output_text(&third), "both tool outputs handled");
+    let requests = fixture.request_bodies().await;
+    assert_eq!(requests.len(), 3);
+    let input = requests[2]["input"].as_array().expect("rehydrated input array");
+    let repeated_items = input
+        .iter()
+        .filter(|item| item["call_id"].as_str() == Some(call_id))
+        .map(|item| item["type"].as_str().expect("typed call item"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        repeated_items,
+        vec![
+            "function_call",
+            "function_call_output",
+            "function_call",
+            "function_call_output"
+        ]
+    );
+}
+
+#[tokio::test]
 async fn test_previous_response_id_replays_plaintext_reasoning_without_opaque_state() {
     assert_plaintext_reasoning_replay(false, false, true).await;
 }
@@ -844,6 +911,33 @@ fn upstream_mcp_fixture_call(id: &str, call_id: &str, name: &str, arguments: &st
         "arguments": arguments,
         "status": "completed"
     })
+}
+
+fn client_function_call_response(response_id: &str, item_id: &str, call_id: &str) -> MockResponse {
+    MockResponse::Json(
+        serde_json::json!({
+            "id": response_id,
+            "object": "response",
+            "created_at": 0,
+            "model": "test-model",
+            "status": "completed",
+            "output": [{
+                "id": item_id,
+                "type": "function_call",
+                "call_id": call_id,
+                "name": "get_weather",
+                "arguments": "{}",
+                "status": "completed"
+            }],
+            "usage": null,
+            "incomplete_details": null,
+            "error": null,
+            "previous_response_id": null,
+            "conversation_id": null,
+            "instructions": null
+        })
+        .to_string(),
+    )
 }
 
 fn tool_output(call_id: &str, output: &str) -> InputItem {
