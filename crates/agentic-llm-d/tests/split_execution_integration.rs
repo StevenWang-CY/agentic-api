@@ -117,6 +117,19 @@ fn status_of(error: &ExecutorError) -> u16 {
     error.http_status().as_u16()
 }
 
+fn assert_call_id_error(error: &ExecutorError, case: &str, untrusted_marker: Option<&str>) {
+    assert_eq!(status_of(error), 400, "{case}: {error}");
+    let message = error.to_string();
+    assert!(message.contains("call_id"), "{case}: {error}");
+    if let Some(marker) = untrusted_marker {
+        assert!(!message.contains(marker), "untrusted call_id leaked: {message}");
+        assert!(
+            message.contains("output[0]") && message.contains("output[1]"),
+            "{case}: {message}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn a_streamed_turn_persists_from_the_relayed_frames() {
     let ctx = exec_ctx().await;
@@ -179,6 +192,121 @@ async fn a_function_call_stream_passes_strict_validation() {
         stored.output.as_slice(),
         [agentic_core::types::io::OutputItem::FunctionCall(_)]
     ));
+}
+
+#[tokio::test]
+async fn relayed_json_tool_call_ids_are_validated_before_persistence() {
+    assert_relayed_tool_call_ids_are_validated(false).await;
+}
+
+#[tokio::test]
+async fn relayed_sse_tool_call_ids_are_validated_before_persistence() {
+    assert_relayed_tool_call_ids_are_validated(true).await;
+}
+
+async fn assert_relayed_tool_call_ids_are_validated(stream: bool) {
+    let ctx = exec_ctx().await;
+    let mut accepted = Vec::new();
+    let duplicate_id = "call_duplicate\r\nforged-log-entry";
+    let malformed_outputs = [
+        (
+            "function call without call_id",
+            "completed",
+            json!([{
+                "type": "function_call", "id": "fc_1", "name": "lookup",
+                "arguments": "{}", "status": "completed"
+            }]),
+            None,
+        ),
+        (
+            "custom tool call with empty call_id",
+            "incomplete",
+            json!([{
+                "type": "custom_tool_call", "id": "ctc_1", "call_id": "",
+                "name": "raw_echo", "input": "hello", "status": "completed"
+            }]),
+            None,
+        ),
+        (
+            "function and custom calls with the same call_id",
+            "completed",
+            json!([
+                {
+                    "type": "function_call", "id": "fc_1", "call_id": duplicate_id,
+                    "name": "lookup", "arguments": "{}", "status": "completed"
+                },
+                {
+                    "type": "custom_tool_call", "id": "ctc_2", "call_id": duplicate_id,
+                    "name": "raw_echo", "input": "hello", "status": "completed"
+                }
+            ]),
+            Some("forged-log-entry"),
+        ),
+    ];
+
+    for (case, status, output, untrusted_marker) in malformed_outputs {
+        let attempt = turn("Call a tool", None, &ctx).await;
+        let context = attempt.context.clone();
+        let response_id = unseal(&context, &signing_key()).expect("unseal").response_id;
+        let body = json!({
+            "id": "resp_upstream", "object": "response", "created_at": 1_700_000_000,
+            "model": "test-model", "status": status, "output": output
+        });
+        let relayed = if stream {
+            let mut frames = vec![
+                json!({"type": "response.created", "response": {"id": "resp_upstream", "status": "in_progress"}}),
+                json!({"type": "response.in_progress", "response": {"id": "resp_upstream", "status": "in_progress"}}),
+            ];
+            for (output_index, item) in output.as_array().expect("output items").iter().enumerate() {
+                frames.push(json!({
+                    "type": "response.output_item.added", "output_index": output_index, "item": item
+                }));
+                frames.push(json!({
+                    "type": "response.output_item.done", "output_index": output_index, "item": item
+                }));
+            }
+            frames.push(json!({
+                "type": format!("response.{status}"),
+                "response": {"id": "resp_upstream", "status": status, "output": output}
+            }));
+            frames
+                .iter()
+                .map(|frame| format!("data: {frame}\n\n"))
+                .collect::<Vec<_>>()
+                .concat()
+        } else {
+            body.to_string()
+        };
+        let upstream = if stream {
+            UpstreamBody::Sse(&relayed)
+        } else {
+            UpstreamBody::Json(&relayed)
+        };
+
+        let Err(error) = persist(attempt.context, upstream, &ctx).await else {
+            let poisoned = hydrate(request("continue", Some(&response_id)), &ctx)
+                .await
+                .expect_err("accepted invalid response remained continuable");
+            accepted.push(format!("{case}: {poisoned}"));
+            continue;
+        };
+        assert_call_id_error(&error, case, untrusted_marker);
+
+        // Validation must happen before insertion so the caller can retry
+        // the reserved response ID with a usable upstream response.
+        let valid = json!({
+            "id": "resp_retry", "status": "completed", "output": [{
+                "type": "custom_tool_call", "id": "ctc_retry", "call_id": "call_retry",
+                "name": "raw_echo", "input": "retry succeeded", "status": "completed"
+            }]
+        })
+        .to_string();
+        let stored = persist(context, UpstreamBody::Json(&valid), &ctx)
+            .await
+            .unwrap_or_else(|error| panic!("{case} consumed {response_id}: {error}"));
+        assert_eq!(stored.id, response_id);
+    }
+    assert!(accepted.is_empty(), "accepted invalid calls: {}", accepted.join("; "));
 }
 
 /// Every way a turn is refused, and the status the caller sees.
@@ -309,13 +437,20 @@ async fn a_turn_that_is_not_written_still_returns() {
 
     let mut failed: Value = serde_json::from_str(&upstream_json("")).expect("json");
     failed["status"] = json!("failed");
-    failed["output"] = json!([]);
+    failed["output"] = json!([{
+        "type": "function_call", "id": "fc_partial", "name": "lookup",
+        "arguments": "", "status": "in_progress"
+    }]);
     let attempt = turn("hi", None, &ctx).await;
     let id = unseal(&attempt.context, &signing_key()).expect("unseal").response_id;
     let payload = persist(attempt.context, UpstreamBody::Json(&failed.to_string()), &ctx)
         .await
         .expect("a failed turn is not a boundary error");
     assert_eq!(payload.status, "error", "`failed` normalizes to the error status");
+    assert!(matches!(
+        payload.output.as_slice(),
+        [agentic_core::types::io::OutputItem::FunctionCall(call)] if call.call_id.is_empty()
+    ));
     let orphan = hydrate(request("and then?", Some(&id)), &ctx).await;
     assert_eq!(status_of(&orphan.expect_err("never stored")), 404);
 }

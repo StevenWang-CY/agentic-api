@@ -3,6 +3,8 @@
 //! Writes the completed response and output items to storage, routing to the
 //! appropriate handler based on whether the turn belongs to a conversation.
 
+use std::collections::HashMap;
+
 use crate::executor::error::{ExecutorError, ExecutorResult};
 use crate::executor::modes::{ConversationHandler, ResponseHandler};
 use crate::executor::request::{ExecutionContext, RequestContext};
@@ -85,7 +87,7 @@ pub async fn persist_turn(
 /// returned unstored, as the in-process flow does.
 ///
 /// # Errors
-/// [`ExecutorError::InvalidRequest`] for an unusable id or unfinished response,
+/// [`ExecutorError::InvalidRequest`] for unusable IDs or an unfinished response,
 /// [`ExecutorError::Conflict`] for an id already stored, or a storage error.
 pub async fn commit(
     ctx: RequestContext,
@@ -98,12 +100,16 @@ pub async fn commit(
         ));
     }
 
+    let status = payload.status.parse::<ResponseStatus>().unwrap_or_default();
     // Storing an unfinished turn would return an id that can never be continued.
-    if payload.status.parse::<ResponseStatus>().unwrap_or_default() == ResponseStatus::InProgress {
+    if status == ResponseStatus::InProgress {
         return Err(ExecutorError::InvalidRequest(format!(
             "upstream response status '{}' is not terminal",
             payload.status
         )));
+    }
+    if matches!(status, ResponseStatus::Completed | ResponseStatus::Incomplete) {
+        validate_output_call_ids(&payload.output)?;
     }
 
     persist_if_needed(
@@ -114,4 +120,26 @@ pub async fn commit(
     )
     .await?;
     Ok(payload)
+}
+
+fn validate_output_call_ids(output_items: &[OutputItem]) -> ExecutorResult<()> {
+    let mut call_ids = HashMap::new();
+    for (index, item) in output_items.iter().enumerate() {
+        let (item_type, call_id) = match item {
+            OutputItem::FunctionCall(call) => ("function_call", call.call_id.as_str()),
+            OutputItem::CustomToolCall(call) => ("custom_tool_call", call.call_id.as_str()),
+            _ => continue,
+        };
+        if call_id.is_empty() {
+            return Err(ExecutorError::InvalidRequest(format!(
+                "upstream response output[{index}] {item_type} has no valid 'call_id'"
+            )));
+        }
+        if let Some(first_index) = call_ids.insert(call_id, index) {
+            return Err(ExecutorError::InvalidRequest(format!(
+                "upstream response output[{index}] repeats 'call_id' from output[{first_index}]"
+            )));
+        }
+    }
+    Ok(())
 }
