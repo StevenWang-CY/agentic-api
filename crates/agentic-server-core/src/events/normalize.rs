@@ -29,11 +29,19 @@ pub(crate) fn is_data_frame(line: &str) -> bool {
 }
 
 /// Normalizes an already parsed SSE payload.
-pub(crate) fn normalize_sse_value(json: Value) -> Option<EventFrame> {
-    let event_type = json
+pub(crate) fn normalize_sse_value(mut json: Value) -> Option<EventFrame> {
+    let mut event_type = json
         .get("type")
         .and_then(Value::as_str)
         .map_or(SSEEventType::Other, SSEEventType::from);
+
+    // vLLM can emit a completion event even when its response ran out of tokens.
+    // Reconcile the explicit status before validation, accumulation, and delivery
+    // so all consumers retain the same incomplete outcome and terminal details.
+    if event_type == SSEEventType::ResponseCompleted && json["response"]["status"] == "incomplete" {
+        event_type = SSEEventType::ResponseIncomplete;
+        json["type"] = Value::String("response.incomplete".to_owned());
+    }
 
     let payload = extract_payload(event_type, &json);
     let wire: WireEvent = deserialize_from_value_opt(json)?;
