@@ -87,25 +87,29 @@ fn normalization_does_not_infer_incomplete_from_usage_or_details() {
     }
 }
 
-#[test]
-fn strict_decode_preserves_incomplete_completion_like_json() {
+#[tokio::test]
+async fn strict_decode_preserves_incomplete_completion_like_json() {
     for event_type in ["response.completed", "response.done"] {
-        assert_incomplete_parity(event_type);
+        assert_incomplete_parity(event_type).await;
     }
 }
 
-#[test]
-fn strict_decode_preserves_canonical_incomplete() {
-    assert_incomplete_parity("response.incomplete");
+#[tokio::test]
+async fn strict_decode_preserves_canonical_incomplete() {
+    assert_incomplete_parity("response.incomplete").await;
 }
 
-fn assert_incomplete_parity(event_type: &str) {
+async fn assert_incomplete_parity(event_type: &str) {
     let response = json!({"id":"resp_upstream", "status":"incomplete", "output":[],
             "usage":{"input_tokens":3,"output_tokens":5,"total_tokens":8},
             "incomplete_details":{"reason":"max_output_tokens"}});
     let sse = stream(&json!({"type":event_type, "response":response}));
-    let decoded = decode_upstream(&context(), UpstreamBody::Sse(&sse)).expect("supported incomplete terminal");
-    let control = decode_upstream(&context(), UpstreamBody::Json(&response.to_string())).unwrap();
+    let (decoded, _) = decode_upstream(context(), UpstreamBody::Sse(&sse))
+        .await
+        .expect("supported incomplete terminal");
+    let (control, _) = decode_upstream(context(), UpstreamBody::Json(&response.to_string()))
+        .await
+        .unwrap();
     let mut decoded = serde_json::to_value(decoded).unwrap();
     let mut control = serde_json::to_value(control).unwrap();
     // Each decoding operation assigns its own local creation time.
@@ -114,8 +118,8 @@ fn assert_incomplete_parity(event_type: &str) {
     assert_eq!(decoded, control);
 }
 
-#[test]
-fn strict_decode_still_rejects_other_mismatches_and_invalid_lifecycles() {
+#[tokio::test]
+async fn strict_decode_still_rejects_other_mismatches_and_invalid_lifecycles() {
     for (event_type, status) in [
         ("response.completed", "failed"),
         ("response.completed", "in_progress"),
@@ -123,7 +127,7 @@ fn strict_decode_still_rejects_other_mismatches_and_invalid_lifecycles() {
         ("response.failed", "incomplete"),
     ] {
         let sse = stream(&json!({"type":event_type, "response":{"id":"resp_upstream","status":status,"output":[]}}));
-        let error = decode_upstream(&context(), UpstreamBody::Sse(&sse)).unwrap_err();
+        let error = decode_upstream(context(), UpstreamBody::Sse(&sse)).await.unwrap_err();
         assert!(error.to_string().contains("expected"), "{error}");
     }
     let terminal =
@@ -133,7 +137,7 @@ fn strict_decode_still_rejects_other_mismatches_and_invalid_lifecycles() {
         (format!("data: {terminal}\n"), "out of lifecycle order"),
         (format!("{valid}data: {terminal}\n"), "after its terminal event"),
     ] {
-        let error = decode_upstream(&context(), UpstreamBody::Sse(&sse)).unwrap_err();
+        let error = decode_upstream(context(), UpstreamBody::Sse(&sse)).await.unwrap_err();
         assert!(error.to_string().contains(diagnostic), "{error}");
     }
     for (response, diagnostic) in [
@@ -144,7 +148,7 @@ fn strict_decode_still_rejects_other_mismatches_and_invalid_lifecycles() {
         ),
     ] {
         let sse = stream(&json!({"type":"response.incomplete", "response":response}));
-        let error = decode_upstream(&context(), UpstreamBody::Sse(&sse)).unwrap_err();
+        let error = decode_upstream(context(), UpstreamBody::Sse(&sse)).await.unwrap_err();
         assert!(error.to_string().contains(diagnostic), "{error}");
     }
 }
