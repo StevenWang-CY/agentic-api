@@ -2,9 +2,11 @@ import type { Metadata } from 'next';
 import { Geist, Geist_Mono } from 'next/font/google';
 import { Header } from '@/components/site/header';
 import { Footer } from '@/components/site/footer';
+import { SpotlightEffects } from '@/components/site/spotlight-effects';
 import { SITE_URL, assetPath } from '@/lib/site';
 import { themeInitScript } from '@/lib/theme.mjs';
 import './globals.css';
+import './effects.css';
 const sans = Geist({ variable: '--font-geist-sans', subsets: ['latin'] });
 const mono = Geist_Mono({ variable: '--font-geist-mono', subsets: ['latin'] });
 export const metadata: Metadata = {
@@ -39,6 +41,7 @@ export default function RootLayout({
         </a>
         <Header />
         {children}
+        <SpotlightEffects />
         <Footer />
       </body>
     </html>
