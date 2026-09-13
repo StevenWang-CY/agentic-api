@@ -757,6 +757,12 @@ loops make to that body (`force_stream`, `append_round`) and the native web-sear
 budget, so the two views cannot drift apart uncontrolled; `messages` and `system` are
 reachable only through the raw body, never the typed view.
 
+`append_round` also changes a fulfilled forced `tool_choice` (`any`, or `tool`
+matching a returned gateway call result) to `auto`. The first round retains the
+client's selector; later rounds can answer from the tool result or choose another
+tool. Parallel-use settings and extension fields remain intact. Client-tool and
+mixed rounds return before this mutation, and Messages does not persist this state.
+
 ### `storage/` — persistence
 
 - **`pool.rs`** — `DbPool = sqlx::Pool<sqlx::Any>`, driver-agnostic across SQLite and

@@ -190,7 +190,7 @@ Recommendation: ship A.
 | gateway-owned `tool_use` (web_search, MCP) | gateway executes, appends a `tool_result`, loops |
 | client-owned `tool_use` | returned to the client, which executes and resends `tool_result` |
 | `tool_result` content block (may carry `is_error: true`) | fed into the next upstream turn |
-| `tool_choice` (`auto`/`any`/`tool`/`none`, `disable_parallel_tool_use`) | preserved and forwarded; the loop must not assume one tool per turn |
+| `tool_choice` (`auto`/`any`/`tool`/`none`, `disable_parallel_tool_use`) | forwarded on the first round; a fulfilled forced choice becomes `auto` after gateway tool results are appended; parallel-use settings remain unchanged |
 
 The gateway-owned vs. client-owned split is already the tool framework's core model; Messages just uses Anthropic's block names in place of Responses item types. Beyond the table, the loop has to handle parallel tool calls (multiple `tool_use` blocks in one assistant turn, with all resulting `tool_result` blocks in a single user message), the full `stop_reason` set (`end_turn`, `max_tokens`, `stop_sequence`, `tool_use`, `pause_turn`, `refusal` — where `pause_turn` means resend to continue), and streaming `tool_use` args arriving as `input_json_delta` partial-JSON frames. When it resolves a gateway-owned `tool_use` mid-stream it must emit correct `content_block_start` → `input_json_delta` → `content_block_stop` frames for surfaced calls, suppress the hidden ones, and keep block `index` contiguous.
 

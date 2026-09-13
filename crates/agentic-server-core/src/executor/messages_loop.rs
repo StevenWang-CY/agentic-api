@@ -2,9 +2,10 @@
 //!
 //! Runs the server-side gateway-tool loop for `/v1/messages` **natively**: the
 //! client's Anthropic request is forwarded to vLLM `/v1/messages` essentially
-//! untouched (preserving every Anthropic field), the assistant turn is
+//! untouched on the first round, the assistant turn is
 //! inspected, any gateway-owned `tool_use` is executed server-side and hidden,
-//! the loop appends the `tool_result` and re-POSTs, until the model stops asking
+//! the loop appends the `tool_result`, relaxes a fulfilled forced tool choice,
+//! and re-POSTs until the model stops asking
 //! for a gateway tool. Only the final assistant message reaches the client.
 //!
 //! This never touches `RequestPayload`/`ResponsePayload`; it reuses only the

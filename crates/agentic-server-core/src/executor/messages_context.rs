@@ -2,7 +2,7 @@
 //!
 //! The Messages loops are a pass-through, not a transform: the client's request
 //! is forwarded to vLLM `/v1/messages` essentially untouched, and only `tools`
-//! and `stream`/`messages` are read or rewritten. That rules out a typed
+//! and `stream`/`messages`/`tool_choice` are read or rewritten. That rules out a typed
 //! round-trip through [`MessagesRequest`] as the upstream body — `ContentBlock`
 //! carries a `#[serde(other)] Unknown` catch-all, and several block types model
 //! only the fields the gateway reads, so re-serializing would silently drop
@@ -198,6 +198,8 @@ impl MessagesRequestContext {
     /// `tool_use` blocks in order — F3) and a following user turn of
     /// `tool_result`s, so the next upstream round sees the full conversation
     /// state. These stay internal — the client never sees them (hide-the-call).
+    /// A fulfilled forced `tool_choice` becomes `auto` for subsequent rounds;
+    /// parallel-use settings and extension fields remain unchanged.
     ///
     /// # Errors
     /// Returns [`ExecutorError::InvalidRequest`] if the body has no `messages`
@@ -210,6 +212,30 @@ impl MessagesRequestContext {
         assistant_content: &[Value],
         tool_results: Vec<GatewayToolResult>,
     ) -> ExecutorResult<()> {
+        // A forced choice applies to this public turn. Once its gateway call
+        // has a result, let the next inference round use that result to answer
+        // instead of forcing another call until the round limit is reached.
+        let fulfilled_choice =
+            self.raw
+                .get("tool_choice")
+                .is_some_and(|choice| match choice.get("type").and_then(Value::as_str) {
+                    Some("any") => !tool_results.is_empty(),
+                    Some("tool") => choice
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .filter(|name| !name.is_empty())
+                        .is_some_and(|name| {
+                            assistant_content.iter().any(|block| {
+                                block["type"] == "tool_use"
+                                    && block["name"] == name
+                                    && block
+                                        .get("id")
+                                        .and_then(Value::as_str)
+                                        .is_some_and(|id| tool_results.iter().any(|result| result.tool_use_id == id))
+                            })
+                        }),
+                    _ => false,
+                });
         let messages = self
             .raw
             .get_mut("messages")
@@ -225,6 +251,14 @@ impl MessagesRequestContext {
             serde_json::to_value(tool_results).map_err(ExecutorError::JsonError)?,
         );
         messages.push(Value::Object(user));
+        if fulfilled_choice {
+            if let Some(choice) = self.raw.get_mut("tool_choice").and_then(Value::as_object_mut) {
+                if choice["type"] == "tool" {
+                    choice.remove("name");
+                }
+                choice.insert("type".to_owned(), Value::String("auto".to_owned()));
+            }
+        }
         Ok(())
     }
 }
@@ -332,5 +366,96 @@ mod tests {
     fn parsed_request_rejects_non_messages_json() {
         let error = ParsedMessagesRequest::parse(br"[]").unwrap_err();
         assert!(matches!(error, ExecutorError::JsonError(_)), "{error:?}");
+    }
+
+    fn completed_search() -> (Vec<Value>, Vec<GatewayToolResult>) {
+        (
+            vec![json!({"type":"tool_use", "id":"search_1", "name":"web_search", "input":{}})],
+            vec![GatewayToolResult::new("search_1", "answer".to_owned(), false)],
+        )
+    }
+
+    #[test]
+    fn fulfilled_forced_choice_allows_an_answer_and_preserves_other_settings() {
+        for kind in ["any", "tool"] {
+            for is_error in [false, true] {
+                let mut body = request();
+                let mut choice = json!({"type":kind, "disable_parallel_tool_use":true, "extension":{"value":1}});
+                if kind == "tool" {
+                    choice["name"] = json!("web_search");
+                }
+                body["tool_choice"] = choice.clone();
+                let mut ctx = MessagesRequestContext::from_value(body).unwrap();
+                let initial = ctx.raw.clone();
+                assert_eq!(initial["tool_choice"], choice);
+                let (content, mut results) = completed_search();
+                results[0].is_error = is_error;
+                ctx.append_round(&content, results).unwrap();
+                let mut expected = initial;
+                expected["tool_choice"]["type"] = json!("auto");
+                expected["tool_choice"].as_object_mut().unwrap().remove("name");
+                expected["messages"].as_array_mut().unwrap().extend([
+                    json!({"role":"assistant", "content":content}),
+                    json!({"role":"user", "content":[{"type":"tool_result", "tool_use_id":"search_1", "content":"answer", "is_error":is_error}]}),
+                ]);
+                assert_eq!(ctx.raw, expected);
+                let (content, results) = completed_search();
+                ctx.append_round(&content, results).unwrap();
+                assert_eq!(ctx.raw["tool_choice"], expected["tool_choice"]);
+            }
+        }
+    }
+
+    #[test]
+    fn unforced_or_unrecognized_choices_are_preserved() {
+        for choice in [
+            None,
+            Some(Value::Null),
+            Some(json!({"type":"auto", "disable_parallel_tool_use":false})),
+            Some(json!({"type":"none"})),
+            Some(json!({"type":"future", "name":"web_search"})),
+            Some(json!({"type":"tool"})),
+            Some(json!({"type":"tool", "name":""})),
+            Some(json!({"type":"tool", "name":"client_tool"})),
+            Some(json!("any")),
+            Some(json!([])),
+            Some(json!({"type":false})),
+        ] {
+            let mut body = request();
+            if let Some(choice) = &choice {
+                body["tool_choice"] = choice.clone();
+            }
+            let mut ctx = MessagesRequestContext::from_value(body).unwrap();
+            let (content, results) = completed_search();
+            ctx.append_round(&content, results).unwrap();
+            assert_eq!(ctx.raw.get("tool_choice"), choice.as_ref());
+        }
+    }
+
+    #[test]
+    fn forced_choice_is_not_fulfilled_without_its_call_result() {
+        for kind in ["any", "tool"] {
+            let mut body = request();
+            body["tool_choice"] = json!({"type":kind});
+            if kind == "tool" {
+                body["tool_choice"]["name"] = json!("web_search");
+            }
+            let mut ctx = MessagesRequestContext::from_value(body.clone()).unwrap();
+            let (content, _) = completed_search();
+            ctx.append_round(&content, vec![]).unwrap();
+            assert_eq!(ctx.raw["tool_choice"], body["tool_choice"]);
+        }
+        for content in [
+            vec![],
+            vec![json!({"type":"tool_use", "id":"unresolved", "name":"web_search"})],
+            vec![json!({"type":"text", "id":"search_1", "name":"web_search"})],
+        ] {
+            let mut body = request();
+            body["tool_choice"] = json!({"type":"tool", "name":"web_search"});
+            let mut ctx = MessagesRequestContext::from_value(body.clone()).unwrap();
+            let (_, results) = completed_search();
+            ctx.append_round(&content, results).unwrap();
+            assert_eq!(ctx.raw["tool_choice"], body["tool_choice"]);
+        }
     }
 }
