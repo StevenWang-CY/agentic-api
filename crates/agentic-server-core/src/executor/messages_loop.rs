@@ -134,11 +134,16 @@ pub async fn run_messages_loop(
             }
         }
 
-        // Terminal when the model didn't ask for a gateway tool, or stopped for
-        // another reason. A client-owned tool_use is also terminal (the client
-        // must run it) — but the gateway tool_use, if any, must still be hidden
+        // The shared context accepts tool_use and vLLM's end_turn for a matching
+        // named call. Other stops remain terminal. A client-owned tool_use is
+        // also terminal (the client must run it), but the gateway tool_use must be hidden
         // (F5): strip gateway blocks from the client-facing content.
-        if gateway_calls.is_empty() || stop_reason != Some("tool_use") {
+        if gateway_calls.is_empty()
+            || !ctx.is_tool_call_stop(
+                stop_reason,
+                gateway_calls.iter().filter_map(|call| call["name"].as_str()),
+            )
+        {
             return Ok(MessagesResponse {
                 body: message,
                 headers: response_headers,

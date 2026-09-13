@@ -760,8 +760,14 @@ reachable only through the raw body, never the typed view.
 `append_round` also changes a fulfilled forced `tool_choice` (`any`, or `tool`
 matching a returned gateway call result) to `auto`. The first round retains the
 client's selector; later rounds can answer from the tool result or choose another
-tool. Parallel-use settings and extension fields remain intact. Client-tool and
-mixed rounds return before this mutation, and Messages does not persist this state.
+tool. Parallel-use settings and extension fields remain intact. Rounds containing
+client-executed function tools return before this mutation, and Messages does not
+persist this state.
+
+vLLM can label a completed, explicitly named tool call `end_turn`. The shared
+request context accepts that stop only when the selected gateway tool appears in
+the round. Streaming additionally requires `message_stop`; client-executed
+function tools and truncated rounds remain terminal.
 
 ### `storage/` — persistence
 

@@ -39,6 +39,7 @@ struct Upstream {
     search_fails: bool,
     wanted_searches: usize,
     mixed_calls: bool,
+    tool_stop_reason: &'static str,
 }
 
 fn tool_call(name: &str, round: usize) -> Value {
@@ -118,7 +119,7 @@ async fn infer(State(state): State<Upstream>, Json(request): Json<Value>) -> Res
         vec![json!({"type":"text", "text":answer})]
     };
     let message = json!({"id":"msg_choice", "type":"message", "role":"assistant", "model":"test-model",
-        "content":content, "stop_reason":if call {"tool_use"} else {"end_turn"}, "stop_sequence":null,
+        "content":content, "stop_reason":if call {state.tool_stop_reason} else {"end_turn"}, "stop_sequence":null,
         "usage":{"input_tokens":5,"output_tokens":3}});
     if request["stream"] == true {
         Response::builder()
@@ -130,8 +131,8 @@ async fn infer(State(state): State<Upstream>, Json(request): Json<Value>) -> Res
     }
 }
 
-fn assert_client_message(body: &str, stream: bool, client_owned: bool, expected_answer: &str) {
-    let stop = if client_owned { "tool_use" } else { "end_turn" };
+fn assert_client_message(body: &str, stream: bool, client_owned: bool, expected_answer: &str, tool_stop_reason: &str) {
+    let stop = if client_owned { tool_stop_reason } else { "end_turn" };
     if stream {
         let events: Vec<Value> = body
             .lines()
@@ -178,8 +179,10 @@ fn assert_upstream_rounds(rounds: &[Value], expected_request: &Value) {
     let mut expected_choice = expected_request.get("tool_choice").cloned();
     if let Some(choice) = &mut expected_choice {
         if choice["type"] == "any" || choice["type"] == "tool" {
+            if choice["type"] == "tool" {
+                choice.as_object_mut().unwrap().remove("name");
+            }
             choice["type"] = json!("auto");
-            choice.as_object_mut().unwrap().remove("name");
         }
     }
     for round in &rounds[1..] {
@@ -197,12 +200,24 @@ fn assert_upstream_rounds(rounds: &[Value], expected_request: &Value) {
 }
 
 async fn check_choice(choice: Option<Value>, stream: bool, search_fails: bool, wanted_searches: usize, mixed: bool) {
+    check_choice_with_stop(choice, stream, search_fails, wanted_searches, mixed, "tool_use").await;
+}
+
+async fn check_choice_with_stop(
+    choice: Option<Value>,
+    stream: bool,
+    search_fails: bool,
+    wanted_searches: usize,
+    mixed: bool,
+    tool_stop_reason: &'static str,
+) {
     let upstream = Upstream {
         requests: Arc::default(),
         searches: Arc::default(),
         search_fails,
         wanted_searches,
         mixed_calls: mixed,
+        tool_stop_reason,
     };
     let app = Router::new()
         .route("/v1/messages", post(infer))
@@ -241,7 +256,10 @@ async fn check_choice(choice: Option<Value>, stream: bool, search_fails: bool, w
         .timeout(Duration::from_secs(5))
         .build()
         .unwrap();
-    let client_owned = mixed || choice.as_ref().is_some_and(|choice| choice["name"] == "client_echo");
+    let client_owned = mixed
+        || choice
+            .as_ref()
+            .is_some_and(|choice| choice["type"] == "tool" && choice["name"] == "client_echo");
     let no_tools = choice.as_ref().is_some_and(|choice| choice["type"] == "none");
     let expected_searches = if client_owned || no_tools { 0 } else { wanted_searches };
     let expected_rounds = expected_searches + 1;
@@ -262,7 +280,7 @@ async fn check_choice(choice: Option<Value>, stream: bool, search_fails: bool, w
             .unwrap();
         assert_eq!(response.status(), http::StatusCode::OK);
         let body = response.text().await.unwrap();
-        assert_client_message(&body, stream, client_owned, expected_answer);
+        assert_client_message(&body, stream, client_owned, expected_answer, tool_stop_reason);
         let requests = upstream.requests.lock().await;
         assert_eq!(requests.len(), (request_number + 1) * expected_rounds);
         let rounds = &requests[request_number * expected_rounds..];
@@ -327,6 +345,66 @@ async fn any_choice_finishes_streaming_search() {
         false,
     )
     .await;
+}
+
+#[tokio::test]
+async fn named_choice_end_turn_executes_the_selected_gateway_call() {
+    for stream in [false, true] {
+        check_choice_with_stop(
+            Some(json!({"type":"tool", "name":"web_search", "disable_parallel_tool_use":true})),
+            stream,
+            false,
+            1,
+            false,
+            "end_turn",
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn named_choice_end_turn_preserves_client_tool_ownership() {
+    for stream in [false, true] {
+        for (name, mixed) in [("client_echo", false), ("web_search", true)] {
+            check_choice_with_stop(
+                Some(json!({"type":"tool", "name":name})),
+                stream,
+                false,
+                1,
+                mixed,
+                "end_turn",
+            )
+            .await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn any_choice_preserves_name_extension() {
+    for stream in [false, true] {
+        check_choice(
+            Some(json!({"type":"any", "name":"web_search", "disable_parallel_tool_use":true})),
+            stream,
+            false,
+            1,
+            false,
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn any_choice_name_does_not_select_a_client_tool() {
+    for stream in [false, true] {
+        check_choice(
+            Some(json!({"type":"any", "name":"client_echo", "disable_parallel_tool_use":false})),
+            stream,
+            false,
+            1,
+            false,
+        )
+        .await;
+    }
 }
 
 #[tokio::test]

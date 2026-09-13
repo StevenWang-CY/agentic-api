@@ -192,6 +192,10 @@ Recommendation: ship A.
 | `tool_result` content block (may carry `is_error: true`) | fed into the next upstream turn |
 | `tool_choice` (`auto`/`any`/`tool`/`none`, `disable_parallel_tool_use`) | forwarded on the first round; a fulfilled forced choice becomes `auto` after gateway tool results are appended; parallel-use settings remain unchanged |
 
+vLLM may label a completed named tool call `end_turn`. The gateway accepts that stop only when the explicitly
+selected gateway tool appears in the round; streaming also requires `message_stop`. Rounds containing
+client-executed function tools and truncated responses remain terminal.
+
 The gateway-owned vs. client-owned split is already the tool framework's core model; Messages just uses Anthropic's block names in place of Responses item types. Beyond the table, the loop has to handle parallel tool calls (multiple `tool_use` blocks in one assistant turn, with all resulting `tool_result` blocks in a single user message), the full `stop_reason` set (`end_turn`, `max_tokens`, `stop_sequence`, `tool_use`, `pause_turn`, `refusal` — where `pause_turn` means resend to continue), and streaming `tool_use` args arriving as `input_json_delta` partial-JSON frames. When it resolves a gateway-owned `tool_use` mid-stream it must emit correct `content_block_start` → `input_json_delta` → `content_block_stop` frames for surfaced calls, suppress the hidden ones, and keep block `index` contiguous.
 
 ---

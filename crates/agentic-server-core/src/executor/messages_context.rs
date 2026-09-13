@@ -194,6 +194,29 @@ impl MessagesRequestContext {
         self.web_search_budget.reserve(requested)
     }
 
+    /// Whether a finished round permits executing its gateway calls.
+    /// vLLM maps named Chat Completions calls to Messages `end_turn`; accept
+    /// that terminal only when the explicitly selected tool actually appears.
+    /// Other stops (including truncation) retain their normal terminal behavior.
+    pub(super) fn is_tool_call_stop<'a>(
+        &self,
+        stop_reason: Option<&str>,
+        mut gateway_names: impl Iterator<Item = &'a str>,
+    ) -> bool {
+        if stop_reason == Some("tool_use") {
+            return true;
+        }
+        stop_reason == Some("end_turn")
+            && self.raw.get("tool_choice").is_some_and(|choice| {
+                choice["type"] == "tool"
+                    && choice
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .filter(|name| !name.is_empty())
+                        .is_some_and(|name| gateway_names.any(|called| called == name))
+            })
+    }
+
     /// Append the model's assistant turn (preserving its `thinking`/`text`/
     /// `tool_use` blocks in order — F3) and a following user turn of
     /// `tool_result`s, so the next upstream round sees the full conversation
@@ -273,6 +296,41 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}],
             "tools": [{"name": "web_search", "type": "web_search_20250305", "max_uses": 2}]
         })
+    }
+
+    #[test]
+    fn end_turn_requires_the_explicitly_selected_gateway_call() {
+        for (choice, accepts_end_turn) in [
+            (Value::Null, false),
+            (json!({"type":"auto", "name":"web_search"}), false),
+            (json!({"type":"any", "name":"web_search"}), false),
+            (json!({"type":"none"}), false),
+            (json!({"type":"future", "name":"web_search"}), false),
+            (json!({"type":"tool"}), false),
+            (json!({"type":"tool", "name":""}), false),
+            (json!({"type":"tool", "name":42}), false),
+            (json!({"type":"tool", "name":"client_echo"}), false),
+            (json!({"type":"tool", "name":"web_search"}), true),
+        ] {
+            let mut body = request();
+            body["tool_choice"] = choice.clone();
+            let ctx = MessagesRequestContext::from_value(body).unwrap();
+            assert!(ctx.is_tool_call_stop(Some("tool_use"), ["web_search"].into_iter()));
+            assert_eq!(
+                ctx.is_tool_call_stop(Some("end_turn"), ["web_search"].into_iter()),
+                accepts_end_turn,
+            );
+            assert!(!ctx.is_tool_call_stop(Some("end_turn"), std::iter::empty()));
+            for reason in [
+                None,
+                Some("max_tokens"),
+                Some("stop_sequence"),
+                Some("pause_turn"),
+                Some("future"),
+            ] {
+                assert!(!ctx.is_tool_call_stop(reason, ["web_search"].into_iter()));
+            }
+        }
     }
 
     #[test]
@@ -380,10 +438,7 @@ mod tests {
         for kind in ["any", "tool"] {
             for is_error in [false, true] {
                 let mut body = request();
-                let mut choice = json!({"type":kind, "disable_parallel_tool_use":true, "extension":{"value":1}});
-                if kind == "tool" {
-                    choice["name"] = json!("web_search");
-                }
+                let choice = json!({"type":kind, "name":"web_search", "disable_parallel_tool_use":true, "extension":{"value":1}});
                 body["tool_choice"] = choice.clone();
                 let mut ctx = MessagesRequestContext::from_value(body).unwrap();
                 let initial = ctx.raw.clone();
@@ -393,7 +448,9 @@ mod tests {
                 ctx.append_round(&content, results).unwrap();
                 let mut expected = initial;
                 expected["tool_choice"]["type"] = json!("auto");
-                expected["tool_choice"].as_object_mut().unwrap().remove("name");
+                if kind == "tool" {
+                    expected["tool_choice"].as_object_mut().unwrap().remove("name");
+                }
                 expected["messages"].as_array_mut().unwrap().extend([
                     json!({"role":"assistant", "content":content}),
                     json!({"role":"user", "content":[{"type":"tool_result", "tool_use_id":"search_1", "content":"answer", "is_error":is_error}]}),
