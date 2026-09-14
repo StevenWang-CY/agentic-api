@@ -112,7 +112,14 @@ async fn infer(State(state): State<Upstream>, Json(request): Json<Value>) -> Res
     let content = if call {
         let mut calls = vec![tool_call(if kind == "tool" { named } else { "web_search" }, rounds)];
         if state.mixed_calls {
-            calls.push(tool_call("client_echo", rounds));
+            calls.push(tool_call(
+                if kind == "tool" && named == "client_echo" {
+                    "web_search"
+                } else {
+                    "client_echo"
+                },
+                rounds,
+            ));
         }
         calls
     } else {
@@ -132,7 +139,17 @@ async fn infer(State(state): State<Upstream>, Json(request): Json<Value>) -> Res
 }
 
 fn assert_client_message(body: &str, stream: bool, client_owned: bool, expected_answer: &str, tool_stop_reason: &str) {
-    let stop = if client_owned { tool_stop_reason } else { "end_turn" };
+    assert!(
+        !body.contains("\"name\":\"web_search\""),
+        "gateway calls must remain hidden: {body}"
+    );
+    let stop = if client_owned && tool_stop_reason == "end_turn" {
+        "tool_use"
+    } else if client_owned {
+        tool_stop_reason
+    } else {
+        "end_turn"
+    };
     if stream {
         let events: Vec<Value> = body
             .lines()
@@ -164,7 +181,9 @@ fn assert_client_message(body: &str, stream: bool, client_owned: bool, expected_
         let message: Value = serde_json::from_str(body).unwrap();
         assert_eq!(message["stop_reason"], stop, "{body}");
         if client_owned {
+            assert_eq!(message["content"].as_array().unwrap().len(), 1);
             assert_eq!(message["content"][0]["name"], "client_echo");
+            assert_eq!(message["content"][0]["input"], json!({"query":"proof"}));
         } else {
             assert_eq!(message["content"][0]["text"], expected_answer);
         }
@@ -365,7 +384,7 @@ async fn named_choice_end_turn_executes_the_selected_gateway_call() {
 #[tokio::test]
 async fn named_choice_end_turn_preserves_client_tool_ownership() {
     for stream in [false, true] {
-        for (name, mixed) in [("client_echo", false), ("web_search", true)] {
+        for (name, mixed) in [("client_echo", false), ("web_search", true), ("client_echo", true)] {
             check_choice_with_stop(
                 Some(json!({"type":"tool", "name":name})),
                 stream,
@@ -375,6 +394,25 @@ async fn named_choice_end_turn_preserves_client_tool_ownership() {
                 "end_turn",
             )
             .await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn client_tool_truncation_and_other_stops_are_preserved() {
+    for stream in [false, true] {
+        for reason in ["max_tokens", "stop_sequence", "pause_turn", "future"] {
+            for mixed in [false, true] {
+                check_choice_with_stop(
+                    Some(json!({"type":"tool", "name":"client_echo"})),
+                    stream,
+                    false,
+                    1,
+                    mixed,
+                    reason,
+                )
+                .await;
+            }
         }
     }
 }

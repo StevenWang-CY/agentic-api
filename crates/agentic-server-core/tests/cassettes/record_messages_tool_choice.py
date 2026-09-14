@@ -1,6 +1,6 @@
-"""Capture the gateway's forced-to-auto Messages requests to a real vLLM server.
+"""Capture forced gateway searches or a named client-tool continuation with vLLM.
 
-Uses the existing recorder proxy; only the search service is deterministic.
+Uses the existing recorder proxy; tool outputs are supplied locally.
 See README.md for the server command and reproduction instructions.
 """
 
@@ -45,7 +45,47 @@ def wait_for_gateway(client, url, process, log):
     raise RuntimeError(log.read_text())
 
 
-def record(binary, upstream, model, output, kind, stream):
+def run_client_tool(url, request):
+    """Use the Anthropic SDK's stop reason to drive a real client continuation."""
+    from anthropic import Anthropic
+
+    def infer(sdk, body):
+        options = dict(body)
+        streaming = options.pop("stream")
+        options["extra_body"] = {"chat_template_kwargs": options.pop("chat_template_kwargs"),
+                                 "temperature": options.pop("temperature")}
+        if streaming:
+            with sdk.messages.stream(**options) as events:
+                return events.get_final_message()
+        return sdk.messages.create(**options, stream=False)
+
+    request["messages"][0]["content"] = (
+        "Call client_echo to get a verification string. After receiving its result, copy the ENTIRE result text "
+        "verbatim, including its prefix, underscores and all characters. Output nothing else. "
+        "Do not call tools again after receiving a result.")
+    request["tools"].append({"name": "client_echo", "description": "Return a verification token.",
+                             "input_schema": {"type": "object", "properties": {"query": {"type": "string"}},
+                                              "required": ["query"]}})
+    request["tool_choice"] = {"type": "tool", "name": "client_echo", "disable_parallel_tool_use": True}
+    with Anthropic(base_url=url, api_key="local-recording", timeout=300, max_retries=0) as sdk:
+        message = infer(sdk, request)
+        # Canonical client runners execute calls only for this stop reason.
+        assert message.stop_reason == "tool_use", message
+        calls = [block for block in message.content if block.type == "tool_use"]
+        assert len(calls) == 1 and calls[0].name == "client_echo", message
+        assert isinstance(calls[0].input.get("query"), str), calls[0]
+        continuation = dict(request, tool_choice={"type": "auto"})
+        continuation["messages"] = [*request["messages"],
+            {"role": "assistant", "content": [block.model_dump(mode="json", exclude_unset=True)
+                                               for block in message.content]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": calls[0].id,
+                                           "content": "CLIENT_PROOF_雪"}]}]
+        final = infer(sdk, continuation)
+        assert final.stop_reason == "end_turn", final
+        assert "CLIENT_PROOF_雪" in "".join(block.text for block in final.content if block.type == "text"), final
+
+
+def record(binary, upstream, model, output, kind, stream, client_tool=False):
     searches = []
 
     class Search(BaseHTTPRequestHandler):
@@ -99,21 +139,24 @@ def record(binary, upstream, model, output, kind, stream):
                                 "tool_choice": {"type": kind, "name": "web_search",
                                                 "disable_parallel_tool_use": kind == "tool"},
                             }
-                            response = client.post(url + "/v1/messages", json=request)
-                            response.raise_for_status()
-                            if stream:
-                                events = [json.loads(line[5:]) for line in response.text.splitlines()
-                                          if line.startswith("data:")]
-                                assert events[-1]["type"] == "message_stop", response.text
-                                for event_type in ("message_start", "message_delta", "message_stop"):
-                                    assert sum(e["type"] == event_type for e in events) == 1
-                                assert any(e.get("delta", {}).get("stop_reason") == "end_turn" for e in events)
-                                text = "".join(e.get("delta", {}).get("text", "") for e in events)
+                            if client_tool:
+                                run_client_tool(url, request)
                             else:
-                                message = response.json()
-                                assert message["stop_reason"] == "end_turn", message
-                                text = "".join(b.get("text", "") for b in message["content"])
-                            assert "SEARCH_PROOF_雪" in text, text
+                                response = client.post(url + "/v1/messages", json=request)
+                                response.raise_for_status()
+                                if stream:
+                                    events = [json.loads(line[5:]) for line in response.text.splitlines()
+                                              if line.startswith("data:")]
+                                    assert events[-1]["type"] == "message_stop", response.text
+                                    for event_type in ("message_start", "message_delta", "message_stop"):
+                                        assert sum(e["type"] == event_type for e in events) == 1
+                                    assert any(e.get("delta", {}).get("stop_reason") == "end_turn" for e in events)
+                                    text = "".join(e.get("delta", {}).get("text", "") for e in events)
+                                else:
+                                    message = response.json()
+                                    assert message["stop_reason"] == "end_turn", message
+                                    text = "".join(b.get("text", "") for b in message["content"])
+                                assert "SEARCH_PROOF_雪" in text, text
                     finally:
                         process.terminate()
                         try:
@@ -125,14 +168,14 @@ def record(binary, upstream, model, output, kind, stream):
             finally:
                 _stop_proxy(proxy)
         turns = yaml.safe_load(output.read_text())["turns"]
-        assert len(turns) == 2 and len(searches) == 1, (len(turns), searches)
+        assert len(turns) == 2 and len(searches) == (0 if client_tool else 1), (len(turns), searches)
         assert all(t["response"]["status_code"] == 200 for t in turns)
         assert turns[0]["request"]["body"] == request
-        expected_choice = {"type": "auto", "disable_parallel_tool_use": kind == "tool"}
+        expected_choice = {"type": "auto"} if client_tool else {"type": "auto", "disable_parallel_tool_use": kind == "tool"}
         if kind == "any":
             expected_choice["name"] = "web_search"
         assert turns[1]["request"]["body"]["tool_choice"] == expected_choice
-        print(f"Validated {output.name}: two provider requests, one search, completed answer.")
+        print(f"Validated {output.name}: two provider requests, {len(searches)} gateway searches, completed answer.")
     finally:
         search.shutdown()
         search.server_close()
@@ -144,13 +187,15 @@ def main():
     parser.add_argument("--binary", required=True, type=Path)
     parser.add_argument("--vllm", required=True)
     parser.add_argument("--model", default="Qwen/Qwen3-4B")
+    parser.add_argument("--client-tool", action="store_true", help="Record a client-executed call and SDK continuation")
     parser.add_argument("--output-dir", type=Path, default=HERE / "messages/tool-choice")
     args = parser.parse_args()
-    for kind in ("any", "tool"):
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    for kind in (("client",) if args.client_tool else ("any", "tool")):
         for stream in (False, True):
             suffix = "streaming" if stream else "nonstreaming"
             output = args.output_dir / f"messages-{kind}-{args.model.replace('/', '-')}-{suffix}.yaml"
-            record(args.binary.resolve(), args.vllm, args.model, output, kind, stream)
+            record(args.binary.resolve(), args.vllm, args.model, output, kind, stream, args.client_tool)
 
 
 if __name__ == "__main__":

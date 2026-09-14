@@ -134,10 +134,23 @@ pub async fn run_messages_loop(
             }
         }
 
+        if has_client_tool_use {
+            // Client execution takes precedence even when the provider labels a
+            // named call end_turn. Keep hidden gateway calls out of this turn.
+            let stripped = tool_seam::strip_gateway_tool_use(content, gateway_map);
+            let mut message = message;
+            message["content"] = Value::Array(stripped);
+            if message["stop_reason"] == "end_turn" {
+                message["stop_reason"] = json!("tool_use");
+            }
+            return Ok(MessagesResponse {
+                body: message,
+                headers: response_headers,
+            });
+        }
+
         // The shared context accepts tool_use and vLLM's end_turn for a matching
-        // named call. Other stops remain terminal. A client-owned tool_use is
-        // also terminal (the client must run it), but the gateway tool_use must be hidden
-        // (F5): strip gateway blocks from the client-facing content.
+        // named gateway call. Other stops retain their terminal behavior.
         if gateway_calls.is_empty()
             || !ctx.is_tool_call_stop(
                 stop_reason,
@@ -149,18 +162,6 @@ pub async fn run_messages_loop(
                 headers: response_headers,
             });
         }
-        if has_client_tool_use {
-            // Strip the gateway tool_use from the client-facing content (compute
-            // before mutating to end the immutable borrow of `message`).
-            let stripped = tool_seam::strip_gateway_tool_use(content, gateway_map);
-            let mut message = message;
-            message["content"] = Value::Array(stripped);
-            return Ok(MessagesResponse {
-                body: message,
-                headers: response_headers,
-            });
-        }
-
         // Pure gateway-tool round: execute the calls, then feed the model's FULL
         // assistant turn (thinking/text/tool_use, order preserved — F3) plus the
         // tool_results back for the next round. Gateway blocks stay internal.

@@ -439,7 +439,12 @@ impl MessagesStreamAccumulator {
     /// Emit the terminal `message_delta` + `message_stop` once, at loop end.
     fn finish(&mut self) -> Vec<String> {
         let mut out = Vec::new();
-        if let Some(delta) = self.final_message_delta.take() {
+        if let Some(mut delta) = self.final_message_delta.take() {
+            // A completed client call requires client action, even when vLLM
+            // labels a named call end_turn. Do not hide truncation or clean EOF.
+            if self.has_client_tool_use && self.has_completed_round() && delta["delta"]["stop_reason"] == "end_turn" {
+                delta["delta"]["stop_reason"] = json!("tool_use");
+            }
             out.push(sse("message_delta", &delta));
         }
         out.push(sse("message_stop", &json!({"type": "message_stop"})));
@@ -530,6 +535,39 @@ mod tests {
 
     fn context() -> MessagesRequestContext {
         MessagesRequestContext::from_value(json!({"model":"test", "max_tokens":64, "messages":[]})).unwrap()
+    }
+
+    #[test]
+    fn client_terminal_normalization_preserves_metadata_and_requires_completion() {
+        for completed in [false, true] {
+            for reason in ["end_turn", "tool_use", "max_tokens", "stop_sequence", "future"] {
+                let mut acc = acc();
+                acc.push(&line(
+                    &json!({"type":"content_block_start", "index":0, "content_block":{
+                        "type":"tool_use", "id":"client", "name":"client_echo", "input":{}
+                    }}),
+                ));
+                acc.push(&line(&json!({"type":"content_block_stop", "index":0})));
+                let mut terminal = json!({"type":"message_delta", "delta":{
+                    "stop_reason":reason, "stop_sequence":null, "extension":{"value":1}
+                }, "usage":{"output_tokens":7}, "provider_extension":[1,2]});
+                acc.push(&line(&terminal));
+                if completed {
+                    acc.push(&line(&json!({"type":"message_stop"})));
+                }
+                assert!(!acc.should_continue_loop(&context()));
+                if completed && reason == "end_turn" {
+                    terminal["delta"]["stop_reason"] = json!("tool_use");
+                }
+                assert_eq!(
+                    acc.finish(),
+                    vec![
+                        sse("message_delta", &terminal),
+                        sse("message_stop", &json!({"type":"message_stop"}))
+                    ]
+                );
+            }
+        }
     }
 
     #[test]

@@ -9,14 +9,16 @@
 //! `cache_control`, `is_error`, and every unmodeled block (`image`,
 //! `redacted_thinking`, future provider extensions).
 //!
-//! So this context carries **two views of one request**, built once per request:
+//! This context retains the request data needed by the loop:
 //!
 //! * `raw` — the JSON body actually sent upstream. It
-//!   is the single source of truth for `messages` and `system`, and the only
-//!   thing the loops mutate.
+//!   is the source of truth for `messages` and `system`, preserving unmodeled
+//!   history blocks and extension fields.
 //! * `typed` — only the client's `tools`, `stream`, and `model`, retained for
 //!   safe field access in routing and the loops. The parsed message history,
 //!   system prompt, and other fields are dropped before the loop begins.
+//! * `tool_choice` — the current typed selector. Fulfillment and transitions
+//!   use exhaustive enum matches; each transition updates the raw selector.
 //!
 //! The two are **not** kept byte-identical, and must not be confused: `typed` is
 //! what the client sent, `raw` is what the gateway sends upstream. They diverge
@@ -35,7 +37,10 @@ use serde_json::{Map, Value, json};
 
 use crate::executor::error::{ExecutorError, ExecutorResult};
 use crate::executor::messages_request::{WebSearchBudget, normalize_native_web_search};
-use crate::types::messages::{GatewayToolResult, MessagesRequest, ToolParam};
+use crate::types::messages::request::MessagesToolDeclarations;
+use crate::types::messages::{
+    GatewayToolMap, GatewayToolResult, MessagesRequest, MessagesToolChoice, ToolParam, has_gateway_tool,
+};
 use crate::utils::common::serialize_to_string;
 
 /// A Messages request parsed together with the exact immutable body bytes it
@@ -60,6 +65,22 @@ impl<'a> ParsedMessagesRequest<'a> {
     pub fn parse(body: &'a [u8]) -> ExecutorResult<Self> {
         let typed = serde_json::from_slice(body).map_err(ExecutorError::JsonError)?;
         Ok(Self { typed, body })
+    }
+
+    /// Parse requests handled by the gateway; preserve the transparent proxy
+    /// contract for requests without gateway-executed tools.
+    ///
+    /// # Errors
+    /// Returns the parse error if a gateway-tool request fails validation.
+    pub fn parse_for_gateway(body: &'a [u8], gateway_map: &GatewayToolMap) -> ExecutorResult<Option<Self>> {
+        match Self::parse(body) {
+            Ok(parsed) => Ok(has_gateway_tool(parsed.tools(), gateway_map).then_some(parsed)),
+            Err(error) => {
+                let declares_gateway_tool = serde_json::from_slice::<MessagesToolDeclarations>(body)
+                    .is_ok_and(|request| has_gateway_tool(request.tools.as_ref(), gateway_map));
+                if declares_gateway_tool { Err(error) } else { Ok(None) }
+            }
+        }
     }
 
     /// The tools declared by the client, before upstream normalization.
@@ -97,6 +118,8 @@ impl From<MessagesRequest> for MessagesTypedState {
 pub struct MessagesRequestContext {
     /// The only typed request fields needed after routing.
     typed: MessagesTypedState,
+    /// Current upstream selection policy; updated together with `raw`.
+    tool_choice: Option<MessagesToolChoice>,
     /// The upstream body. Mutated by the loops; the source of truth for
     /// `messages` and `system`.
     raw: Value,
@@ -141,9 +164,10 @@ impl MessagesRequestContext {
         Self::from_parts(typed, raw)
     }
 
-    fn from_parts(typed: MessagesRequest, mut raw: Value) -> ExecutorResult<Self> {
+    fn from_parts(mut typed: MessagesRequest, mut raw: Value) -> ExecutorResult<Self> {
         let web_search_budget = normalize_native_web_search(&mut raw)?;
         Ok(Self {
+            tool_choice: typed.tool_choice.take(),
             typed: typed.into(),
             raw,
             web_search_budget,
@@ -207,14 +231,11 @@ impl MessagesRequestContext {
             return true;
         }
         stop_reason == Some("end_turn")
-            && self.raw.get("tool_choice").is_some_and(|choice| {
-                choice["type"] == "tool"
-                    && choice
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .filter(|name| !name.is_empty())
-                        .is_some_and(|name| gateway_names.any(|called| called == name))
-            })
+            && match self.tool_choice.as_ref() {
+                Some(MessagesToolChoice::Tool { name, .. }) => gateway_names.any(|called| called == name.as_str()),
+                Some(MessagesToolChoice::Auto(_) | MessagesToolChoice::Any(_) | MessagesToolChoice::None { .. })
+                | None => false,
+            }
     }
 
     /// Append the model's assistant turn (preserving its `thinking`/`text`/
@@ -238,27 +259,18 @@ impl MessagesRequestContext {
         // A forced choice applies to this public turn. Once its gateway call
         // has a result, let the next inference round use that result to answer
         // instead of forcing another call until the round limit is reached.
-        let fulfilled_choice =
-            self.raw
-                .get("tool_choice")
-                .is_some_and(|choice| match choice.get("type").and_then(Value::as_str) {
-                    Some("any") => !tool_results.is_empty(),
-                    Some("tool") => choice
-                        .get("name")
+        let fulfilled_choice = match self.tool_choice.as_ref() {
+            Some(MessagesToolChoice::Any(_)) => !tool_results.is_empty(),
+            Some(MessagesToolChoice::Tool { name, .. }) => assistant_content.iter().any(|block| {
+                block["type"] == "tool_use"
+                    && block["name"] == name.as_str()
+                    && block
+                        .get("id")
                         .and_then(Value::as_str)
-                        .filter(|name| !name.is_empty())
-                        .is_some_and(|name| {
-                            assistant_content.iter().any(|block| {
-                                block["type"] == "tool_use"
-                                    && block["name"] == name
-                                    && block
-                                        .get("id")
-                                        .and_then(Value::as_str)
-                                        .is_some_and(|id| tool_results.iter().any(|result| result.tool_use_id == id))
-                            })
-                        }),
-                    _ => false,
-                });
+                        .is_some_and(|id| tool_results.iter().any(|result| result.tool_use_id == id))
+            }),
+            Some(MessagesToolChoice::Auto(_) | MessagesToolChoice::None { .. }) | None => false,
+        };
         let messages = self
             .raw
             .get_mut("messages")
@@ -275,11 +287,14 @@ impl MessagesRequestContext {
         );
         messages.push(Value::Object(user));
         if fulfilled_choice {
-            if let Some(choice) = self.raw.get_mut("tool_choice").and_then(Value::as_object_mut) {
-                if choice["type"] == "tool" {
-                    choice.remove("name");
+            if let Some(choice) = &mut self.tool_choice {
+                match choice {
+                    MessagesToolChoice::Any(options) | MessagesToolChoice::Tool { options, .. } => {
+                        *choice = MessagesToolChoice::Auto(std::mem::take(options));
+                    }
+                    MessagesToolChoice::Auto(_) | MessagesToolChoice::None { .. } => {}
                 }
-                choice.insert("type".to_owned(), Value::String("auto".to_owned()));
+                self.raw["tool_choice"] = serde_json::to_value(choice).map_err(ExecutorError::JsonError)?;
             }
         }
         Ok(())
@@ -305,10 +320,6 @@ mod tests {
             (json!({"type":"auto", "name":"web_search"}), false),
             (json!({"type":"any", "name":"web_search"}), false),
             (json!({"type":"none"}), false),
-            (json!({"type":"future", "name":"web_search"}), false),
-            (json!({"type":"tool"}), false),
-            (json!({"type":"tool", "name":""}), false),
-            (json!({"type":"tool", "name":42}), false),
             (json!({"type":"tool", "name":"client_echo"}), false),
             (json!({"type":"tool", "name":"web_search"}), true),
         ] {
@@ -426,6 +437,25 @@ mod tests {
         assert!(matches!(error, ExecutorError::JsonError(_)), "{error:?}");
     }
 
+    #[test]
+    fn malformed_gateway_selectors_fail_routing_including_configured_aliases() {
+        let map = GatewayToolMap::from_pairs([("WebSearch", "web_search")]);
+        for name in ["web_search", "WebSearch", "client_echo"] {
+            let body = serde_json::to_vec(&json!({
+                "model":"test", "max_tokens":64, "messages":[],
+                "tools":[{"name":name, "input_schema":{"type":"object"}}],
+                "tool_choice":{"type":"tool"}
+            }))
+            .unwrap();
+            let parsed = ParsedMessagesRequest::parse_for_gateway(&body, &map);
+            if name == "client_echo" {
+                assert!(parsed.unwrap().is_none(), "proxy requests retain upstream validation");
+            } else {
+                assert!(parsed.is_err(), "gateway requests must not fall back to the proxy");
+            }
+        }
+    }
+
     fn completed_search() -> (Vec<Value>, Vec<GatewayToolResult>) {
         (
             vec![json!({"type":"tool_use", "id":"search_1", "name":"web_search", "input":{}})],
@@ -459,24 +489,20 @@ mod tests {
                 let (content, results) = completed_search();
                 ctx.append_round(&content, results).unwrap();
                 assert_eq!(ctx.raw["tool_choice"], expected["tool_choice"]);
+                assert!(matches!(ctx.tool_choice, Some(MessagesToolChoice::Auto(_))));
+                assert!(!ctx.is_tool_call_stop(Some("end_turn"), ["web_search"].into_iter()));
             }
         }
     }
 
     #[test]
-    fn unforced_or_unrecognized_choices_are_preserved() {
+    fn unforced_or_unfulfilled_choices_are_preserved() {
         for choice in [
             None,
             Some(Value::Null),
             Some(json!({"type":"auto", "disable_parallel_tool_use":false})),
             Some(json!({"type":"none"})),
-            Some(json!({"type":"future", "name":"web_search"})),
-            Some(json!({"type":"tool"})),
-            Some(json!({"type":"tool", "name":""})),
             Some(json!({"type":"tool", "name":"client_tool"})),
-            Some(json!("any")),
-            Some(json!([])),
-            Some(json!({"type":false})),
         ] {
             let mut body = request();
             if let Some(choice) = &choice {

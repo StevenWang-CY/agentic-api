@@ -118,6 +118,84 @@ fn assert_completion(body: &str, turns: &[Value], stream: bool) {
     assert_eq!(actual_text, expected_text);
 }
 
+fn client_tool_content(body: &str, recorded: &Value, stream: bool) -> Vec<Value> {
+    if !stream {
+        let actual: Value = serde_json::from_str(body).unwrap();
+        let mut expected = recorded["body"].clone();
+        assert_eq!(
+            expected["stop_reason"], "end_turn",
+            "record the provider's incorrect stop"
+        );
+        expected["stop_reason"] = json!("tool_use");
+        assert_eq!(actual, expected, "only the public stop reason changes");
+        return actual["content"].as_array().unwrap().clone();
+    }
+    let actual = events(body);
+    let mut expected = events(&sse(recorded));
+    let terminal = expected
+        .iter_mut()
+        .find(|event| event["type"] == "message_delta")
+        .unwrap();
+    assert_eq!(terminal["delta"]["stop_reason"], "end_turn");
+    terminal["delta"]["stop_reason"] = json!("tool_use");
+    assert_eq!(
+        actual, expected,
+        "preserve the recorded lifecycle, arguments and metadata"
+    );
+    let starts: Vec<_> = actual
+        .iter()
+        .filter(|event| event["type"] == "content_block_start")
+        .collect();
+    assert_eq!(starts.len(), 1);
+    let mut call = starts[0]["content_block"].clone();
+    let input: String = actual
+        .iter()
+        .filter_map(|event| event["delta"]["partial_json"].as_str())
+        .collect();
+    call["input"] = serde_json::from_str(&input).unwrap();
+    vec![call]
+}
+
+async fn continue_client_conversation(client: &reqwest::Client, url: &str, body: &str, turns: &[Value], stream: bool) {
+    let client_blocks = client_tool_content(body, &turns[0]["response"], stream);
+    assert_eq!(client_blocks.len(), 1);
+    let call = &client_blocks[0];
+    assert_eq!(call["type"], "tool_use");
+    assert_eq!(call["name"], "client_echo");
+    assert!(call["input"]["query"].is_string());
+    // A client runner uses the public call's ID to submit the output.
+    let result = json!({"type":"tool_result", "tool_use_id":call["id"], "content":"CLIENT_PROOF_雪"});
+    let mut continuation = turns[0]["request"]["body"].clone();
+    continuation["tool_choice"] = json!({"type":"auto"});
+    continuation["messages"].as_array_mut().unwrap().extend([
+        json!({"role":"assistant", "content":client_blocks}),
+        json!({"role":"user", "content":[result]}),
+    ]);
+    let response = client
+        .post(format!("{url}/v1/messages"))
+        .json(&continuation)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let body = response.text().await.unwrap();
+    if stream {
+        let actual = events(&body);
+        assert_eq!(actual, events(&sse(&turns[1]["response"])));
+        let text: String = actual
+            .iter()
+            .filter_map(|event| event["delta"]["text"].as_str())
+            .collect();
+        assert!(text.contains("CLIENT_PROOF_雪"), "{body}");
+    } else {
+        assert!(body.contains("CLIENT_PROOF_雪"), "{body}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&body).unwrap(),
+            turns[1]["response"]["body"]
+        );
+    }
+}
+
 async fn replay(kind: &str, stream: bool) {
     let suffix = if stream { "streaming" } else { "nonstreaming" };
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!(
@@ -127,7 +205,11 @@ async fn replay(kind: &str, stream: bool) {
     let turns = Arc::new(cassette["turns"].as_array().unwrap().clone());
     assert_eq!(turns.len(), 2);
     assert!(turns.iter().all(|turn| turn["response"]["status_code"] == 200));
-    assert_eq!(turns[0]["request"]["body"]["tool_choice"]["type"], kind);
+    let client_tool = kind == "client";
+    assert_eq!(
+        turns[0]["request"]["body"]["tool_choice"]["type"],
+        if client_tool { "tool" } else { kind }
+    );
     assert_eq!(turns[1]["request"]["body"]["tool_choice"]["type"], "auto");
     let upstream = Replay {
         turns: Arc::clone(&turns),
@@ -164,7 +246,12 @@ async fn replay(kind: &str, stream: bool) {
             .await
             .unwrap();
         assert_eq!(response.status(), http::StatusCode::OK);
-        assert_completion(&response.text().await.unwrap(), &turns, stream);
+        let body = response.text().await.unwrap();
+        if client_tool {
+            continue_client_conversation(&client, &url, &body, &turns, stream).await;
+        } else {
+            assert_completion(&body, &turns, stream);
+        }
     }
     {
         let actual = upstream.requests.lock().await;
@@ -185,10 +272,16 @@ async fn replay(kind: &str, stream: bool) {
         .unwrap();
     let result = &history[2]["content"][0];
     assert_eq!(result["tool_use_id"], call["id"]);
-    assert_eq!(result["is_error"], false);
+    if !client_tool {
+        assert_eq!(result["is_error"], false);
+    }
     assert_eq!(
         *upstream.searches.lock().await,
-        vec![call["input"]["query"].as_str().unwrap(); 2]
+        if client_tool {
+            vec![]
+        } else {
+            vec![call["input"]["query"].as_str().unwrap(); 2]
+        }
     );
     for table in ["responses", "items", "conversations"] {
         let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
@@ -220,4 +313,14 @@ async fn recorded_any_choice_finishes_streaming_search() {
 #[tokio::test]
 async fn recorded_named_choice_finishes_streaming_search() {
     replay("tool", true).await;
+}
+
+#[tokio::test]
+async fn recorded_named_client_call_resumes_http_conversation() {
+    replay("client", false).await;
+}
+
+#[tokio::test]
+async fn recorded_named_client_call_resumes_streaming_conversation() {
+    replay("client", true).await;
 }

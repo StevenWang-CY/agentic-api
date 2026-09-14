@@ -218,7 +218,7 @@ turns:
 
 ### Messages forced tool choice (vLLM)
 
-`messages/tool-choice/` records the production gateway's two upstream requests for each forced selector. The first
+`messages-any-*` and `messages-tool-*` in `messages/tool-choice/` record the gateway's two requests for each forced selector. The first
 request forces `web_search`; after one successful search, the second carries the complete assistant/tool-result
 history and `tool_choice.type=auto`. The `any` cases retain a `name` extension and allow parallel tool use; the named
 cases remove `name` and retain `disable_parallel_tool_use=true`. Each exchange ends with the token from the search
@@ -250,6 +250,20 @@ The scenario uses the existing `record_cassette.py` proxy between the gateway an
 requests, one search and a completed public response per cassette. Replay tests compare every complete upstream
 request to the capture, check the query/result pairing and public lifecycle, repeat on the same gateway, and assert
 that Messages writes no conversation state.
+
+The `messages-client-*` recordings exercise named **client-executed function tools** with an unused gateway tool
+declared. vLLM returns `end_turn`; the gateway surfaces `tool_use`. The Anthropic SDK then executes `client_echo`,
+submits the output using the returned call ID, and receives the token from that output. Each cassette has two public
+requests and no gateway search. The replay tests assert the complete captured requests and response events,
+including the sole public stop-reason correction, and repeat the conversation on the same gateway.
+
+Capture these scenarios with the same provider and gateway build:
+
+```bash
+python -m pip install anthropic==1.5.0
+python crates/agentic-server-core/tests/cassettes/record_messages_tool_choice.py \
+    --binary target/debug/agentic-server --vllm http://localhost:8000 --client-tool
+```
 
 ### Text-only (OpenAI)
 
