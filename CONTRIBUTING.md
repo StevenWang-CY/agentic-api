@@ -105,6 +105,22 @@ dependencies are installed once by pre-commit and reused; a check neither builds
 the Rust workspace nor accesses the network. The existing Pre-commit workflow
 runs these hooks with `--all-files`.
 
+The local hook compares baseline entries with the committed policy at `HEAD`.
+CI compares against the PR base, merge-queue base, or the previous main commit,
+using `RUST_FILE_SIZE_BASE`; CI fetches full history for that comparison.
+This prevents an earlier commit in a PR from hiding a baseline addition or increase.
+To check a whole branch locally, select an already-fetched base:
+
+```bash
+RUST_FILE_SIZE_BASE=upstream/main pre-commit run rust-file-sizes --all-files
+```
+
+The script also accepts `--base-ref`, which overrides the environment variable.
+An unavailable base fails the check; fetch that revision before retrying. When
+introducing the policy, initial caps may only come from production counts in
+regular Rust files that already existed at the base revision. A repository's
+first commit or first push has no prior allowances.
+
 Counting rules:
 
 - Count physical lines, including comments and blanks, with or without a final
@@ -130,9 +146,12 @@ Counting rules:
 
 When a baselined file shrinks, lower its cap to the reported production count in
 the same commit; remove the entry at 500 lines or fewer. Delete or rename its
-policy entry when deleting or renaming the file. The checker reports the required
-update and never rewrites the baseline. Do not add or increase baseline caps to
-accommodate growth. A justified cohesion-based exception belongs in `exceptions`
+policy entry when deleting or renaming the file. A rename detected by Git may
+retain or lower the original file's cap; copies and other new paths cannot inherit
+a baseline. The checker reports the required update and never rewrites the baseline.
+Outside initial setup and detected renames, new baseline entries are rejected.
+Caps cannot increase relative to the selected prior revision.
+A justified cohesion-based exception belongs in `exceptions`
 as an exact path mapped to `{"limit": 550, "reason": "Specific rationale and review/issue reference"}`.
 Keep any existing baseline cap so the exception remains explicit. Exceptions
 must exceed the normal allowance and be removed when no longer needed.

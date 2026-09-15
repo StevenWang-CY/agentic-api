@@ -1,6 +1,7 @@
 """Exercise Rust syntax counting and the actual Git-backed checker command."""
 
 import json
+import os
 import runpy
 import subprocess
 import sys
@@ -169,6 +170,8 @@ class CommandTests(unittest.TestCase):
         self.addCleanup(self.directory.cleanup)
         self.root = Path(self.directory.name)
         self.policy = {"version": 1, "baseline": {}, "exceptions": {}, "generated": {}}
+        self.environment = dict(os.environ)
+        self.environment.pop("RUST_FILE_SIZE_BASE", None)
         self.git("init", "-q")
 
     def git(self, *args):
@@ -182,14 +185,25 @@ class CommandTests(unittest.TestCase):
             self.git("add", "--", name)
         return path
 
-    def check(self, expected, text="", raw=None):
+    def commit(self, with_policy=True):
+        if with_policy:
+            (self.root / ".rust-file-sizes.json").write_text(json.dumps(self.policy), encoding="utf-8")
+        self.git("add", "--all")
+        self.git(
+            "-c", "user.name=Test", "-c", "user.email=test@example.com",
+            "-c", "commit.gpgsign=false", "-c", f"core.hooksPath={self.root / 'disabled-hooks'}",
+            "commit", "--quiet", "--allow-empty", "-s", "-m", "test: record prior policy",
+        )
+        return self.git("rev-parse", "HEAD").stdout.decode().strip()
+
+    def check(self, expected, text="", raw=None, base_ref=None):
         policy = self.root / ".rust-file-sizes.json"
         policy.write_text(json.dumps(self.policy) if raw is None else raw, encoding="utf-8")
         before = policy.read_bytes()
-        result = subprocess.run(
-            [sys.executable, str(CHECKER), "--root", str(self.root), "--report"],
-            capture_output=True, text=True,
-        )
+        command = [sys.executable, str(CHECKER), "--root", str(self.root), "--report"]
+        if base_ref is not None:
+            command.extend(["--base-ref", base_ref])
+        result = subprocess.run(command, capture_output=True, text=True, env=self.environment)
         self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
         self.assertIn(text, result.stdout + result.stderr)
         self.assertEqual(policy.read_bytes(), before, "checker must not change the baseline")
@@ -204,12 +218,15 @@ class CommandTests(unittest.TestCase):
     def test_baseline_accepts_exact_size_and_rejects_growth(self):
         self.policy["baseline"]["src/main.rs"] = 520
         self.source(lines=520)
+        self.commit()
         self.check(0, "limit 520")
         self.source(lines=521)
         self.check(1, "521 production lines, limit 520")
 
     def test_reduction_requires_ratchet_and_eventual_removal(self):
         self.policy["baseline"]["src/main.rs"] = 520
+        self.source(lines=520)
+        self.commit()
         self.source(lines=510)
         self.check(1, "lower its baseline to 510")
         self.policy["baseline"]["src/main.rs"] = 510
@@ -217,6 +234,165 @@ class CommandTests(unittest.TestCase):
         self.source(lines=500)
         self.check(1, "remove its baseline entry")
         self.policy["baseline"].clear()
+        self.check(0)
+
+    def test_raising_the_baseline_cannot_hide_growth(self):
+        self.source(lines=520)
+        self.policy["baseline"]["src/main.rs"] = 520
+        self.commit()
+        self.source(lines=530)
+        self.policy["baseline"]["src/main.rs"] = 530
+        self.check(1, "baseline 530 exceeds prior allowance 520")
+        self.policy["baseline"]["src/main.rs"] = 520
+        self.policy["exceptions"]["src/main.rs"] = {"limit": 530, "reason": "Reviewed cohesive table."}
+        self.check(0)
+
+    def test_new_baselines_require_exceptions_instead(self):
+        self.source()
+        self.commit()
+        for path in ["src/new.rs", "src/main.rs"]:
+            with self.subTest(path=path):
+                self.source(path, 601)
+                self.policy["baseline"][path] = 601
+                self.check(1, "baseline 601 exceeds prior allowance 500")
+                self.policy["baseline"].clear()
+                self.policy["exceptions"][path] = {"limit": 601, "reason": "Reviewed cohesive table."}
+                self.check(0)
+
+    def test_ci_base_catches_growth_committed_before_the_latest_commit(self):
+        self.source(lines=520)
+        self.policy["baseline"]["src/main.rs"] = 520
+        base = self.commit()
+        self.source(lines=530)
+        self.policy["baseline"]["src/main.rs"] = 530
+        self.commit()  # Simulate a commit made without running the local hook.
+        self.environment["RUST_FILE_SIZE_BASE"] = base
+        self.check(1, "baseline 530 exceeds prior allowance 520")
+        self.check(1, "baseline 530 exceeds prior allowance 520", base_ref=base)
+
+    def test_initial_baseline_uses_only_existing_production_counts(self):
+        self.source(lines=520)
+        self.commit(with_policy=False)
+        self.policy["baseline"]["src/main.rs"] = 520
+        self.check(0)
+        self.source(lines=521)
+        self.policy["baseline"]["src/main.rs"] = 521
+        self.check(1, "baseline 521 exceeds prior allowance 520")
+        self.source(lines=520)
+        self.policy["baseline"]["src/main.rs"] = 520
+        self.source("src/new.rs", 601)
+        self.policy["baseline"]["src/new.rs"] = 601
+        self.check(1, "baseline 601 exceeds prior allowance 500")
+
+    def test_an_unborn_repository_cannot_grant_a_baseline(self):
+        self.source(lines=520)
+        self.policy["baseline"]["src/main.rs"] = 520
+        self.check(1, "baseline 520 exceeds prior allowance 500")
+
+    def test_first_push_has_no_prior_allowances(self):
+        self.source()
+        self.commit()
+        self.environment["RUST_FILE_SIZE_BASE"] = "0" * 40
+        self.check(0)
+        self.source(lines=520)
+        self.policy["baseline"]["src/main.rs"] = 520
+        self.check(1, "baseline 520 exceeds prior allowance 500")
+
+    def test_bootstrap_does_not_use_test_lines_as_production_allowances(self):
+        path = self.source()
+        with path.open("a") as output:
+            output.write("#[cfg(test)]\nmod tests {\n" + "// test\n" * 600 + "}\n")
+        self.commit(with_policy=False)
+        self.source(lines=601)
+        self.policy["baseline"]["src/main.rs"] = 601
+        self.check(1, "baseline 601 exceeds prior allowance 500")
+
+    def test_a_renamed_dedicated_test_cannot_bootstrap_a_production_baseline(self):
+        self.source("tests/large.rs", 601)
+        self.commit(with_policy=False)
+        (self.root / "src").mkdir()
+        self.git("mv", "tests/large.rs", "src/large.rs")
+        self.policy["baseline"]["src/large.rs"] = 601
+        self.check(1, "baseline 601 exceeds prior allowance 500")
+
+    def test_a_renamed_non_rust_file_cannot_bootstrap_a_baseline(self):
+        self.source("template.txt", 601)
+        self.commit(with_policy=False)
+        self.git("mv", "template.txt", "production.rs")
+        self.policy["baseline"]["production.rs"] = 601
+        self.check(1, "baseline 601 exceeds prior allowance 500")
+
+    @unittest.skipUnless(os.name == "posix", "requires a POSIX symlink target")
+    def test_a_prior_symlink_cannot_bootstrap_a_production_baseline(self):
+        path = self.source(lines=600)
+        path.unlink()
+        path.symlink_to("\n" * 600)
+        self.commit(with_policy=False)
+        path.unlink()
+        self.source(lines=600)
+        self.policy["baseline"]["src/main.rs"] = 600
+        self.check(1, "baseline 600 exceeds prior allowance 500")
+
+    def test_a_copy_cannot_reuse_an_existing_baseline(self):
+        self.source(lines=520)
+        self.policy["baseline"]["src/main.rs"] = 520
+        self.commit()
+        self.source("src/copy.rs", 520)
+        self.policy["baseline"]["src/copy.rs"] = 520
+        self.check(1, "baseline 520 exceeds prior allowance 500")
+
+    def test_malformed_prior_policy_fails_instead_of_bootstrapping(self):
+        self.source(lines=520)
+        self.policy["baseline"]["src/main.rs"] = 520
+        (self.root / ".rust-file-sizes.json").write_text('{"version":1,"version":1}', encoding="utf-8")
+        self.commit(with_policy=False)
+        self.check(1, "duplicate policy key")
+
+    @unittest.skipUnless(os.name == "posix", "requires a POSIX filename")
+    def test_a_prior_policy_symlink_cannot_supply_its_target_name_as_policy(self):
+        self.source("source.rs", 520)
+        self.policy["baseline"] = {"source.rs": 520}
+        target = json.dumps({**self.policy, "baseline": {"source.rs": 900}})
+        (self.root / target).write_text(json.dumps(self.policy), encoding="utf-8")
+        (self.root / ".rust-file-sizes.json").symlink_to(target)
+        self.commit(with_policy=False)
+        (self.root / ".rust-file-sizes.json").unlink()
+        self.source("source.rs", 600)
+        self.policy["baseline"]["source.rs"] = 600
+        self.check(1, "must be a regular file")
+
+    def test_renames_preserve_the_prior_cap_but_cannot_raise_it(self):
+        self.source(lines=520)
+        self.policy["baseline"]["src/main.rs"] = 520
+        self.commit()
+        self.git("mv", "src/main.rs", "src/renamed file.rs")
+        self.policy["baseline"] = {"src/renamed file.rs": 520}
+        self.check(0)
+        self.source("src/renamed file.rs", 521)
+        self.policy["baseline"]["src/renamed file.rs"] = 521
+        self.check(1, "baseline 521 exceeds prior allowance 520")
+        self.source("src/renamed file.rs", 510)
+        self.policy["baseline"]["src/renamed file.rs"] = 510
+        self.check(0)
+
+    def test_unavailable_base_fails_and_explicit_base_overrides_environment(self):
+        self.source()
+        base = self.commit()
+        self.environment["RUST_FILE_SIZE_BASE"] = "missing-base"
+        self.check(1, "cannot resolve baseline base")
+        self.check(0, base_ref=base)
+
+    def test_a_missing_base_in_a_shallow_clone_requires_a_fetch(self):
+        self.source(lines=520)
+        self.policy["baseline"]["src/main.rs"] = 520
+        base = self.commit()
+        self.commit()
+        clone = self.root / "shallow"
+        self.git("clone", "--quiet", "--depth", "1", self.root.as_uri(), str(clone))
+        self.root = clone
+        self.environment["RUST_FILE_SIZE_BASE"] = base
+        self.check(1, "cannot resolve baseline base")
+        self.git("fetch", "--quiet", "--unshallow")
         self.check(0)
 
     def test_inline_tests_do_not_inflate_command_count(self):
@@ -259,8 +435,10 @@ class CommandTests(unittest.TestCase):
         self.check(1, "requires a generator/reason")
 
     def test_exception_is_bounded_and_does_not_replace_baseline(self):
-        self.source(lines=530)
+        self.source(lines=520)
         self.policy["baseline"]["src/main.rs"] = 520
+        self.commit()
+        self.source(lines=530)
         self.policy["exceptions"]["src/main.rs"] = {"limit": 530, "reason": "One cohesive protocol table; reviewed in #123."}
         self.check(0)
         self.source(lines=531)
@@ -297,6 +475,7 @@ class CommandTests(unittest.TestCase):
     def test_deleted_and_renamed_files_require_policy_cleanup(self):
         self.source(lines=520)
         self.policy["baseline"]["src/main.rs"] = 520
+        self.commit()
         self.git("mv", "src/main.rs", "src/renamed.rs")
         self.check(1, "stale baseline entry")
         self.policy["baseline"] = {"src/renamed.rs": 520}

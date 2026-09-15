@@ -133,8 +133,15 @@ def unique_keys(pairs):
     return result
 
 
-def load_policy(root, paths):
-    policy = json.loads((root / POLICY).read_text(encoding="utf-8"), object_pairs_hook=unique_keys)
+def git_bytes(root, *args):
+    return subprocess.check_output(["git", *args], cwd=root, stderr=subprocess.PIPE)
+
+
+def load_policy(root, paths, revision=None):
+    source = (root / POLICY).read_text(encoding="utf-8") if revision is None else git_bytes(
+        root, "show", f"{revision}:{POLICY}"
+    ).decode("utf-8")
+    policy = json.loads(source, object_pairs_hook=unique_keys)
     if not isinstance(policy, dict) or set(policy) != {"version", "baseline", "exceptions", "generated"}:
         raise ValueError("policy must contain version, baseline, exceptions, and generated")
     if type(policy["version"]) is not int or policy["version"] != 1:
@@ -164,11 +171,62 @@ def load_policy(root, paths):
     return policy
 
 
-def check(root, report=False):
+def prior_baselines(root, baseline, base_ref):
+    """Read allowances from a prior commit, never from the edited policy."""
+    if base_ref in {"0" * 40, "0" * 64}:  # First push: every file is new.
+        return {}
+    resolved = subprocess.run(
+        ["git", "rev-parse", "--verify", "--quiet", "--end-of-options", f"{base_ref}^{{commit}}"],
+        cwd=root, capture_output=True,
+    )
+    if resolved.returncode:
+        if base_ref == "HEAD":  # An unborn repository has no existing allowances.
+            return {}
+        raise ValueError(f"cannot resolve baseline base {base_ref!r}; fetch it or supply --base-ref")
+    revision = resolved.stdout.decode().strip()
+    old_files = {}
+    for entry in git_bytes(root, "ls-tree", "-rz", revision).split(b"\0"):
+        if entry:
+            metadata, path = entry.split(b"\t", 1)
+            old_files[os.fsdecode(path)] = metadata.split(b" ", 1)[0]
+    regular = {b"100644", b"100755"}
+    rust_paths = {path for path, mode in old_files.items() if path.endswith(".rs") and mode in regular}
+    if POLICY in old_files and old_files[POLICY] not in regular:
+        raise ValueError(f"{POLICY}: prior policy at {base_ref} must be a regular file")
+    old_policy = load_policy(root, rust_paths, revision) if POLICY in old_files else None
+    known = rust_paths if old_policy is None else set(old_policy["baseline"])
+    renames = {}
+    if set(baseline) - known:
+        renamed = git_bytes(
+            root, "diff", "--name-status", "-z", "--find-renames=50%", "-l0",
+            "--no-ext-diff", "--no-textconv", "--diff-filter=R", revision, "--",
+        ).split(b"\0")
+        renames = {
+            os.fsdecode(renamed[i + 2]): os.fsdecode(renamed[i + 1])
+            for i in range(0, len(renamed) - 1, 3)
+        }
+    allowances = {}
+    for path in baseline:
+        previous = renames.get(path, path)
+        if old_policy is not None:
+            allowances[path] = old_policy["baseline"].get(previous, LIMIT)
+        elif previous in rust_paths and not dedicated_test(previous):
+            # Bootstrap only from production source that existed before the policy.
+            source = git_bytes(root, "show", f"{revision}:{previous}")
+            allowances[path] = max(LIMIT, count_source(source).production)
+    return allowances
+
+
+def check(root, report=False, base_ref="HEAD"):
     listed = subprocess.check_output(["git", "ls-files", "-z", "--", "*.rs"], cwd=root)
     paths = sorted({os.fsdecode(path) for path in listed.split(b"\0") if path})
     policy = load_policy(root, paths)
-    errors = []
+    prior = prior_baselines(root, policy["baseline"], base_ref)
+    errors = [
+        f"{path}: baseline {limit} exceeds prior allowance {prior.get(path, LIMIT)} at {base_ref}; "
+        "keep the prior cap (or omit a new entry) and use a bounded exception with a reason for growth"
+        for path, limit in policy["baseline"].items() if limit > prior.get(path, LIMIT)
+    ]
     checked = 0
     for path in paths:
         if dedicated_test(path):
@@ -211,9 +269,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--report", action="store_true", help="Print counts without modifying the policy")
+    parser.add_argument(
+        "--base-ref", default=os.environ.get("RUST_FILE_SIZE_BASE", "HEAD"),
+        help="Prior commit for baseline validation (default: RUST_FILE_SIZE_BASE or HEAD)",
+    )
     args = parser.parse_args()
     try:
-        return int(check(args.root, args.report))
+        return int(check(args.root, args.report, args.base_ref))
     except (OSError, ValueError, subprocess.CalledProcessError) as error:
         print(f"Rust file sizes: {error}", file=sys.stderr)
         return 1
