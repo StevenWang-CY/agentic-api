@@ -99,6 +99,53 @@ fn live() {
         for source in [b"struct S {\n#[cfg(test)]\nx: u8,\ny: u8,\n}\n", b"enum E {\n#[cfg(test)]\nTest,\nLive,\n}\n"]:
             self.assertEqual(COUNT(source), (3, 2, 5))
 
+    def test_cfg_match_arm_excludes_its_complete_value(self):
+        source = b'''pub fn live(a: u32) -> u32 {
+    match a {
+        #[allow(unused)]
+        #[cfg(test)]
+        1 => {
+            // test only
+            3
+        },
+        _ => 4,
+    }
+}
+'''
+        self.assertEqual(COUNT(source), (5, 6, 11))
+
+    def test_cfg_field_initializers_include_values_and_separators(self):
+        for field in [b"b: {\n            // test only\n            3\n        },", b"b,"]:
+            source = b'''pub struct S { pub a: u32, #[cfg(test)] pub b: u32 }
+pub fn live() -> S {
+    #[cfg(test)]
+    let b = 3;
+    S {
+        #[allow(unused)]
+        #[cfg(test)]
+        ''' + field + b'''
+        a: 4,
+    }
+}
+'''
+            with self.subTest(field=field):
+                total = source.count(b"\n")
+                self.assertEqual(COUNT(source), (6, total - 5, total))
+
+    def test_cfg_tuple_fields_include_visibility_and_complete_type(self):
+        for visibility in [b"", b"pub", b"pub(crate)"]:
+            source = b'''pub struct Live(
+    #[allow(unused)]
+    #[cfg(test)]
+    ''' + visibility + b'''
+    (u32,
+     u32),
+    pub u64,
+);
+'''
+            with self.subTest(visibility=visibility):
+                self.assertEqual(COUNT(source), (3, 5, 8))
+
     def test_raw_identifier_borrow_and_multiline_strings_parse(self):
         source = b'''fn live(raw: String) {
     let borrowed = &raw;
@@ -180,6 +227,22 @@ class CommandTests(unittest.TestCase):
         with path.open("a") as output:
             output.write("fn later_production() {}\n")
         self.check(1, "501 production lines, limit 500")
+
+    def test_conditional_fragments_at_the_command_boundary(self):
+        cases = [
+            (b"pub struct S(\n#[cfg(test)]\npub u32,\npub u64,\n);\n", 3),
+            (b"pub fn f(a: u32) -> u32 {\nmatch a {\n#[cfg(test)]\n1 => 3,\n_ => 4,\n}\n}\n", 5),
+            (b"pub struct S { pub a: u32, #[cfg(test)] pub b: u32 }\n"
+             b"pub fn f() -> S {\nS {\n#[cfg(test)]\nb: 3,\na: 4,\n}\n}\n", 6),
+        ]
+        for source, production in cases:
+            with self.subTest(source=source):
+                path = self.source()
+                path.write_bytes(b"// production\n" * (500 - production) + source)
+                self.check(0, "500 production")
+                with path.open("ab") as output:
+                    output.write(b"// one more production line\n")
+                self.check(1, "501 production lines, limit 500")
 
     def test_dedicated_tests_benches_examples_are_excluded(self):
         for name in ["tests/large.rs", "src/tests.rs", "src/tests/helpers.rs", "benches/large.rs", "examples/large.rs"]:

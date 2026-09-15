@@ -86,9 +86,12 @@ def test_ranges(node):
                 owner = owner.parent
             yield attributed_start(owner), owner.end_byte
             continue
-        owner = attribute.next_named_sibling
-        while owner is not None and owner.type in COMMENTS | {"attribute_item"}:
-            owner = owner.next_named_sibling
+        owner = attribute.parent
+        if owner.type not in {"match_arm", "field_initializer", "shorthand_field_initializer"}:
+            owner = attribute.next_named_sibling
+            # Tuple fields store visibility and type as separate siblings.
+            while owner is not None and owner.type in COMMENTS | {"attribute_item", "visibility_modifier"}:
+                owner = owner.next_named_sibling
         if owner is None:
             raise ValueError("test attribute has no following Rust item")
         end = owner.end_byte

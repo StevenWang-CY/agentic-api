@@ -110,8 +110,9 @@ Counting rules:
 - Count physical lines, including comments and blanks, with or without a final
   newline. CRLF and LF have the same count.
 - Parse Rust syntax with Tree-sitter; exclude `#[cfg(test)]` items and their
-  attributes, nested test modules/items/statements, inner `#![cfg(test)]`, and
-  built-in `#[test]`/`#[bench]` items. A test-only item can appear anywhere in a file.
+  attributes, nested test modules/items/statements, fields, initializers, match
+  arms, inner `#![cfg(test)]`, and built-in `#[test]`/`#[bench]` functions.
+  A test-only item can appear anywhere in a file.
   `all`/`any`/`not` predicates are excluded only when they require `test`; unknown
   feature/platform configurations remain production code.
 - Only remove an entire physical line from the production count when no
