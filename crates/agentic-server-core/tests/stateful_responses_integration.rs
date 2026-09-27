@@ -6,9 +6,11 @@
 mod support;
 
 use agentic_core::executor::request::RequestContext;
-use agentic_core::executor::{ExecutorError, execute};
+use agentic_core::executor::{
+    ExecutionContext, ExecutorError, execute, persist_response, persist_turn, rehydrate_conversation,
+};
 use agentic_core::storage::InOutItem;
-use agentic_core::types::request_response::RequestPayload;
+use agentic_core::types::request_response::{RequestPayload, ResponsePayload};
 use agentic_core::types::tools::{FunctionToolParam, NonEmptyToolName};
 use agentic_core::{
     FunctionToolResultMessage, InputItem, OutputItem, ReasoningOutput, ResponsesInput, ResponsesTool, ToolChoice,
@@ -668,6 +670,68 @@ async fn test_store_false_with_previous_response_id_hydrates_but_does_not_persis
         request_input_texts(&requests[2]),
         vec!["seed", "stored answer", "again"]
     );
+}
+
+/// The composable persist steps apply the same storage policy as `execute`.
+#[tokio::test]
+async fn test_public_persist_steps_honor_the_storage_policy() {
+    let fixture = TestFixture::new_with_responses(vec![text_response("stored answer")]).await;
+    let exec_ctx = Arc::clone(&fixture.exec_ctx);
+    let parent = unwrap_blocking(
+        execute(make_request("seed", true, false, None, None), Arc::clone(&exec_ctx))
+            .await
+            .expect("stored turn"),
+    );
+
+    for store in [false, true] {
+        let follow_up = || make_request("follow up", store, false, Some(parent.id.clone()), None);
+
+        let ctx = rehydrate_conversation(follow_up(), &exec_ctx)
+            .await
+            .expect("hydrates from the stored parent");
+        let id = ctx.response_id.clone();
+        let payload: ResponsePayload = serde_json::from_value(json!({
+            "id": id, "object": "response", "created_at": 0, "model": "test-model", "status": "completed",
+            "output": [{"type": "message", "id": format!("msg_public_{store}"), "role": "assistant",
+                "status": "completed", "content": [{"type": "output_text", "text": "public answer"}]}]
+        }))
+        .expect("completed payload");
+        persist_response(
+            payload,
+            ctx,
+            exec_ctx.conv_handler.clone(),
+            exec_ctx.resp_handler.clone(),
+        )
+        .await
+        .expect("persist_response");
+        assert_eq!(
+            is_continuable(&exec_ctx, &id).await,
+            store,
+            "persist_response with store={store}"
+        );
+
+        let ctx = rehydrate_conversation(follow_up(), &exec_ctx)
+            .await
+            .expect("hydrates from the stored parent");
+        let id = ctx.response_id.clone();
+        persist_turn(ctx, Vec::new(), &exec_ctx.conv_handler, &exec_ctx.resp_handler)
+            .await
+            .expect("persist_turn");
+        assert_eq!(
+            is_continuable(&exec_ctx, &id).await,
+            store,
+            "persist_turn with store={store}"
+        );
+    }
+}
+
+/// Whether `id` resolves as `previous_response_id`; a missing row is the only accepted failure.
+async fn is_continuable(exec_ctx: &ExecutionContext, id: &str) -> bool {
+    match rehydrate_conversation(make_request("next", true, false, Some(id.to_owned()), None), exec_ctx).await {
+        Ok(_) => true,
+        Err(ExecutorError::Storage(source)) if source.is_not_found() => false,
+        Err(error) => panic!("unexpected rehydration error for {id}: {error}"),
+    }
 }
 
 #[tokio::test]

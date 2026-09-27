@@ -51,7 +51,9 @@ pub(crate) async fn persist_if_needed(
 
 /// Step 3 — Persist the completed response to storage.
 ///
-/// Skipped if [`ResponseStatus`] is not `Completed`/`Incomplete` or `payload.id` is empty.
+/// Applies the same storage policy as [`execute`](crate::executor::execute): a
+/// no-session `store: false` context is returned unstored. Also skipped if
+/// [`ResponseStatus`] is not `Completed`/`Incomplete` or `payload.id` is empty.
 /// Routes explicit `conversation_id` requests to [`ConversationHandler`] and
 /// all other requests, including `previous_response_id` continuations, to [`ResponseHandler`].
 ///
@@ -64,10 +66,12 @@ pub async fn persist_response(
     resp_handler: ResponseHandler,
 ) -> ExecutorResult<()> {
     // Use typed enum — no hardcoded status strings.
-    if !matches!(
-        payload.status.parse::<ResponseStatus>().unwrap_or_default(),
-        ResponseStatus::Completed | ResponseStatus::Incomplete
-    ) || payload.id.is_empty()
+    if !should_persist(&ctx)
+        || !matches!(
+            payload.status.parse::<ResponseStatus>().unwrap_or_default(),
+            ResponseStatus::Completed | ResponseStatus::Incomplete
+        )
+        || payload.id.is_empty()
     {
         return Ok(());
     }
@@ -110,6 +114,10 @@ async fn persist_prepared_response(
 
 /// Persists one completed turn with the handler selected by its explicit conversation discriminator.
 ///
+/// Applies the same storage policy as [`persist_response`]: a no-session
+/// `store: false` context is returned unstored, while a session context always
+/// reaches its handler so the connection-local checkpoint is published.
+///
 /// # Errors
 /// Returns [`ExecutorError`] if the selected storage operation fails.
 pub async fn persist_turn(
@@ -118,6 +126,9 @@ pub async fn persist_turn(
     conv_handler: &ConversationHandler,
     resp_handler: &ResponseHandler,
 ) -> ExecutorResult<()> {
+    if !should_persist(&ctx) {
+        return Ok(());
+    }
     let (ctx, tool_search_state) = prepare_request_tools(ctx, conv_handler, resp_handler).await?;
     let tool_search_metadata = tool_search_state.map(ToolSearchState::into_public_metadata);
     persist_prepared_turn(
