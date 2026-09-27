@@ -16,12 +16,16 @@ use crate::types::io::{InputItem, OutputItem};
 use crate::types::request_response::ResponsePayload;
 use tracing::error;
 
+/// Decides whether a completed turn reaches the storage handlers.
+///
+/// `store` governs the no-session path: a `store: false` request leaves no row
+/// even when `previous_response_id` hydrated it from a stored response, so its
+/// id can be neither retrieved nor continued. Session continuations always reach
+/// the handler, which keeps `store: false` checkpoints connection-local. An
+/// explicit conversation stays durable.
 #[must_use]
 pub(crate) fn should_persist(ctx: &RequestContext) -> bool {
-    ctx.continuation.is_some()
-        || ctx.original_request.store
-        || ctx.original_request.previous_response_id.is_some()
-        || ctx.original_request.conversation_id.is_some()
+    ctx.continuation.is_some() || ctx.original_request.store || ctx.original_request.conversation_id.is_some()
 }
 
 pub(crate) async fn persist_if_needed(

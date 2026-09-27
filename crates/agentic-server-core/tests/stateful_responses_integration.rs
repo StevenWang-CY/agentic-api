@@ -5,8 +5,8 @@
 
 mod support;
 
-use agentic_core::executor::execute;
 use agentic_core::executor::request::RequestContext;
+use agentic_core::executor::{ExecutorError, execute};
 use agentic_core::storage::InOutItem;
 use agentic_core::types::request_response::RequestPayload;
 use agentic_core::types::tools::{FunctionToolParam, NonEmptyToolName};
@@ -598,8 +598,14 @@ async fn test_mcp_namespace_showcase_round_trip_rehydrates_calls_tools_and_outpu
 
 #[tokio::test]
 async fn test_store_false_with_previous_response_id_hydrates_but_does_not_persist() {
-    let fixture =
-        TestFixture::new_with_responses(vec![text_response("stored answer"), text_response("stateless answer")]).await;
+    // Arrange — a third reply is queued so that a refused continuation cannot be
+    // mistaken for an exhausted mock.
+    let fixture = TestFixture::new_with_responses(vec![
+        text_response("stored answer"),
+        text_response("stateless answer"),
+        text_response("stored parent answer"),
+    ])
+    .await;
 
     let p1 = unwrap_blocking(
         execute(
@@ -611,13 +617,14 @@ async fn test_store_false_with_previous_response_id_hydrates_but_does_not_persis
     );
     let p2 = unwrap_blocking(
         execute(
-            make_request("follow up", false, false, Some(p1.id), None),
+            make_request("follow up", false, false, Some(p1.id.clone()), None),
             Arc::clone(&fixture.exec_ctx),
         )
         .await
         .expect("store=false follow-up"),
     );
 
+    // Assert — the child was hydrated from the stored parent.
     assert_eq!(output_text(&p2), "stateless answer");
     let requests = fixture.request_bodies().await;
     assert_eq!(requests.len(), 2);
@@ -626,12 +633,41 @@ async fn test_store_false_with_previous_response_id_hydrates_but_does_not_persis
         vec!["seed", "stored answer", "follow up"]
     );
 
-    let result = execute(
+    // Assert — the child left no row: continuing from it fails before inference.
+    let Err(error) = execute(
         make_request("should not find stateless response", true, false, Some(p2.id), None),
         Arc::clone(&fixture.exec_ctx),
     )
-    .await;
-    assert!(result.is_err(), "store=false response should not be persisted");
+    .await
+    else {
+        panic!("store=false response must not be persisted");
+    };
+    assert!(
+        matches!(&error, ExecutorError::Storage(source) if source.is_not_found()),
+        "expected a missing previous response, got {error}"
+    );
+    assert_eq!(
+        fixture.request_bodies().await.len(),
+        2,
+        "no inference may run from an unstored previous response"
+    );
+
+    // Assert — the stored parent is still continuable.
+    let p3 = unwrap_blocking(
+        execute(
+            make_request("again", true, false, Some(p1.id), None),
+            Arc::clone(&fixture.exec_ctx),
+        )
+        .await
+        .expect("stored parent stays continuable"),
+    );
+    assert_eq!(output_text(&p3), "stored parent answer");
+    let requests = fixture.request_bodies().await;
+    assert_eq!(requests.len(), 3);
+    assert_eq!(
+        request_input_texts(&requests[2]),
+        vec!["seed", "stored answer", "again"]
+    );
 }
 
 #[tokio::test]
