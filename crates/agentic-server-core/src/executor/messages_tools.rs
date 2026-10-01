@@ -10,8 +10,11 @@ use futures::future::join_all;
 use serde_json::Value;
 
 use crate::executor::messages_context::MessagesRequestContext;
-use crate::executor::messages_request::web_search_budget_exhausted_result;
+use crate::executor::messages_request::{
+    web_fetch_budget_exhausted_result, web_fetch_refused_result, web_search_budget_exhausted_result,
+};
 use crate::tool::ToolRegistry;
+use crate::tool::web_fetch::{self, WebFetchErrorCode};
 use crate::tool::web_search::args::requested_searches;
 use crate::types::io::output::FunctionToolCall;
 use crate::types::messages::{GatewayToolResult, tool_seam};
@@ -49,7 +52,7 @@ pub(super) async fn execute_gateway_calls(
     gateway_map: &tool_seam::GatewayToolMap,
 ) -> Vec<GatewayToolResult> {
     // Admission is sequential and in model order, before any call starts: the
-    // search budget belongs to the whole request, so it cannot be decided while
+    // budgets belong to the whole request, so they cannot be decided while
     // calls run concurrently.
     let admissions: Vec<_> = tool_uses
         .into_iter()
@@ -58,10 +61,11 @@ pub(super) async fn execute_gateway_calls(
     join_all(admissions.into_iter().map(|admission| run(admission, registry))).await
 }
 
-/// Decide whether one call may run. `max_uses` limits searches, not calls, so a
-/// call is charged for every query it batches and runs only when the remaining
-/// budget covers all of them. A refused call, and a call whose arguments cannot
-/// be dispatched or parsed, leave the budget untouched.
+/// Decide whether one call may run. `max_uses` limits uses, not calls: a
+/// `web_search` call is charged for every query it batches, a `web_fetch`
+/// call for its one page, and each runs only when the remaining budget covers
+/// it. A refused call, and a call whose arguments cannot be dispatched or
+/// parsed, leave the budget untouched.
 fn admit<'a>(
     tool_use: GatewayToolUse<'a>,
     ctx: &mut MessagesRequestContext,
@@ -80,15 +84,40 @@ fn admit<'a>(
         }
     };
     let call = tool_seam::tool_use_to_call(id, name, &input, gateway_map);
-    let searches = if call.name == tool_seam::WEB_SEARCH_EXECUTOR {
-        requested_searches(&call.arguments)
-    } else {
-        0
+    let admitted = match call.name.as_str() {
+        tool_seam::WEB_SEARCH_EXECUTOR => {
+            if ctx.admit_searches(requested_searches(&call.arguments)) {
+                Ok(())
+            } else {
+                Err(web_search_budget_exhausted_result(id))
+            }
+        }
+        tool_seam::WEB_FETCH_EXECUTOR => admit_fetch(id, &call.arguments, ctx),
+        _ => Ok(()),
     };
-    if ctx.admit_searches(searches) {
-        Admission::Run { call, name }
-    } else {
-        Admission::Refused(web_search_budget_exhausted_result(id))
+    match admitted {
+        Ok(()) => Admission::Run { call, name },
+        Err(result) => Admission::Refused(result),
+    }
+}
+
+/// A fetch is charged one use as soon as its arguments name a URL, whatever
+/// happens next: a failed fetch counts, as Anthropic documents. The
+/// conversation rule is applied here because only the loop holds the
+/// conversation — a URL that never appeared in a user message or a tool
+/// result is refused before any network activity, and that refusal counts.
+fn admit_fetch(id: &str, arguments: &str, ctx: &mut MessagesRequestContext) -> Result<(), GatewayToolResult> {
+    if !ctx.admit_fetches(web_fetch::requested_fetches(arguments)) {
+        return Err(web_fetch_budget_exhausted_result(id));
+    }
+    match web_fetch::requested_url(arguments) {
+        Some(url) if !ctx.url_in_prior_context(&url) => Err(web_fetch_refused_result(
+            id,
+            WebFetchErrorCode::UrlNotInPriorContext,
+            "the url did not appear earlier in the conversation; only a url from a user message or a tool result \
+             can be fetched",
+        )),
+        _ => Ok(()),
     }
 }
 
@@ -99,7 +128,13 @@ async fn run(admission: Admission<'_>, registry: &ToolRegistry) -> GatewayToolRe
     };
     let (output, is_error) = match tokio::time::timeout(GATEWAY_TOOL_TIMEOUT, registry.dispatch(&call)).await {
         Ok(Some(result)) => match result.output {
-            Ok(tool_output) => (tool_output.output, false),
+            Ok(tool_output) => {
+                // A documented web_fetch failure is the tool's answer, flagged
+                // so the model knows the page did not arrive.
+                let failed =
+                    call.name == tool_seam::WEB_FETCH_EXECUTOR && web_fetch::is_failure_output(&tool_output.output);
+                (tool_output.output, failed)
+            }
             Err(e) => (format!("tool execution failed: {e}"), true),
         },
         Ok(None) => (format!("no handler for tool '{name}'"), true),

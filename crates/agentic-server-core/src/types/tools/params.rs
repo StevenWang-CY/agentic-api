@@ -110,6 +110,10 @@ pub enum ResponsesTool {
         alias = "web_search_2025_08_26"
     )]
     WebSearch(WebSearchToolParam),
+    /// Gateway-executed page fetch declared through the Messages seam. It
+    /// has no Responses wire form and is never read from a request body.
+    #[serde(skip)]
+    WebFetch(super::web_fetch::WebFetchToolParam),
     #[serde(rename = "file_search")]
     FileSearch(FileSearchToolParam),
     #[serde(rename = "code_interpreter")]
@@ -559,7 +563,7 @@ impl ResponsesTool {
             Self::Shell(_) => Some("shell"),
             Self::Namespace(_) => Some("namespace"),
             Self::Custom(_) => Some("custom"),
-            Self::Unknown => None,
+            Self::WebFetch(_) | Self::Unknown => None,
         }
     }
 

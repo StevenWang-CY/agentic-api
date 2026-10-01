@@ -17,19 +17,34 @@ use serde_json::{Map, Value, json};
 use crate::types::event::MessageStatus;
 use crate::types::io::output::FunctionToolCall;
 use crate::types::tools::{
-    FunctionToolParam, ResponsesTool, WebSearchFilters, WebSearchToolParam, WebSearchUserLocation,
+    FunctionToolParam, ResponsesTool, WebFetchToolParam, WebSearchFilters, WebSearchToolParam, WebSearchUserLocation,
 };
 use crate::utils::common::deserialize_from_value_opt;
 
 use super::request::{GatewayToolResult, ToolParam};
 
-/// The one built-in gateway executor exposed on `/v1/messages` today. The
+/// The built-in gateway executor every `/v1/messages` request may name. The
 /// registry keys it under this exact name (`tool::web_search`).
 pub const WEB_SEARCH_EXECUTOR: &str = "web_search";
 
 /// Claude's basic native web-search server tool version, supported by the
 /// Messages gateway loop as a gateway-owned tool.
 pub const NATIVE_WEB_SEARCH_TYPE: &str = "web_search_20250305";
+
+/// The second built-in gateway executor on `/v1/messages`, reachable only
+/// through a native `web_fetch_*` declaration (`tool::web_fetch`).
+pub const WEB_FETCH_EXECUTOR: &str = "web_fetch";
+
+/// Claude's basic native web-fetch server tool version, the one the Messages
+/// gateway loop executes.
+pub const NATIVE_WEB_FETCH_TYPE: &str = "web_fetch_20250910";
+
+/// Whether a declared tool `type` names a native web-fetch server tool, of
+/// any version. Version support is decided when the request is normalized.
+#[must_use]
+pub fn is_native_web_fetch_type(tool_type: Option<&str>) -> bool {
+    tool_type.is_some_and(|tool_type| tool_type.starts_with("web_fetch_"))
+}
 
 /// Operator-configured map of client-declared tool names to gateway executors.
 ///
@@ -43,11 +58,17 @@ pub const NATIVE_WEB_SEARCH_TYPE: &str = "web_search_20250305";
 /// routes through the Responses loop.
 ///
 /// The canonical executor `web_search` is always recognised; the map only adds
-/// operator-approved *aliases* on top.
+/// operator-approved *aliases* on top. The `web_fetch` executor is recognised
+/// per request, when the request declares the native server tool
+/// ([`for_request`](Self::for_request)).
 #[derive(Clone, Debug, Default)]
 pub struct GatewayToolMap {
     /// client tool name (as the model calls it) → canonical executor key.
     aliases: HashMap<String, String>,
+    /// Whether this request declared the native `web_fetch` server tool, which
+    /// makes the `web_fetch` name gateway-owned for the request. Never an
+    /// operator setting: a plain function named `web_fetch` is the client's.
+    web_fetch: bool,
 }
 
 impl GatewayToolMap {
@@ -61,7 +82,10 @@ impl GatewayToolMap {
             .filter(|(name, exec)| !name.is_empty() && *exec == WEB_SEARCH_EXECUTOR)
             .map(|(name, exec)| (name.to_owned(), exec.to_owned()))
             .collect();
-        Self { aliases }
+        Self {
+            aliases,
+            web_fetch: false,
+        }
     }
 
     /// Parse the `MESSAGES_GATEWAY_TOOL_ALIASES` env format:
@@ -72,12 +96,26 @@ impl GatewayToolMap {
         Self::from_pairs(pairs)
     }
 
+    /// The map for one request: the operator aliases plus the native server
+    /// tools the request itself declared. A plain function named `web_fetch`
+    /// (no native `type`) is the client's own tool and stays client-owned.
+    #[must_use]
+    pub fn for_request(&self, tools: Option<&Vec<ToolParam>>) -> Self {
+        Self {
+            aliases: self.aliases.clone(),
+            web_fetch: tools
+                .is_some_and(|tools| tools.iter().any(|tool| is_native_web_fetch_type(tool.type_.as_deref()))),
+        }
+    }
+
     /// The canonical executor key for a declared tool name, if it is
     /// gateway-owned: the built-in `web_search`, or a configured alias.
     #[must_use]
     pub fn canonical_executor(&self, name: &str) -> Option<&str> {
         if name == WEB_SEARCH_EXECUTOR {
             Some(WEB_SEARCH_EXECUTOR)
+        } else if self.web_fetch && name == WEB_FETCH_EXECUTOR {
+            Some(WEB_FETCH_EXECUTOR)
         } else {
             self.aliases.get(name).map(String::as_str)
         }
@@ -94,6 +132,7 @@ impl GatewayToolMap {
 /// against the operator-configured [`GatewayToolMap`].
 #[must_use]
 pub fn has_gateway_tool(tools: Option<&Vec<ToolParam>>, map: &GatewayToolMap) -> bool {
+    let map = map.for_request(tools);
     tools.is_some_and(|tools| tools.iter().any(|t| map.is_gateway_owned(&t.name)))
 }
 
@@ -108,12 +147,16 @@ pub fn registry_tools(tools: Option<&Vec<ToolParam>>, map: &GatewayToolMap) -> V
     let Some(tools) = tools else {
         return Vec::new();
     };
-    tools.iter().filter_map(|t| map_tool(t, map)).collect()
+    let map = map.for_request(Some(tools));
+    tools.iter().filter_map(|t| map_tool(t, &map)).collect()
 }
 
 fn map_tool(tool: &ToolParam, map: &GatewayToolMap) -> Option<ResponsesTool> {
     if map.canonical_executor(&tool.name) == Some(WEB_SEARCH_EXECUTOR) {
         return Some(ResponsesTool::WebSearch(web_search_config(tool)));
+    }
+    if map.canonical_executor(&tool.name) == Some(WEB_FETCH_EXECUTOR) {
+        return Some(ResponsesTool::WebFetch(web_fetch_config(tool)));
     }
     let name = tool.name.clone().try_into().ok()?;
     Some(ResponsesTool::Function(FunctionToolParam {
@@ -155,6 +198,34 @@ fn web_search_config(tool: &ToolParam) -> WebSearchToolParam {
         search_context_size: None,
         filters,
         user_location,
+    }
+}
+
+/// The per-request settings of a native `web_fetch` declaration. Values were
+/// validated when the request was normalized; anything else is ignored here.
+fn web_fetch_config(tool: &ToolParam) -> WebFetchToolParam {
+    let allowed_domains = tool
+        .extra
+        .get("allowed_domains")
+        .cloned()
+        .and_then(deserialize_from_value_opt);
+    let blocked_domains = tool
+        .extra
+        .get("blocked_domains")
+        .cloned()
+        .and_then(deserialize_from_value_opt);
+    let filters = (allowed_domains.is_some() || blocked_domains.is_some()).then_some(WebSearchFilters {
+        allowed_domains,
+        blocked_domains,
+    });
+    let max_content_tokens = tool
+        .extra
+        .get("max_content_tokens")
+        .and_then(Value::as_u64)
+        .and_then(|tokens| u32::try_from(tokens).ok());
+    WebFetchToolParam {
+        filters,
+        max_content_tokens,
     }
 }
 
@@ -486,5 +557,89 @@ mod tests {
         call.arguments = "not json".to_owned();
         let block = call_to_tool_use_block(&call);
         assert_eq!(block["input"], json!({}));
+    }
+
+    #[test]
+    fn native_web_fetch_is_gateway_owned_only_for_the_request_that_declares_it() {
+        let tools = tools_of(json!({
+            "model": "m", "max_tokens": 10, "messages": [],
+            "tools": [{"type": "web_fetch_20250910", "name": "web_fetch", "max_uses": 2,
+                       "allowed_domains": ["example.com"], "max_content_tokens": 5000}]
+        }));
+        let map = default_map();
+        assert!(
+            !map.is_gateway_owned("web_fetch"),
+            "the operator map alone never owns web_fetch"
+        );
+        assert!(has_gateway_tool(tools.as_ref(), &map));
+        let scoped = map.for_request(tools.as_ref());
+        assert_eq!(scoped.canonical_executor("web_fetch"), Some("web_fetch"));
+        assert!(scoped.is_gateway_owned("web_search"), "web_search stays recognised");
+        let mapped = registry_tools(tools.as_ref(), &map);
+        let [ResponsesTool::WebFetch(param)] = mapped.as_slice() else {
+            panic!("expected one WebFetch registry tool, got {mapped:?}");
+        };
+        assert_eq!(
+            param
+                .filters
+                .as_ref()
+                .and_then(|filters| filters.allowed_domains.clone()),
+            Some(vec!["example.com".to_owned()])
+        );
+        assert_eq!(param.max_content_tokens, Some(5000));
+
+        // Any web_fetch_* version routes to the loop; the version itself is
+        // judged when the request is normalized.
+        let later = tools_of(json!({
+            "model": "m", "max_tokens": 10, "messages": [],
+            "tools": [{"type": "web_fetch_20260318", "name": "web_fetch"}]
+        }));
+        assert!(has_gateway_tool(later.as_ref(), &map));
+        // Operator aliases cannot point at web_fetch.
+        assert!(!GatewayToolMap::from_env_str("WebFetch=web_fetch").is_gateway_owned("WebFetch"));
+    }
+
+    #[test]
+    fn a_plain_function_named_web_fetch_stays_client_owned() {
+        let tools = tools_of(json!({
+            "model": "m", "max_tokens": 10, "messages": [],
+            "tools": [{"name": "web_fetch", "input_schema": {"type": "object"}}]
+        }));
+        assert!(!has_gateway_tool(tools.as_ref(), &default_map()));
+        assert!(matches!(
+            registry_tools(tools.as_ref(), &default_map()).as_slice(),
+            [ResponsesTool::Function(_)]
+        ));
+        let scoped = default_map().for_request(tools.as_ref());
+        assert!(!scoped.is_gateway_owned("web_fetch"));
+        let content = vec![json!({"type": "tool_use", "name": "web_fetch", "id": "c"})];
+        assert_eq!(
+            strip_gateway_tool_use(&content, &scoped).len(),
+            1,
+            "the client's call stays visible"
+        );
+    }
+
+    #[test]
+    fn web_fetch_calls_dispatch_under_their_own_name_without_adaptation() {
+        let tools = tools_of(json!({
+            "model": "m", "max_tokens": 10, "messages": [],
+            "tools": [{"type": "web_fetch_20250910", "name": "web_fetch"}]
+        }));
+        let map = default_map().for_request(tools.as_ref());
+        let call = tool_use_to_call("toolu_f", "web_fetch", &json!({"url": "https://example.com/a"}), &map);
+        assert_eq!(call.name, "web_fetch");
+        assert_eq!(call.call_id, "toolu_f");
+        let args: Value = serde_json::from_str(&call.arguments).unwrap();
+        assert_eq!(args["url"], "https://example.com/a");
+        let content = vec![
+            json!({"type": "text", "text": "t"}),
+            json!({"type": "tool_use", "name": "web_fetch", "id": "g"}),
+        ];
+        assert_eq!(
+            strip_gateway_tool_use(&content, &map).len(),
+            1,
+            "the gateway fetch is hidden"
+        );
     }
 }
