@@ -268,7 +268,7 @@ impl GatewayExecutor for McpHandler {
             };
             let output = execute_tool_call(client, &server_label, &tool_name, &arguments).await?;
 
-            Ok(ToolOutput { call_id, output })
+            Ok(ToolOutput::success(call_id, output))
         })
     }
 
@@ -648,10 +648,7 @@ mod tests {
             status: crate::types::event::MessageStatus::Completed,
             namespace: None,
         };
-        let output = ToolOutput {
-            call_id: call.call_id.clone(),
-            output: "1".to_owned(),
-        };
+        let output = ToolOutput::success(call.call_id.clone(), "1");
 
         let OutputItem::McpCall(item) =
             output_item(&call, &output, GatewayCallStatus::Completed, "counter", "increment")
@@ -676,10 +673,7 @@ mod tests {
             status: crate::types::event::MessageStatus::Completed,
             namespace: None,
         };
-        let output = ToolOutput {
-            call_id: call.call_id.clone(),
-            output: "1".to_owned(),
-        };
+        let output = ToolOutput::success(call.call_id.clone(), "1");
 
         let OutputItem::McpCall(started) = started_output_item(&call, "counter", "increment") else {
             panic!("expected started mcp_call");
@@ -715,10 +709,7 @@ mod tests {
                 let OutputItem::McpCall(started) = started_output_item(call, "counter", "increment") else {
                     panic!("expected started mcp_call");
                 };
-                let output = ToolOutput {
-                    call_id: call.call_id.clone(),
-                    output: "1".to_owned(),
-                };
+                let output = ToolOutput::success(call.call_id.clone(), "1");
                 let OutputItem::McpCall(completed) =
                     output_item(call, &output, GatewayCallStatus::Completed, "counter", "increment")
                 else {
@@ -783,10 +774,7 @@ mod tests {
             status: crate::types::event::MessageStatus::Completed,
             namespace: None,
         };
-        let output = ToolOutput {
-            call_id: call.call_id.clone(),
-            output: r#"{"error":"missing field `b`"}"#.to_owned(),
-        };
+        let output = ToolOutput::failure(call.call_id.clone(), r#"{"error":"missing field `b`"}"#);
         let item = output_item(&call, &output, GatewayCallStatus::Failed, "counter", "sum");
         let json = serde_json::to_value(item).expect("serializable mcp_call");
 

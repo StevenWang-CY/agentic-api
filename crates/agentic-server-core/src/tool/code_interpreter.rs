@@ -261,7 +261,7 @@ impl GatewayExecutor for CodeInterpreterExecutor {
         Box::pin(async move {
             let output = serde_json::to_string(&self.execute_call(&arguments).await?)
                 .map_err(|error| ToolError::Execution(format!("failed to serialize code output: {error}")))?;
-            Ok(ToolOutput { call_id, output })
+            Ok(ToolOutput::success(call_id, output))
         })
     }
 

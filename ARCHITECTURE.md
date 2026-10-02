@@ -1070,9 +1070,9 @@ results) before it can be fetched. The handler owns everything else — URL admi
 address policy and DNS pinning applied to every redirect hop, domain filtering,
 HTML-to-text extraction, the content limit, and the `max_concurrent_gateway_calls`
 ceiling on fetches in flight — and answers documented failures in the
-`web_fetch_tool_result_error` shape, which the loop flags `is_error`. Retrieval sits
-behind the crate-private `WebFetchBackend` trait; the built-in HTTP backend is the
-default.
+`web_fetch_tool_result_error` shape as a `ToolOutput` with a failure status, which the
+loop reports as `is_error` without reading the output. Retrieval sits behind the
+crate-private `WebFetchBackend` trait; the built-in HTTP backend is the default.
 
 Both loops take a `MessagesRequestContext` (`messages_context.rs`), the per-request
 type that replaced a bare `serde_json::Value` at that boundary. It holds two views of

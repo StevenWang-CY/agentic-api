@@ -13,8 +13,8 @@
 //! A call produces one [`output::WebFetchOutcome`]: a rendered page, or a
 //! refusal with one of the documented `web_fetch_tool_result_error` codes.
 //! Both are serialized once, at the model-facing boundary; a refusal is `Ok`
-//! output that the Messages loop marks `is_error`. `Err` is reserved for
-//! gateway faults.
+//! output with a failure status, which the Messages loop reports as
+//! `is_error`. `Err` is reserved for gateway faults.
 
 pub(crate) mod backend;
 mod extract;
@@ -35,7 +35,7 @@ use url::Url;
 use self::backend::{FetchFailure, FetchedDocument, WebFetchBackend};
 use self::http::HttpFetchBackend;
 use self::output::{Refusal, WebFetchOutcome, render_document};
-pub(crate) use self::output::{WebFetchErrorCode, failure_output, is_failure_output};
+pub(crate) use self::output::{WebFetchErrorCode, failure_output};
 use self::policy::validate_domain_entry;
 use super::handler::{GatewayExecutor, ToolError, ToolHandler, ToolOutput};
 use super::ownership::GatewayBinding;

@@ -56,10 +56,7 @@ impl GatewayExecutor for RecordedTool {
         assert_eq!(name, "web_search");
         assert_eq!(serde_json::from_str::<Value>(arguments).unwrap(), self.expected_input);
         *self.calls.lock().unwrap() += 1;
-        let output = ToolOutput {
-            call_id: call_id.to_owned(),
-            output: self.output.clone(),
-        };
+        let output = ToolOutput::success(call_id, self.output.clone());
         Box::pin(async move { Ok(output) })
     }
 }

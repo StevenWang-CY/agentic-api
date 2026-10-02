@@ -988,6 +988,80 @@ mod tests {
         assert!(matches!(error, ToolError::Config(message) if message.contains("web_fetch is disabled")));
     }
 
+    /// The status a handler sets on its output reaches the dispatcher's caller
+    /// unchanged, so a loop never has to parse an output to learn it.
+    #[tokio::test]
+    async fn dispatch_carries_the_handlers_output_status() {
+        use std::pin::Pin;
+
+        use crate::tool::handler::{GatewayExecutor, ToolHandler, ToolOutputStatus};
+        use crate::types::io::FunctionTool;
+        use crate::types::tools::WebSearchToolParam;
+
+        struct Refusing;
+
+        impl ToolHandler for Refusing {
+            type ToolParams = WebSearchToolParam;
+
+            fn tool_type(&self) -> ToolType {
+                ToolType::WebSearch
+            }
+
+            fn validate(&self, _params: &WebSearchToolParam) -> Result<(), ToolError> {
+                Ok(())
+            }
+
+            fn normalize(&self, _params: &WebSearchToolParam) -> Vec<FunctionTool> {
+                Vec::new()
+            }
+        }
+
+        impl GatewayExecutor for Refusing {
+            type ExecutionParams = WebSearchToolParam;
+
+            fn execute(
+                &self,
+                call_id: &str,
+                _tool_name: &str,
+                _arguments: &str,
+                _params: &WebSearchToolParam,
+            ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
+                let call_id = call_id.to_owned();
+                Box::pin(async move { Ok(ToolOutput::failure(call_id, r#"{"error":"refused"}"#)) })
+            }
+        }
+
+        let mut entries = HashMap::new();
+        entries.insert(
+            "probe".to_owned(),
+            ToolEntry::gateway(
+                ToolType::WebSearch,
+                None,
+                Some(GatewayBinding::new(Arc::new(Refusing), WebSearchToolParam::default())),
+            ),
+        );
+        let registry = ToolRegistry {
+            entries,
+            ..ToolRegistry::default()
+        };
+        let call = FunctionToolCall {
+            agent: None,
+            id: "fc_1".to_owned(),
+            call_id: "call_1".to_owned(),
+            name: "probe".to_owned(),
+            arguments: "{}".to_owned(),
+            status: crate::types::event::MessageStatus::Completed,
+            namespace: None,
+        };
+
+        let result = registry.dispatch(&call).await.expect("a gateway entry dispatches");
+        let output = result.output.expect("the handler answered");
+        assert_eq!(result.tool_type, ToolType::WebSearch);
+        assert_eq!(output.call_id, "call_1");
+        assert_eq!(output.status, ToolOutputStatus::Failure);
+        assert!(output.is_failure());
+    }
+
     #[tokio::test]
     async fn build_with_handlers_rejects_unavailable_code_interpreter_before_entry_creation() {
         let mut tools = vec![
