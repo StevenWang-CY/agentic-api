@@ -6,8 +6,8 @@
 //! building, declaration validation, and normalization read both through
 //! [`ToolDeclarationRef`], the borrowed view every [`DeclaredTool`] yields, so
 //! there is one registry-building path and no API-specific variant leaks into
-//! the other API's wire enum. The Messages seam produces owned
-//! [`ToolDeclaration`]s ([`registry_tools`]); that is where the Messages-only
+//! the other API's wire enum. The Messages mapping ([`registry_tools`])
+//! produces owned [`ToolDeclaration`]s; that is where the Messages-only
 //! `web_fetch` declaration lives.
 
 use crate::types::messages::request::ToolParam;
@@ -25,8 +25,10 @@ use crate::utils::common::deserialize_from_value_opt;
 ///
 /// One variant per kind the gateway implements, plus [`Unsupported`] for a
 /// declaration of a kind it does not: that one registers nothing and is not
-/// sent upstream. The Messages seam builds these directly; a Responses
-/// declaration converts through [`From<ResponsesTool>`].
+/// sent upstream. [`registry_tools`] builds these for the Messages API; the
+/// Responses API reads its wire [`ResponsesTool`]s through [`DeclaredTool`]
+/// and never converts, and [`From<ResponsesTool>`] is the owned conversion
+/// for a caller that keeps one.
 ///
 /// [`Unsupported`]: ToolDeclaration::Unsupported
 #[derive(Debug, Clone)]
@@ -363,9 +365,13 @@ mod tests {
     fn a_wire_declaration_and_its_converted_form_yield_the_same_view() {
         let tools = wire(json!([
             {"type": "function", "name": "get_weather"},
+            {"type": "tool_search", "execution": "client"},
             {"type": "mcp", "server_label": "docs", "server_url": "http://127.0.0.1:1/mcp"},
             {"type": "web_search_preview"},
+            {"type": "file_search", "vector_store_ids": ["vs_1"]},
             {"type": "code_interpreter", "container": {"type": "auto"}},
+            {"type": "shell", "environment": {"type": "local"}},
+            {"type": "namespace", "name": "tools"},
             {"type": "custom", "name": "raw"},
             {"type": "something_new"}
         ]));
@@ -377,9 +383,13 @@ mod tests {
             kinds,
             vec![
                 Some(ToolType::Function),
+                Some(ToolType::ToolSearch),
                 Some(ToolType::Mcp),
                 Some(ToolType::WebSearch),
+                Some(ToolType::FileSearch),
                 Some(ToolType::CodeInterpreter),
+                Some(ToolType::Shell),
+                Some(ToolType::CodexNamespace),
                 Some(ToolType::Custom),
                 None,
             ]

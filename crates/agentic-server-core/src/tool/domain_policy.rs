@@ -1,17 +1,22 @@
 //! Domain policy shared by the gateway's web tools.
 //!
 //! A `web_search` or `web_fetch` declaration may name `allowed_domains` and
-//! `blocked_domains` ([`DomainFilters`]). This module owns what both tools do
-//! with them: the shape a declared entry must have to match anything
-//! ([`validate_domain_entry`], [`validate_domain_filters`]) and the
-//! [`DomainFilter`] that decides whether a URL's host is admitted. Web search
-//! applies the filter to results, web fetch to the requested URL and to every
-//! redirect hop; neither tool owns the rule.
+//! `blocked_domains` ([`DomainFilters`]). This module owns the [`DomainFilter`]
+//! that decides whether a URL's host is admitted — web search applies it to
+//! results, web fetch to the requested URL and to every redirect hop — and the
+//! host-name rule a `web_fetch` entry must satisfy to match anything
+//! ([`validate_domain_entry`], [`validate_domain_filters`]). `web_search` keeps
+//! its lenient entry rule in the Messages adapter, because Anthropic's web
+//! search accepts subpath entries the host-name rule would refuse.
 
 use url::Host;
 
 use super::handler::ToolError;
 use crate::types::tools::DomainFilters;
+
+/// The rule both lists share, as Anthropic documents it for every server tool;
+/// the Messages adapter reports it in the same words.
+pub(crate) const EXCLUSIVE_LISTS_RULE: &str = "allowed_domains and blocked_domains cannot be used together";
 
 /// Why a declared `allowed_domains` / `blocked_domains` entry cannot match a
 /// host. The filter matches on the host only, so an entry must be a host name
@@ -63,9 +68,7 @@ pub(crate) fn validate_domain_filters(tool: &str, filters: Option<&DomainFilters
         .and_then(|filters| filters.blocked_domains.as_deref())
         .unwrap_or_default();
     if !allowed.is_empty() && !blocked.is_empty() {
-        return Err(ToolError::Config(format!(
-            "{tool} allowed_domains and blocked_domains cannot be used together"
-        )));
+        return Err(ToolError::Config(format!("{tool} {EXCLUSIVE_LISTS_RULE}")));
     }
     for (field, entries) in [("allowed_domains", allowed), ("blocked_domains", blocked)] {
         for entry in entries {
@@ -212,6 +215,7 @@ mod tests {
             error.to_string(),
             "invalid tool config: web_fetch allowed_domains entry \".\" is not a host name"
         );
+        // The tool name is the caller's: today only web_fetch applies this rule.
         let error = validate_domain_filters("web_search", Some(&filters(&[], &["example.com/blog"]))).unwrap_err();
         assert_eq!(
             error.to_string(),

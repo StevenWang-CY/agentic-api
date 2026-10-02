@@ -11,10 +11,9 @@ pub(crate) const MAX_GATEWAY_TOOL_OUTPUT_BYTES: usize = 1024 * 1024;
 ///
 /// Set by the handler that produced the output and carried unchanged through
 /// dispatch, so a loop never has to parse an output to learn its status.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolOutputStatus {
     /// The output is the tool's answer.
-    #[default]
     Success,
     /// The output reports a failure the model should treat as an error, such
     /// as a documented `web_fetch_tool_result_error`.
@@ -30,6 +29,7 @@ pub struct ToolOutput {
 
 impl ToolOutput {
     /// An output that is the tool's answer.
+    #[must_use]
     pub fn success(call_id: impl Into<String>, output: impl Into<String>) -> Self {
         Self {
             call_id: call_id.into(),
@@ -39,6 +39,7 @@ impl ToolOutput {
     }
 
     /// An output that reports a failure in the tool's own documented shape.
+    #[must_use]
     pub fn failure(call_id: impl Into<String>, output: impl Into<String>) -> Self {
         Self {
             call_id: call_id.into(),
@@ -215,6 +216,5 @@ mod tests {
         let refusal = ToolOutput::failure("call_2", r#"{"error":"refused"}"#);
         assert_eq!(refusal.status, ToolOutputStatus::Failure);
         assert!(refusal.is_failure());
-        assert_eq!(ToolOutputStatus::default(), ToolOutputStatus::Success);
     }
 }

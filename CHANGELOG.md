@@ -26,7 +26,8 @@ All notable changes to Agentic API are documented here.
 ### Changed
 
 - The domain lists of `web_search` and `web_fetch` declarations are one shared type, `DomainFilters` (formerly
-  `WebSearchFilters`, the same two fields), validated and matched by one shared policy module; the request and
+  `WebSearchFilters`, the same two fields), matched by one shared policy module that also validates a `web_fetch`
+  entry as a host name (`web_search` keeps its non-empty-entry rule in the Messages adapter); the request and
   response wire shapes are unchanged, and the OpenAPI component is named `DomainFilters`.
 - `agentic_core`: `ToolOutput` carries an explicit success/failure status set by the handler, which the Messages
   loop reports as `is_error`; the request-scoped tool registry is built from a protocol-neutral `ToolDeclaration`
