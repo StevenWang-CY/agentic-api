@@ -623,9 +623,10 @@ in a shape the upstream cannot execute.
 ```
 
 The gateway supports `max_uses`, `allowed_domains` / `blocked_domains` (matched on the host only, as Anthropic documents
-for web fetch), and `max_content_tokens`; `citations: {"enabled": false}` and `allowed_callers: ["direct"]` are
-accepted. Anything the gateway cannot honour (`citations` enabled, the `use_cache` and `response_inclusion` settings of
-later tool versions, or another `web_fetch_*` version) is rejected with HTTP 400 rather than ignored.
+for web fetch, so each entry must be a host name or address without scheme or path), and `max_content_tokens`;
+`citations: {"enabled": false}` and `allowed_callers: ["direct"]` are accepted. Anything the gateway cannot honour
+(`citations` enabled, the `use_cache` and `response_inclusion` settings of later tool versions, or another
+`web_fetch_*` version) is rejected with HTTP 400 rather than ignored.
 
 Each call answers the model with one JSON `tool_result`: the final URL after redirects, the page title, the content
 type, a `retrieved_at` timestamp, and the page text. HTML is reduced to plain text; `text/*`, XHTML, XML, and JSON
@@ -645,8 +646,10 @@ Fetches are bounded and never reach internal networks:
 - Only absolute `http`/`https` URLs of at most 250 characters without embedded credentials are accepted.
 - Hosts that are, or resolve to, loopback, private, link-local (including cloud metadata), carrier-grade NAT, multicast,
   or other non-public addresses are refused before any connection; the connection is pinned to the addresses that
-  passed the check, and every redirect hop is checked again with the same rules and domain filters. Deployments that
-  fetch intranet pages on purpose can set `[web_fetch] allow_private_networks = true`.
+  passed the check, and every redirect hop is checked again with the same rules and domain filters. Under this policy
+  the fetcher connects directly and ignores the `HTTP_PROXY` / `HTTPS_PROXY` environment, so the check and the pin
+  apply to the real destination. Deployments that fetch intranet pages on purpose can set
+  `[web_fetch] allow_private_networks = true`, which also restores proxy use.
 - Each fetch is bounded in time (`timeout_secs`, default 20 s including redirects), size (`max_response_bytes`,
   default 10 MiB; a longer body is cut and reported as truncated), and redirects (5 hops).
 - `max_uses` is a request-wide budget of fetches. Every admitted call is charged whether the page arrives, the fetch

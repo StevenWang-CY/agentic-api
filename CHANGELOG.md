@@ -14,8 +14,9 @@ All notable changes to Agentic API are documented here.
   `max_content_tokens` cuts the text at an approximate four bytes per token below the 1 MiB tool output cap. Only a
   URL that already appeared in a user message or a tool result can be fetched; non-public addresses (loopback,
   private, link-local, cloud metadata, carrier-grade NAT) are refused directly, through DNS, and through redirects,
-  with connections pinned to the checked addresses; every fetch is bounded in time, size, and redirects, and at most
-  `max_concurrent_gateway_calls` fetches run at once. Failures reach the model as the documented
+  with connections pinned to the checked addresses and made directly, without environment proxies, under the default
+  policy; every fetch is bounded in time, size, and redirects, and at most `max_concurrent_gateway_calls` fetches run
+  at once. Failures reach the model as the documented
   `web_fetch_tool_result_error` codes. `citations` enabled, the later-version
   `use_cache` and `response_inclusion` settings, and other `web_fetch_*` versions are rejected with HTTP 400; a plain
   function named `web_fetch` stays client-owned. Operators tune or disable the fetcher with `[web_fetch]` in

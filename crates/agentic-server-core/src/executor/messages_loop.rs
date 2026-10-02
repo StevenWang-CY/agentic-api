@@ -20,7 +20,7 @@ use tracing::Instrument as _;
 use crate::executor::error::{ExecutorError, ExecutorResult};
 use crate::executor::inference::fetch_response_json_with_headers;
 use crate::executor::messages_context::MessagesRequestContext;
-use crate::executor::messages_tools::{GatewayToolUse, execute_gateway_calls};
+use crate::executor::messages_tools::{GatewayToolUse, execute_gateway_calls, request_gateway_map};
 use crate::executor::messages_usage::MessagesUsageTotals;
 use crate::executor::request::ExecutionContext;
 use crate::executor::telemetry::{Api, ExecutionSpan, FailureCategory, Route};
@@ -114,9 +114,9 @@ async fn run_messages_loop_traced(
     // what the client asked (the handler routes streaming elsewhere).
     ctx.force_stream(false);
     let mut usage = MessagesUsageTotals::default();
-    // Gateway ownership is request-scoped: the operator aliases plus the native
-    // server tools this request declared.
-    let gateway_map = exec_ctx.messages_gateway_tools.for_request(ctx.tools());
+    // Gateway ownership is request-scoped: the operator aliases plus the
+    // gateway tools this request's registry resolved.
+    let gateway_map = request_gateway_map(&exec_ctx.messages_gateway_tools, registry);
 
     for round in 0..MAX_GATEWAY_TOOL_ROUNDS {
         let body = ctx.upstream_body()?;

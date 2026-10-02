@@ -5,13 +5,15 @@
 //! connection to the addresses that passed, so a name cannot re-resolve to a
 //! non-public address after the check. Redirects are not followed by the HTTP
 //! client; each `Location` is parsed, admitted, and domain-filtered like the
-//! original URL. The body is read up to the configured ceiling and decoded
-//! with the charset the response declares.
+//! original URL. One absolute deadline covers name resolution, every request,
+//! and the body read. The body is read up to the configured ceiling and
+//! decoded with the charset the response declares.
 //!
-//! The client honours the process proxy environment like the rest of the
-//! gateway. Behind an egress proxy the proxy resolves the name itself, so the
-//! address check runs on the gateway's own resolution and the pin does not
-//! reach past the proxy.
+//! Under the default public-only policy the client ignores the proxies the
+//! environment configures and connects directly, so the address check and the
+//! pin apply to the real destination; a proxy would resolve the name itself. A
+//! backend allowed to reach private networks honours the environment proxies
+//! like the rest of the gateway.
 
 use std::future::Future;
 use std::net::IpAddr;
@@ -24,6 +26,7 @@ use reqwest::StatusCode;
 use reqwest::redirect::Policy;
 use url::{Host, Url};
 
+use super::WebFetchErrorCode;
 use super::backend::{FetchFailure, FetchedDocument, WebFetchBackend};
 use super::extract::{sniff_html_charset, truncate_to_char_boundary};
 use super::policy::{UrlRejection, is_public_ip, resolve_addrs, validate_url};
@@ -69,6 +72,13 @@ impl HttpFetchBackend {
         Self { config, admit }
     }
 
+    /// Whether the client may use the proxies the environment configures. Only
+    /// a backend allowed to reach private networks does: a proxy resolves the
+    /// name itself, which would put the address check and the pin out of reach.
+    const fn honours_proxies(&self) -> bool {
+        self.config.allow_private_networks
+    }
+
     async fn fetch_following_redirects(
         &self,
         mut url: Url,
@@ -77,25 +87,21 @@ impl HttpFetchBackend {
         let deadline = Instant::now() + self.config.timeout;
         for hop in 0..=self.config.max_redirects {
             if !filter.allows(url.as_str()) {
-                return Err(FetchFailure::NotAllowed(format!(
-                    "{} is outside the allowed domains",
-                    url.host_str().unwrap_or_default()
-                )));
+                let host = url.host_str().unwrap_or_default().to_owned();
+                return Err(refused_on(hop, FetchFailure::OutsideDomains { host }));
             }
-            let response = self.request(&url, deadline).await.map_err(|failure| match failure {
-                FetchFailure::NotAllowed(reason) if hop > 0 => hop_refused(&reason),
-                failure => failure,
-            })?;
+            let response = self
+                .request(&url, deadline)
+                .await
+                .map_err(|failure| refused_on(hop, failure))?;
             let status = response.status();
             if status.is_redirection() {
                 let location = response
                     .headers()
                     .get(LOCATION)
                     .and_then(|value| value.to_str().ok())
-                    .ok_or_else(|| FetchFailure::NotAccessible(format!("HTTP {status} without a Location header")))?;
-                let target = url
-                    .join(location)
-                    .map_err(|error| FetchFailure::NotAccessible(format!("invalid redirect target: {error}")))?;
+                    .ok_or(FetchFailure::RedirectWithoutLocation { status })?;
+                let target = url.join(location).map_err(FetchFailure::UnparseableRedirect)?;
                 url = validate_url(target.as_str()).map_err(redirect_rejection)?;
                 continue;
             }
@@ -103,50 +109,50 @@ impl HttpFetchBackend {
                 return Err(FetchFailure::TooManyRequests);
             }
             if !status.is_success() {
-                return Err(FetchFailure::NotAccessible(format!("HTTP {status}")));
+                return Err(FetchFailure::Status(status));
             }
             return self.read_document(url, response, deadline).await;
         }
-        Err(FetchFailure::NotAccessible(format!(
-            "more than {} redirects",
-            self.config.max_redirects
-        )))
+        Err(FetchFailure::TooManyRedirects(self.config.max_redirects))
     }
 
-    /// Send one GET for `url` with the connection pinned to its admitted addresses.
+    /// Send one GET for `url` within `deadline`, with the connection pinned to
+    /// the admitted addresses. Resolution counts against the same deadline.
     async fn request(&self, url: &Url, deadline: Instant) -> Result<reqwest::Response, FetchFailure> {
+        let host = url.host().ok_or(FetchFailure::NoHost)?;
+        let port = url.port_or_known_default().unwrap_or(80);
+        let addrs = tokio::time::timeout_at(deadline.into(), resolve_addrs(&host, port, self.admit))
+            .await
+            .map_err(|_| FetchFailure::TimedOut)??;
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return Err(FetchFailure::NotAccessible("timed out".to_owned()));
+            return Err(FetchFailure::TimedOut);
         }
-        let host = url
-            .host()
-            .ok_or_else(|| FetchFailure::NotAccessible("url has no host".to_owned()))?;
-        let port = url.port_or_known_default().unwrap_or(80);
-        let addrs = resolve_addrs(&host, port, self.admit).await?;
         let mut builder = reqwest::Client::builder()
             .redirect(Policy::none())
             .timeout(remaining)
             .connect_timeout(CONNECT_TIMEOUT.min(remaining))
             .user_agent(USER_AGENT);
+        if !self.honours_proxies() {
+            builder = builder.no_proxy();
+        }
         if let Host::Domain(name) = host {
             builder = builder.resolve_to_addrs(name, &addrs);
         }
-        let client = builder
-            .build()
-            .map_err(|error| FetchFailure::Unavailable(format!("could not build the fetch client: {error}")))?;
-        client
-            .get(url.clone())
-            .header(ACCEPT, ACCEPT_VALUE)
-            .send()
-            .await
-            .map_err(|error| {
-                if error.is_timeout() {
-                    FetchFailure::NotAccessible("timed out".to_owned())
-                } else {
-                    FetchFailure::NotAccessible(format!("request failed: {error}"))
-                }
-            })
+        let client = builder.build().map_err(FetchFailure::Client)?;
+        let sent = tokio::time::timeout_at(
+            deadline.into(),
+            client.get(url.clone()).header(ACCEPT, ACCEPT_VALUE).send(),
+        )
+        .await
+        .map_err(|_| FetchFailure::TimedOut)?;
+        sent.map_err(|error| {
+            if error.is_timeout() {
+                FetchFailure::TimedOut
+            } else {
+                FetchFailure::Request(error)
+            }
+        })
     }
 
     async fn read_document(
@@ -189,18 +195,24 @@ impl WebFetchBackend for HttpFetchBackend {
     }
 }
 
-/// A refused redirect target, worded so the model can tell the hop from the
-/// URL it asked for.
-fn redirect_rejection(rejection: UrlRejection) -> FetchFailure {
-    match rejection {
-        UrlRejection::InvalidInput(reason) => FetchFailure::NotAccessible(format!("invalid redirect target: {reason}")),
-        UrlRejection::TooLong => FetchFailure::NotAccessible("redirect target is too long".to_owned()),
-        UrlRejection::NotAllowed(reason) => hop_refused(&reason),
+/// A policy refusal on a later hop is reported as a refused redirect target,
+/// so the model can tell the hop from the URL it asked for.
+fn refused_on(hop: u8, failure: FetchFailure) -> FetchFailure {
+    match failure {
+        FetchFailure::NotPublic { .. } | FetchFailure::OutsideDomains { .. } if hop > 0 => {
+            FetchFailure::RedirectRefused(Box::new(failure))
+        }
+        failure => failure,
     }
 }
 
-fn hop_refused(reason: &str) -> FetchFailure {
-    FetchFailure::NotAllowed(format!("redirect target refused: {reason}"))
+/// A redirect target that failed URL admission: a refusal (credentials) keeps
+/// its code, anything else makes the page not accessible.
+fn redirect_rejection(rejection: UrlRejection) -> FetchFailure {
+    match rejection.code() {
+        WebFetchErrorCode::UrlNotAllowed => FetchFailure::RedirectRefused(Box::new(FetchFailure::Rejected(rejection))),
+        _ => FetchFailure::InvalidRedirect(rejection),
+    }
 }
 
 /// Split a `Content-Type` header into its lowercase media type and charset.
@@ -255,11 +267,11 @@ async fn read_bounded(
     loop {
         let next = tokio::time::timeout_at(deadline.into(), stream.next())
             .await
-            .map_err(|_| FetchFailure::NotAccessible("timed out while reading the body".to_owned()))?;
+            .map_err(|_| FetchFailure::TimedOut)?;
         let Some(chunk) = next else {
             return Ok((body, false));
         };
-        let chunk = chunk.map_err(|error| FetchFailure::NotAccessible(format!("failed to read the body: {error}")))?;
+        let chunk = chunk.map_err(FetchFailure::Body)?;
         let room = limit.saturating_sub(body.len());
         if chunk.len() > room {
             body.extend_from_slice(&chunk[..room]);
@@ -315,24 +327,38 @@ mod tests {
             .into_response()
     }
 
-    #[tokio::test]
-    async fn an_internal_address_is_refused_directly_and_through_a_redirect() {
+    /// Answers after a delay longer than any deadline a test configures.
+    async fn slow() -> &'static str {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        "late"
+    }
+
+    /// A loopback origin; returns its request counter and port.
+    async fn origin() -> (Arc<AtomicUsize>, u16) {
         let hits = Arc::new(AtomicUsize::new(0));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let app = Router::new()
             .route("/hop", get(hop))
+            .route("/slow", get(slow))
             .with_state((Arc::clone(&hits), port));
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (hits, port)
+    }
+
+    #[tokio::test]
+    async fn an_internal_address_is_refused_directly_and_through_a_redirect() {
+        let (hits, port) = origin().await;
         let backend = HttpFetchBackend::with_address_policy(WebFetchConfig::default(), admit_all_but_the_stand_in);
         let filter = DomainFilter::new(None, None);
 
         let direct = Url::parse(&format!("http://{STAND_IN_INTERNAL}:{port}/internal")).unwrap();
         let error = backend.fetch(&direct, &filter).await.unwrap_err();
         assert!(
-            matches!(&error, FetchFailure::NotAllowed(reason) if reason == "127.0.0.2 is not a public address"),
+            matches!(&error, FetchFailure::NotPublic { host } if host == "127.0.0.2"),
             "{error:?}"
         );
+        assert_eq!(error.to_string(), "127.0.0.2 is not a public address");
         assert_eq!(hits.load(Ordering::SeqCst), 0, "refused before any connection");
 
         let through_redirect = Url::parse(&format!("http://127.0.0.1:{port}/hop")).unwrap();
@@ -340,11 +366,34 @@ mod tests {
         assert!(
             matches!(
                 &error,
-                FetchFailure::NotAllowed(reason) if reason == "redirect target refused: 127.0.0.2 is not a public address"
+                FetchFailure::RedirectRefused(inner)
+                    if matches!(inner.as_ref(), FetchFailure::NotPublic { host } if host == "127.0.0.2")
             ),
             "{error:?}"
         );
+        assert_eq!(
+            error.to_string(),
+            "redirect target refused: 127.0.0.2 is not a public address"
+        );
         assert_eq!(hits.load(Ordering::SeqCst), 1, "only the first hop was requested");
+    }
+
+    #[tokio::test]
+    async fn the_deadline_bounds_a_slow_origin() {
+        let (_hits, port) = origin().await;
+        let config = WebFetchConfig::default()
+            .with_allow_private_networks(true)
+            .with_timeout(Duration::from_millis(50));
+        let backend = HttpFetchBackend::new(config);
+        let url = Url::parse(&format!("http://127.0.0.1:{port}/slow")).unwrap();
+        let started = Instant::now();
+        let error = backend.fetch(&url, &DomainFilter::new(None, None)).await.unwrap_err();
+        assert!(matches!(error, FetchFailure::TimedOut), "{error:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the fetch stopped at its deadline, not when the origin answered: {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
@@ -352,8 +401,10 @@ mod tests {
         let strict = HttpFetchBackend::new(WebFetchConfig::default());
         assert!(!(strict.admit)(IpAddr::V4(Ipv4Addr::LOCALHOST)));
         assert!((strict.admit)(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
+        assert!(!strict.honours_proxies(), "public-only fetches connect directly");
         let open = HttpFetchBackend::new(WebFetchConfig::default().with_allow_private_networks(true));
         assert!((open.admit)(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        assert!(open.honours_proxies());
     }
 
     #[test]
@@ -417,18 +468,36 @@ mod tests {
     }
 
     #[test]
-    fn redirect_rejections_map_onto_fetch_failures() {
+    fn redirect_targets_keep_a_refusal_and_make_the_rest_inaccessible() {
+        let refused = redirect_rejection(UrlRejection::Credentials);
         assert!(matches!(
-            redirect_rejection(UrlRejection::InvalidInput("x".to_owned())),
-            FetchFailure::NotAccessible(reason) if reason == "invalid redirect target: x"
+            &refused,
+            FetchFailure::RedirectRefused(inner) if matches!(inner.as_ref(), FetchFailure::Rejected(UrlRejection::Credentials))
         ));
+        assert_eq!(refused.to_string(), "redirect target refused: url carries credentials");
+
+        let invalid = redirect_rejection(UrlRejection::Scheme("ftp".to_owned()));
+        assert!(matches!(
+            invalid,
+            FetchFailure::InvalidRedirect(UrlRejection::Scheme(_))
+        ));
+        assert_eq!(
+            invalid.to_string(),
+            "invalid redirect target: url scheme \"ftp\" is not http or https"
+        );
         assert!(matches!(
             redirect_rejection(UrlRejection::TooLong),
-            FetchFailure::NotAccessible(_)
+            FetchFailure::InvalidRedirect(UrlRejection::TooLong)
         ));
-        assert!(matches!(
-            redirect_rejection(UrlRejection::NotAllowed("url carries credentials".to_owned())),
-            FetchFailure::NotAllowed(reason) if reason == "redirect target refused: url carries credentials"
-        ));
+
+        let on_first_hop = refused_on(0, FetchFailure::NotPublic { host: "h".to_owned() });
+        assert!(matches!(on_first_hop, FetchFailure::NotPublic { .. }));
+        let on_later_hop = refused_on(2, FetchFailure::OutsideDomains { host: "h".to_owned() });
+        assert_eq!(
+            on_later_hop.to_string(),
+            "redirect target refused: h is outside the allowed domains"
+        );
+        let unrelated = refused_on(2, FetchFailure::TimedOut);
+        assert!(matches!(unrelated, FetchFailure::TimedOut));
     }
 }

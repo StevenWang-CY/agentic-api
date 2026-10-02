@@ -1,5 +1,6 @@
-//! URL admission for `web_fetch`: syntax, scheme, embedded credentials, and
-//! the address classes the gateway never contacts.
+//! URL and host admission for `web_fetch`: syntax, scheme, embedded
+//! credentials, the shape of a declared domain entry, and the address classes
+//! the gateway never contacts.
 //!
 //! The address policy runs on resolved addresses, not on host names, so a name
 //! that resolves to a loopback, private, link-local, or cloud-metadata address
@@ -11,20 +12,37 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use url::{Host, Url};
 
+use super::WebFetchErrorCode;
 use super::backend::FetchFailure;
 
 /// Anthropic's documented maximum URL length for web fetch, in characters.
 pub(crate) const MAX_URL_CHARS: usize = 250;
 
 /// Why a URL was refused before any network activity.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, thiserror::Error)]
 pub(crate) enum UrlRejection {
-    /// Not an absolute HTTP(S) URL.
-    InvalidInput(String),
-    /// Longer than [`MAX_URL_CHARS`].
+    #[error("url is empty")]
+    Empty,
+    #[error("url exceeds {MAX_URL_CHARS} characters")]
     TooLong,
-    /// Well formed but outside what the gateway fetches.
-    NotAllowed(String),
+    #[error("url is not valid: {0}")]
+    Invalid(#[source] url::ParseError),
+    #[error("url scheme {0:?} is not http or https")]
+    Scheme(String),
+    /// Well formed, but the gateway never sends credentials to a third party.
+    #[error("url carries credentials")]
+    Credentials,
+}
+
+impl UrlRejection {
+    /// The documented error code for this rejection.
+    pub(crate) const fn code(&self) -> WebFetchErrorCode {
+        match self {
+            Self::Empty | Self::Invalid(_) | Self::Scheme(_) => WebFetchErrorCode::InvalidToolInput,
+            Self::TooLong => WebFetchErrorCode::UrlTooLong,
+            Self::Credentials => WebFetchErrorCode::UrlNotAllowed,
+        }
+    }
 }
 
 /// Parse and admit a URL the model asked to fetch.
@@ -35,22 +53,49 @@ pub(crate) enum UrlRejection {
 pub(crate) fn validate_url(raw: &str) -> Result<Url, UrlRejection> {
     let raw = raw.trim();
     if raw.is_empty() {
-        return Err(UrlRejection::InvalidInput("url is empty".to_owned()));
+        return Err(UrlRejection::Empty);
     }
     if raw.chars().count() > MAX_URL_CHARS {
         return Err(UrlRejection::TooLong);
     }
-    let url = Url::parse(raw).map_err(|error| UrlRejection::InvalidInput(format!("url is not valid: {error}")))?;
+    let url = Url::parse(raw).map_err(UrlRejection::Invalid)?;
     if !matches!(url.scheme(), "http" | "https") {
-        return Err(UrlRejection::InvalidInput(format!(
-            "url scheme {:?} is not http or https",
-            url.scheme()
-        )));
+        return Err(UrlRejection::Scheme(url.scheme().to_owned()));
     }
     if !url.username().is_empty() || url.password().is_some() {
-        return Err(UrlRejection::NotAllowed("url carries credentials".to_owned()));
+        return Err(UrlRejection::Credentials);
     }
     Ok(url)
+}
+
+/// Why a declared `allowed_domains` / `blocked_domains` entry cannot match a
+/// host. Web fetch matches on the host only, so an entry must be a host name
+/// or address: no scheme, no path, nothing that normalizes to nothing.
+pub(crate) fn validate_domain_entry(entry: &str) -> Result<(), &'static str> {
+    let trimmed = entry.trim();
+    if trimmed.is_empty() {
+        return Err("is empty");
+    }
+    if trimmed.contains("://") || trimmed.contains('/') {
+        return Err("must be a host name without a scheme or path");
+    }
+    if trimmed.chars().any(char::is_whitespace) {
+        return Err("must not contain whitespace");
+    }
+    let host = trimmed.trim_end_matches('.');
+    // `Host::parse` applies IDNA and lowercasing but admits characters such as
+    // `*` that no host carries; a label must be letters, digits, and hyphens.
+    match Host::parse(host) {
+        Ok(Host::Ipv4(_) | Host::Ipv6(_)) => Ok(()),
+        Ok(Host::Domain(domain))
+            if domain.split('.').all(|label| {
+                !label.is_empty() && label.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            }) =>
+        {
+            Ok(())
+        }
+        _ => Err("is not a host name"),
+    }
 }
 
 /// Whether an address is one the gateway may contact on behalf of a request.
@@ -127,14 +172,17 @@ pub(crate) async fn resolve_addrs(
         Host::Ipv6(ip) => vec![SocketAddr::new(IpAddr::V6(*ip), port)],
         Host::Domain(name) => tokio::net::lookup_host((*name, port))
             .await
-            .map_err(|error| FetchFailure::NotAccessible(format!("could not resolve {name}: {error}")))?
+            .map_err(|source| FetchFailure::Dns {
+                host: (*name).to_owned(),
+                source,
+            })?
             .collect(),
     };
     if addrs.is_empty() {
-        return Err(FetchFailure::NotAccessible(format!("{host} has no address")));
+        return Err(FetchFailure::NoAddress { host: host.to_string() });
     }
     if addrs.iter().any(|addr| !admit(addr.ip())) {
-        return Err(FetchFailure::NotAllowed(format!("{host} is not a public address")));
+        return Err(FetchFailure::NotPublic { host: host.to_string() });
     }
     Ok(addrs)
 }
@@ -161,17 +209,19 @@ mod tests {
             ("javascript:alert(1)", "url scheme \"javascript\" is not http or https"),
             ("http://", "url is not valid"),
         ] {
-            match validate_url(raw) {
-                Err(UrlRejection::InvalidInput(reason)) => assert!(reason.starts_with(expected), "{raw}: {reason}"),
-                other => panic!("{raw}: expected invalid input, got {other:?}"),
-            }
+            let rejection = validate_url(raw).unwrap_err();
+            assert_eq!(rejection.code(), WebFetchErrorCode::InvalidToolInput, "{raw}");
+            assert!(rejection.to_string().starts_with(expected), "{raw}: {rejection}");
         }
     }
 
     #[test]
     fn validate_url_refuses_long_urls_and_credentials() {
         let long = format!("https://example.com/{}", "a".repeat(MAX_URL_CHARS));
-        assert_eq!(validate_url(&long).unwrap_err(), UrlRejection::TooLong);
+        let rejection = validate_url(&long).unwrap_err();
+        assert!(matches!(rejection, UrlRejection::TooLong));
+        assert_eq!(rejection.code(), WebFetchErrorCode::UrlTooLong);
+        assert_eq!(rejection.to_string(), "url exceeds 250 characters");
         let exact = format!(
             "https://example.com/{}",
             "a".repeat(MAX_URL_CHARS - "https://example.com/".len())
@@ -181,10 +231,36 @@ mod tests {
             "exactly {MAX_URL_CHARS} characters is allowed"
         );
         for raw in ["https://user:secret@example.com/", "https://token@example.com/"] {
-            assert!(
-                matches!(validate_url(raw), Err(UrlRejection::NotAllowed(reason)) if reason.contains("credentials")),
-                "{raw}"
-            );
+            let rejection = validate_url(raw).unwrap_err();
+            assert!(matches!(rejection, UrlRejection::Credentials), "{raw}");
+            assert_eq!(rejection.code(), WebFetchErrorCode::UrlNotAllowed);
+            assert_eq!(rejection.to_string(), "url carries credentials");
+        }
+    }
+
+    #[test]
+    fn domain_entries_must_be_host_names() {
+        for accepted in [
+            "example.com",
+            " Docs.Example.com. ",
+            "xn--bcher-kva.example",
+            "93.184.216.34",
+            "[2001:db8::1]",
+        ] {
+            assert_eq!(validate_domain_entry(accepted), Ok(()), "{accepted}");
+        }
+        for (rejected, reason) in [
+            ("", "is empty"),
+            ("   ", "is empty"),
+            (".", "is not a host name"),
+            ("...", "is not a host name"),
+            ("https://example.com", "must be a host name without a scheme or path"),
+            ("example.com/blog", "must be a host name without a scheme or path"),
+            ("exa mple.com", "must not contain whitespace"),
+            ("example.com:8080", "is not a host name"),
+            ("*.example.com", "is not a host name"),
+        ] {
+            assert_eq!(validate_domain_entry(rejected), Err(reason), "{rejected:?}");
         }
     }
 
@@ -276,7 +352,10 @@ mod tests {
     async fn resolve_addrs_checks_literals_without_a_lookup() {
         let loopback = Host::Ipv4(Ipv4Addr::LOCALHOST);
         let error = resolve_addrs(&loopback, 80, is_public_ip).await.unwrap_err();
-        assert!(matches!(error, FetchFailure::NotAllowed(reason) if reason.contains("127.0.0.1")));
+        assert!(
+            matches!(&error, FetchFailure::NotPublic { host } if host == "127.0.0.1"),
+            "{error:?}"
+        );
         let allowed = resolve_addrs(&loopback, 8080, |_| true).await.unwrap();
         assert_eq!(allowed, vec!["127.0.0.1:8080".parse::<SocketAddr>().unwrap()]);
 
@@ -293,7 +372,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(&error, FetchFailure::NotAllowed(reason) if reason.contains("localhost")),
+            matches!(&error, FetchFailure::NotPublic { host } if host == "localhost"),
             "{error:?}"
         );
         let addrs = resolve_addrs(&Host::Domain("localhost"), 80, |_| true).await.unwrap();

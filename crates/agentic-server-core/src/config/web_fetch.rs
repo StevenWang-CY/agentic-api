@@ -26,7 +26,10 @@ pub struct WebFetchConfig {
     /// Whether fetches may reach private, loopback, link-local, carrier-grade
     /// NAT, multicast, or otherwise non-public addresses, directly or through
     /// DNS and redirects. Off by default: only deployments that fetch intranet
-    /// pages on purpose should enable it.
+    /// pages on purpose should enable it. Under the default policy the fetcher
+    /// also ignores the environment's proxies and connects directly, so the
+    /// address check applies to the real destination; enabling this restores
+    /// proxy use.
     pub allow_private_networks: bool,
     /// Bytes read from one response body before the download is cut.
     pub max_response_bytes: NonZeroUsize,

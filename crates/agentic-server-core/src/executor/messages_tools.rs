@@ -13,9 +13,9 @@ use crate::executor::messages_context::MessagesRequestContext;
 use crate::executor::messages_request::{
     web_fetch_budget_exhausted_result, web_fetch_refused_result, web_search_budget_exhausted_result,
 };
-use crate::tool::ToolRegistry;
-use crate::tool::web_fetch::{self, WebFetchErrorCode};
+use crate::tool::web_fetch::{self, WebFetchArguments, WebFetchErrorCode};
 use crate::tool::web_search::args::requested_searches;
+use crate::tool::{ToolRegistry, ToolType};
 use crate::types::io::output::FunctionToolCall;
 use crate::types::messages::{GatewayToolResult, tool_seam};
 
@@ -36,6 +36,20 @@ pub(super) struct GatewayToolUse<'a> {
 enum Admission<'a> {
     Run { call: FunctionToolCall, name: &'a str },
     Refused(GatewayToolResult),
+}
+
+/// The ownership map for one request: the operator's aliases plus the gateway
+/// tools the request-scoped registry resolved. `web_fetch` is gateway-owned
+/// exactly when the registry bound it to the gateway executor, so the loop's
+/// classification cannot drift from the registry.
+pub(super) fn request_gateway_map(
+    operator: &tool_seam::GatewayToolMap,
+    registry: &ToolRegistry,
+) -> tool_seam::GatewayToolMap {
+    let web_fetch_owned = registry
+        .lookup(tool_seam::WEB_FETCH_EXECUTOR)
+        .is_some_and(|entry| entry.tool_type == ToolType::WebFetch && entry.ownership.is_gateway());
+    operator.clone().with_web_fetch_owned(web_fetch_owned)
 }
 
 /// Execute one round's gateway calls concurrently, each bounded by the per-call
@@ -102,16 +116,19 @@ fn admit<'a>(
 }
 
 /// A fetch is charged one use as soon as its arguments name a URL, whatever
-/// happens next: a failed fetch counts, as Anthropic documents. The
-/// conversation rule is applied here because only the loop holds the
-/// conversation — a URL that never appeared in a user message or a tool
-/// result is refused before any network activity, and that refusal counts.
+/// happens next: a failed fetch counts, as Anthropic documents; arguments
+/// without a URL fetch nothing and cost nothing (the handler answers them as
+/// invalid input). The conversation rule is applied here because only the
+/// loop holds the conversation — a URL that never appeared in a user message
+/// or a tool result is refused before any network activity, and that refusal
+/// counts.
 fn admit_fetch(id: &str, arguments: &str, ctx: &mut MessagesRequestContext) -> Result<(), GatewayToolResult> {
-    if !ctx.admit_fetches(web_fetch::requested_fetches(arguments)) {
+    let args = WebFetchArguments::from_json(arguments).ok();
+    if !ctx.admit_fetches(usize::from(args.is_some())) {
         return Err(web_fetch_budget_exhausted_result(id));
     }
-    match web_fetch::requested_url(arguments) {
-        Some(url) if !ctx.url_in_prior_context(&url) => Err(web_fetch_refused_result(
+    match args {
+        Some(args) if !ctx.url_in_prior_context(&args.url) => Err(web_fetch_refused_result(
             id,
             WebFetchErrorCode::UrlNotInPriorContext,
             "the url did not appear earlier in the conversation; only a url from a user message or a tool result \

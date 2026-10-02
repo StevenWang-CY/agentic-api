@@ -991,9 +991,16 @@ charged.
 
 A native `web_fetch_20250910` declaration is handled the same way (`tool/web_fetch`,
 #408): the upstream sees an ordinary `web_fetch` function tool with a single `url`
-argument, and the gateway executes the call. Ownership is request-scoped
-(`GatewayToolMap::for_request`): the `web_fetch` name is gateway-owned only when the
-request declares the native type, so a client function that happens to be named
+argument, and the gateway executes the call. The Messages adapter
+(`messages_request.rs`) judges the Anthropic-specific settings — tool version,
+`citations`, cache settings, `allowed_callers`, `max_uses` — reads the shared parameters
+into `WebFetchToolParam`, and routes them through `WebFetchHandler::validate` and
+`normalize`; the registry seam reads a declaration through the same parser.
+`GatewayExecutors::require_web_fetch` is the one owner of the operator switch, used by
+registry construction and by `count_tokens` alike. Ownership is request-scoped and
+derived from the registry (`messages_tools::request_gateway_map`): the `web_fetch` name
+is gateway-owned only when the request-scoped registry bound it to the gateway executor,
+which only a native declaration does, so a client function that happens to be named
 `web_fetch` stays client-owned. The fetch budget is separate from the search budget and
 counted in fetches; every admitted call is charged whatever its outcome, and a call whose
 arguments carry no URL is not. Two rules live in the loop rather than the handler because

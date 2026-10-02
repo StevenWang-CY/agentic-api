@@ -15,6 +15,10 @@ use crate::types::tools::{McpToolParam, ResponsesTool};
 
 use super::code_interpreter::CodeInterpreterExecutor;
 
+/// The error for a native `web_fetch` declaration on a gateway whose operator
+/// disabled the executor.
+const WEB_FETCH_UNAVAILABLE: &str = "web_fetch is disabled by operator configuration";
+
 pub enum GatewayExecutorRegistration {
     WebSearch(Arc<WebSearchExecutor>),
     WebFetch(Arc<WebFetchExecutor>),
@@ -167,10 +171,18 @@ impl GatewayExecutors {
             .unwrap_or_else(|| Arc::new(WebSearchHandler::spec_only()))
     }
 
-    /// The `web_fetch` executor, or `None` when the operator disabled it.
-    #[must_use]
-    pub fn web_fetch_handler(&self) -> Option<Arc<WebFetchExecutor>> {
-        self.web_fetch.clone()
+    /// The `web_fetch` executor. The one owner of the availability policy: a
+    /// gateway whose operator disabled the executor refuses a native
+    /// declaration here, whether the caller is building a registry or counting
+    /// tokens.
+    ///
+    /// # Errors
+    ///
+    /// [`ToolError::Config`] when the operator disabled the executor.
+    pub fn require_web_fetch(&self) -> Result<Arc<WebFetchExecutor>, ToolError> {
+        self.web_fetch
+            .clone()
+            .ok_or_else(|| ToolError::Config(WEB_FETCH_UNAVAILABLE.to_owned()))
     }
 
     #[must_use]
@@ -500,18 +512,21 @@ mod tests {
         let client = Arc::new(reqwest::Client::new());
         assert!(
             GatewayExecutors::from_env(Arc::clone(&client))
-                .web_fetch_handler()
-                .is_some()
+                .require_web_fetch()
+                .is_ok()
         );
-        assert!(GatewayExecutors::default().web_fetch_handler().is_none());
+        let Err(error) = GatewayExecutors::default().require_web_fetch() else {
+            panic!("a default registry has no web_fetch executor");
+        };
+        assert!(matches!(&error, ToolError::Config(message) if message == super::WEB_FETCH_UNAVAILABLE));
         let enabled = GatewayExecutors::from_config(Arc::clone(&client), &ToolRuntimeConfig::default()).unwrap();
-        assert!(enabled.web_fetch_handler().is_some());
+        assert!(enabled.require_web_fetch().is_ok());
         let config = ToolRuntimeConfig {
             web_fetch: crate::config::WebFetchConfig::default().with_enabled(false),
             ..ToolRuntimeConfig::default()
         };
         let disabled = GatewayExecutors::from_config(client, &config).unwrap();
-        assert!(disabled.web_fetch_handler().is_none());
+        assert!(disabled.require_web_fetch().is_err());
         assert!(format!("{disabled:?}").contains("web_fetch: false"));
     }
 

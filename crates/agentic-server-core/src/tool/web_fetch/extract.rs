@@ -19,6 +19,10 @@ pub(crate) struct ExtractedText {
 /// chooses its length.
 const MAX_TITLE_BYTES: usize = 512;
 
+/// Longest character reference decoded, in characters after the `&`; the
+/// search for a reference's `;` never looks past it.
+const MAX_REFERENCE_CHARS: usize = 12;
+
 /// Elements whose content never reaches the model.
 const SKIPPED_ELEMENTS: &[&str] = &[
     "script", "style", "noscript", "template", "svg", "iframe", "canvas", "object",
@@ -273,7 +277,14 @@ pub(crate) fn decode_entities(text: &str) -> Cow<'_, str> {
     while let Some(amp) = rest.find('&') {
         out.push_str(&rest[..amp]);
         rest = &rest[amp..];
-        let Some(semicolon) = rest[1..].find(';').map(|index| index + 1).filter(|index| *index <= 12) else {
+        // Look for the `;` within the reference length only, so a run of
+        // ampersands costs a bounded amount of work per ampersand.
+        let semicolon = rest[1..]
+            .char_indices()
+            .take(MAX_REFERENCE_CHARS + 1)
+            .find(|(_, ch)| *ch == ';')
+            .map(|(index, _)| index + 1);
+        let Some(semicolon) = semicolon else {
             out.push('&');
             rest = &rest[1..];
             continue;
@@ -421,6 +432,25 @@ mod tests {
             "&#1114112;",
             "out of range code points are kept"
         );
+    }
+
+    #[test]
+    fn ampersand_floods_decode_in_linear_time() {
+        // Each ampersand looks at most a reference length ahead, so a flood
+        // costs a bounded amount per character; the old scan to the next `;`
+        // was quadratic and took tens of seconds at this size.
+        let flood = "&".repeat(300 * 1024);
+        let started = std::time::Instant::now();
+        assert_eq!(decode_entities(&flood), flood);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        let mixed = format!("{}{}&lt;", "&amp;".repeat(1000), "&".repeat(100_000));
+        let decoded = decode_entities(&mixed);
+        assert!(decoded.starts_with("&&&&") && decoded.ends_with("&<"));
+        assert_eq!(decoded.len(), 1000 + 100_000 + 1);
     }
 
     #[test]

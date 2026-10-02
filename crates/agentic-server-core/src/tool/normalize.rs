@@ -11,7 +11,7 @@ use super::mcp::McpHandler;
 use super::registry::ToolType;
 use super::shell::ShellHandler;
 use super::tool_search::ToolSearchHandler;
-use super::web_fetch::web_fetch_function_tool;
+use super::web_fetch::WebFetchHandler;
 use super::web_search::web_search_function_tool;
 
 #[cfg(not(feature = "embedded-code-interpreter"))]
@@ -24,13 +24,6 @@ const CODE_INTERPRETER_UNAVAILABLE: &str =
 
 pub(crate) fn code_interpreter_unavailable_error() -> ToolError {
     ToolError::Config(CODE_INTERPRETER_UNAVAILABLE.to_owned())
-}
-
-/// The error for a native `web_fetch` declaration on a gateway whose operator
-/// disabled the executor.
-#[must_use]
-pub fn web_fetch_unavailable_error() -> ToolError {
-    ToolError::Config("web_fetch is disabled by operator configuration".to_owned())
 }
 
 impl ResponsesTool {
@@ -105,7 +98,7 @@ impl ResponsesTool {
             Self::Mcp(param) => McpHandler::spec_from_param(param).normalize(param),
             Self::ToolSearch(param) => ToolSearchHandler.normalize(param).into_iter().take(1).collect(),
             Self::WebSearch(_) => vec![web_search_function_tool()],
-            Self::WebFetch(_) => vec![web_fetch_function_tool()],
+            Self::WebFetch(param) => WebFetchHandler::spec_only().normalize(param),
             Self::FileSearch(_) => {
                 tracing::debug!("file_search tool skipped in normalize - handler not yet registered");
                 vec![]

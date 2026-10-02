@@ -1,21 +1,28 @@
 //! Request preparation shared by the native Anthropic Messages tool loops.
 //!
 //! The gateway executes two native Anthropic server tools: `web_search_20250305`
-//! and `web_fetch_20250910`. Both are validated here, rewritten into the
-//! ordinary function-tool shape vLLM accepts, and turned into the request-wide
-//! `max_uses` budgets the loops enforce before dispatching a call.
+//! and `web_fetch_20250910`. This adapter judges what is Anthropic-specific
+//! about a declaration (tool version, `citations`, cache settings,
+//! `allowed_callers`, `max_uses`), reads the shared parameters into the tool's
+//! typed form, and hands validation of those parameters and the upstream
+//! function schema to the tool's own `ToolHandler`. The result is written back
+//! as the ordinary function-tool shape vLLM accepts, and `max_uses` becomes
+//! the request-wide budget the loops enforce before dispatching a call.
 
 use serde_json::{Value, json};
 
 use crate::executor::{ExecutorError, ExecutorResult};
-use crate::tool::web_fetch::{self, WebFetchErrorCode, web_fetch_function_tool};
-use crate::tool::web_search::web_search_function_tool;
+use crate::tool::ToolHandler;
+use crate::tool::web_fetch::{self, WebFetchErrorCode, WebFetchHandler};
+use crate::tool::web_search::WebSearchHandler;
 use crate::types::io::FunctionTool;
 use crate::types::messages::GatewayToolResult;
+use crate::types::messages::request::ToolParam;
 use crate::types::messages::tool_seam::{
     NATIVE_WEB_FETCH_TYPE, NATIVE_WEB_SEARCH_TYPE, WEB_FETCH_EXECUTOR, WEB_SEARCH_EXECUTOR, is_native_web_fetch_type,
-    tool_result_block,
+    tool_result_block, web_search_config,
 };
+use crate::types::tools::WebFetchToolParam;
 
 /// One request-wide `max_uses` budget, counted in the tool's unit of use.
 #[derive(Debug, Default)]
@@ -51,6 +58,10 @@ pub(super) struct ServerToolBudgets {
     pub(super) fetches: UseBudget,
 }
 
+fn invalid(message: impl Into<String>) -> ExecutorError {
+    ExecutorError::InvalidRequest(message.into())
+}
+
 fn validate_domain_list(tool: &Value, tool_name: &str, field: &str) -> ExecutorResult<()> {
     let Some(value) = tool.get(field) else {
         return Ok(());
@@ -69,7 +80,7 @@ fn validate_domain_list(tool: &Value, tool_name: &str, field: &str) -> ExecutorR
     if valid {
         Ok(())
     } else {
-        Err(ExecutorError::InvalidRequest(format!(
+        Err(invalid(format!(
             "{tool_name} {field} must be an array of non-empty strings"
         )))
     }
@@ -86,7 +97,7 @@ fn validate_domain_filters(tool: &Value, tool_name: &str) -> ExecutorResult<()> 
             .is_some_and(|domains| !domains.is_empty())
     };
     if has_entries("allowed_domains") && has_entries("blocked_domains") {
-        return Err(ExecutorError::InvalidRequest(format!(
+        return Err(invalid(format!(
             "{tool_name} allowed_domains and blocked_domains cannot be used together"
         )));
     }
@@ -98,17 +109,17 @@ fn validate_allowed_callers(tool: &Value, tool_name: &str) -> ExecutorResult<()>
         return Ok(());
     };
     let Some(callers) = value.as_array() else {
-        return Err(ExecutorError::InvalidRequest(format!(
+        return Err(invalid(format!(
             "{tool_name} allowed_callers must be an array of strings"
         )));
     };
     if !callers.iter().all(Value::is_string) {
-        return Err(ExecutorError::InvalidRequest(format!(
+        return Err(invalid(format!(
             "{tool_name} allowed_callers must be an array of strings"
         )));
     }
     if !callers.iter().any(|caller| caller.as_str() == Some("direct")) {
-        return Err(ExecutorError::InvalidRequest(format!(
+        return Err(invalid(format!(
             "{tool_name} allowed_callers must permit direct invocation"
         )));
     }
@@ -120,14 +131,10 @@ fn validate_user_location(tool: &Value) -> ExecutorResult<()> {
         return Ok(());
     };
     let Some(location) = value.as_object() else {
-        return Err(ExecutorError::InvalidRequest(
-            "web_search user_location must be an object".to_owned(),
-        ));
+        return Err(invalid("web_search user_location must be an object"));
     };
     if location.get("type").and_then(Value::as_str) != Some("approximate") {
-        return Err(ExecutorError::InvalidRequest(
-            "web_search user_location.type must be approximate".to_owned(),
-        ));
+        return Err(invalid("web_search user_location.type must be approximate"));
     }
     let fields = ["city", "region", "country", "timezone"];
     let mut has_location = false;
@@ -135,7 +142,7 @@ fn validate_user_location(tool: &Value) -> ExecutorResult<()> {
         if let Some(value) = location.get(field) {
             let valid = value.as_str().is_some_and(|value| !value.trim().is_empty());
             if !valid {
-                return Err(ExecutorError::InvalidRequest(format!(
+                return Err(invalid(format!(
                     "web_search user_location.{field} must be a non-empty string"
                 )));
             }
@@ -143,8 +150,8 @@ fn validate_user_location(tool: &Value) -> ExecutorResult<()> {
         }
     }
     if !has_location {
-        return Err(ExecutorError::InvalidRequest(
-            "web_search user_location must include city, region, country, or timezone".to_owned(),
+        return Err(invalid(
+            "web_search user_location must include city, region, country, or timezone",
         ));
     }
     Ok(())
@@ -160,7 +167,7 @@ fn positive_integer(tool: &Value, tool_name: &str, field: &str) -> ExecutorResul
         .and_then(|value| usize::try_from(value).ok())
         .filter(|value| *value > 0)
         .map(Some)
-        .ok_or_else(|| ExecutorError::InvalidRequest(format!("{tool_name} {field} must be a positive integer")))
+        .ok_or_else(|| invalid(format!("{tool_name} {field} must be a positive integer")))
 }
 
 /// Fold one declaration's `max_uses` into the request-wide minimum.
@@ -171,96 +178,95 @@ fn fold_max_uses(current: Option<usize>, tool: &Value, tool_name: &str) -> Execu
     Ok(Some(current.map_or(parsed, |current| current.min(parsed))))
 }
 
-fn native_web_search_max_uses(request: &Value) -> ExecutorResult<Option<usize>> {
-    let Some(tools) = request.get("tools").and_then(Value::as_array) else {
-        return Ok(None);
-    };
-    let mut max_uses = None;
-
-    for tool in tools {
-        let tool_type = tool.get("type").and_then(Value::as_str);
-        let is_web_search = tool.get("name").and_then(Value::as_str) == Some(WEB_SEARCH_EXECUTOR);
-        if is_web_search
-            && tool_type
-                .is_some_and(|tool_type| tool_type.starts_with("web_search_") && tool_type != NATIVE_WEB_SEARCH_TYPE)
-        {
-            return Err(ExecutorError::InvalidRequest(format!(
-                "unsupported web_search tool type '{}'",
-                tool_type.unwrap_or_default()
-            )));
-        }
-        if tool_type != Some(NATIVE_WEB_SEARCH_TYPE) || !is_web_search {
-            continue;
-        }
-        validate_domain_filters(tool, WEB_SEARCH_EXECUTOR)?;
-        validate_user_location(tool)?;
-        validate_allowed_callers(tool, WEB_SEARCH_EXECUTOR)?;
-        max_uses = fold_max_uses(max_uses, tool, WEB_SEARCH_EXECUTOR)?;
-    }
-
-    Ok(max_uses)
+/// The handler's model-visible function tool for a validated declaration.
+fn handler_function_tool<H: ToolHandler>(
+    handler: &H,
+    tool_name: &str,
+    params: &H::ToolParams,
+) -> ExecutorResult<FunctionTool> {
+    handler.validate(params).map_err(|error| invalid(error.to_string()))?;
+    handler
+        .normalize(params)
+        .into_iter()
+        .next()
+        .ok_or_else(|| invalid(format!("{tool_name} declaration produced no function tool")))
 }
 
-/// Validate every native web-fetch declaration and return the request-wide
-/// `max_uses`. Only `web_fetch_20250910` is honoured; parameters the gateway
-/// cannot honour are rejected rather than ignored.
-fn native_web_fetch_max_uses(request: &Value) -> ExecutorResult<Option<usize>> {
-    let Some(tools) = request.get("tools").and_then(Value::as_array) else {
-        return Ok(None);
-    };
-    let mut max_uses = None;
-
-    for tool in tools {
-        let tool_type = tool.get("type").and_then(Value::as_str);
-        if !is_native_web_fetch_type(tool_type) {
-            continue;
-        }
-        if tool_type != Some(NATIVE_WEB_FETCH_TYPE) {
-            return Err(ExecutorError::InvalidRequest(format!(
-                "unsupported web_fetch tool type '{}'; only {NATIVE_WEB_FETCH_TYPE} is supported",
-                tool_type.unwrap_or_default()
-            )));
-        }
-        if tool.get("name").and_then(Value::as_str) != Some(WEB_FETCH_EXECUTOR) {
-            return Err(ExecutorError::InvalidRequest(format!(
-                "{NATIVE_WEB_FETCH_TYPE} declarations must be named {WEB_FETCH_EXECUTOR}"
-            )));
-        }
-        validate_domain_filters(tool, WEB_FETCH_EXECUTOR)?;
-        validate_allowed_callers(tool, WEB_FETCH_EXECUTOR)?;
-        if let Some(citations) = tool.get("citations") {
-            match citations.get("enabled").and_then(Value::as_bool) {
-                Some(false) => {}
-                Some(true) => {
-                    return Err(ExecutorError::InvalidRequest(
-                        "web_fetch citations are not supported".to_owned(),
-                    ));
-                }
-                None => {
-                    return Err(ExecutorError::InvalidRequest(
-                        "web_fetch citations must be an object with a boolean enabled field".to_owned(),
-                    ));
-                }
-            }
-        }
-        for unsupported in ["use_cache", "response_inclusion"] {
-            if tool.get(unsupported).is_some() {
-                return Err(ExecutorError::InvalidRequest(format!(
-                    "web_fetch {unsupported} requires a later web_fetch tool version"
-                )));
-            }
-        }
-        if positive_integer(tool, WEB_FETCH_EXECUTOR, "max_content_tokens")?
-            .is_some_and(|tokens| u32::try_from(tokens).is_err())
-        {
-            return Err(ExecutorError::InvalidRequest(
-                "web_fetch max_content_tokens is too large".to_owned(),
-            ));
-        }
-        max_uses = fold_max_uses(max_uses, tool, WEB_FETCH_EXECUTOR)?;
+/// A native `web_search_20250305` declaration, if `tool` is one: the Anthropic
+/// settings are judged here, the shared parameters go through
+/// [`WebSearchHandler`], and `max_uses` folds into the request-wide budget.
+fn normalize_web_search_declaration(
+    tool: &Value,
+    max_uses: &mut Option<usize>,
+) -> ExecutorResult<Option<FunctionTool>> {
+    let tool_type = tool.get("type").and_then(Value::as_str);
+    let is_web_search = tool.get("name").and_then(Value::as_str) == Some(WEB_SEARCH_EXECUTOR);
+    if is_web_search
+        && tool_type
+            .is_some_and(|tool_type| tool_type.starts_with("web_search_") && tool_type != NATIVE_WEB_SEARCH_TYPE)
+    {
+        return Err(invalid(format!(
+            "unsupported web_search tool type '{}'",
+            tool_type.unwrap_or_default()
+        )));
     }
+    if tool_type != Some(NATIVE_WEB_SEARCH_TYPE) || !is_web_search {
+        return Ok(None);
+    }
+    validate_domain_filters(tool, WEB_SEARCH_EXECUTOR)?;
+    validate_user_location(tool)?;
+    validate_allowed_callers(tool, WEB_SEARCH_EXECUTOR)?;
+    *max_uses = fold_max_uses(*max_uses, tool, WEB_SEARCH_EXECUTOR)?;
+    let declaration: ToolParam = serde_json::from_value(tool.clone())
+        .map_err(|error| invalid(format!("web_search declaration is not a tool: {error}")))?;
+    let params = web_search_config(&declaration);
+    handler_function_tool(&WebSearchHandler::spec_only(), WEB_SEARCH_EXECUTOR, &params).map(Some)
+}
 
-    Ok(max_uses)
+/// A native `web_fetch_*` declaration, if `tool` is one. Only
+/// `web_fetch_20250910` is honoured; settings the gateway cannot honour are
+/// rejected rather than ignored. The shared parameters are read once into
+/// [`WebFetchToolParam`] and validated by [`WebFetchHandler`].
+fn normalize_web_fetch_declaration(tool: &Value, max_uses: &mut Option<usize>) -> ExecutorResult<Option<FunctionTool>> {
+    let tool_type = tool.get("type").and_then(Value::as_str);
+    if !is_native_web_fetch_type(tool_type) {
+        return Ok(None);
+    }
+    if tool_type != Some(NATIVE_WEB_FETCH_TYPE) {
+        return Err(invalid(format!(
+            "unsupported web_fetch tool type '{}'; only {NATIVE_WEB_FETCH_TYPE} is supported",
+            tool_type.unwrap_or_default()
+        )));
+    }
+    if tool.get("name").and_then(Value::as_str) != Some(WEB_FETCH_EXECUTOR) {
+        return Err(invalid(format!(
+            "{NATIVE_WEB_FETCH_TYPE} declarations must be named {WEB_FETCH_EXECUTOR}"
+        )));
+    }
+    validate_domain_filters(tool, WEB_FETCH_EXECUTOR)?;
+    validate_allowed_callers(tool, WEB_FETCH_EXECUTOR)?;
+    if let Some(citations) = tool.get("citations") {
+        match citations.get("enabled").and_then(Value::as_bool) {
+            Some(false) => {}
+            Some(true) => return Err(invalid("web_fetch citations are not supported")),
+            None => {
+                return Err(invalid(
+                    "web_fetch citations must be an object with a boolean enabled field",
+                ));
+            }
+        }
+    }
+    for unsupported in ["use_cache", "response_inclusion"] {
+        if tool.get(unsupported).is_some() {
+            return Err(invalid(format!(
+                "web_fetch {unsupported} requires a later web_fetch tool version"
+            )));
+        }
+    }
+    *max_uses = fold_max_uses(*max_uses, tool, WEB_FETCH_EXECUTOR)?;
+    let params = WebFetchToolParam::from_declaration(|field| tool.get(field))
+        .map_err(|reason| invalid(format!("web_fetch {reason}")))?;
+    handler_function_tool(&WebFetchHandler::spec_only(), WEB_FETCH_EXECUTOR, &params).map(Some)
 }
 
 fn declares_native_web_search(request: &Value) -> bool {
@@ -339,31 +345,29 @@ fn anthropic_function_tool(function: &FunctionTool) -> Value {
 /// resulting `tool_use` internally, so this is an upstream-only representation
 /// change; the client request itself remains Anthropic-native.
 pub(super) fn normalize_native_server_tools(request: &mut Value) -> ExecutorResult<ServerToolBudgets> {
-    let searches = UseBudget::limited(native_web_search_max_uses(request)?);
-    let fetches = UseBudget::limited(native_web_fetch_max_uses(request)?);
+    let mut searches = None;
+    let mut fetches = None;
     if let Some(tools) = request.get_mut("tools").and_then(Value::as_array_mut) {
         for tool in tools {
-            let tool_type = tool.get("type").and_then(Value::as_str);
-            let name = tool.get("name").and_then(Value::as_str);
-            let replacement = if tool_type == Some(NATIVE_WEB_SEARCH_TYPE) && name == Some(WEB_SEARCH_EXECUTOR) {
-                Some(web_search_function_tool())
-            } else if tool_type == Some(NATIVE_WEB_FETCH_TYPE) {
-                Some(web_fetch_function_tool())
-            } else {
-                None
+            let function = match normalize_web_search_declaration(tool, &mut searches)? {
+                Some(function) => Some(function),
+                None => normalize_web_fetch_declaration(tool, &mut fetches)?,
             };
-            if let Some(function) = replacement {
+            if let Some(function) = function {
                 *tool = anthropic_function_tool(&function);
             }
         }
     }
-
-    Ok(ServerToolBudgets { searches, fetches })
+    Ok(ServerToolBudgets {
+        searches: UseBudget::limited(searches),
+        fetches: UseBudget::limited(fetches),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::tools::WebSearchToolParam;
 
     fn fetch_request(extra: &Value) -> Value {
         let mut tool = json!({"type": "web_fetch_20250910", "name": "web_fetch"});
@@ -389,12 +393,28 @@ mod tests {
         assert_eq!(request["tools"][0]["name"], "web_fetch");
         assert!(request["tools"][0].get("type").is_none());
         assert_eq!(request["tools"][0]["input_schema"]["required"], json!(["url"]));
+        assert_eq!(
+            request["tools"][0],
+            anthropic_function_tool(&WebFetchHandler::spec_only().normalize(&WebFetchToolParam::default())[0]),
+            "the upstream declaration is the handler's own normalization"
+        );
         assert!(budgets.fetches.admit(3));
         assert!(!budgets.fetches.admit(1), "max_uses caps the request-wide total");
         assert!(
             budgets.searches.admit(50),
             "no web_search declaration leaves searches unlimited"
         );
+    }
+
+    #[test]
+    fn native_web_search_is_rewritten_through_its_handler() {
+        let mut request = json!({"model": "m", "max_tokens": 8, "messages": [], "tools": [
+            {"type": "web_search_20250305", "name": "web_search", "max_uses": 2, "allowed_domains": ["example.com"]}
+        ]});
+        normalize_native_server_tools(&mut request).unwrap();
+        let expected =
+            anthropic_function_tool(&WebSearchHandler::spec_only().normalize(&WebSearchToolParam::default())[0]);
+        assert_eq!(request["tools"][0], expected);
     }
 
     #[test]
@@ -431,13 +451,25 @@ mod tests {
             ),
             (
                 json!({"max_content_tokens": 5_000_000_000_u64}),
-                "web_fetch max_content_tokens is too large",
+                "web_fetch max_content_tokens must be a positive integer that fits 32 bits",
             ),
             (
                 json!({"allowed_domains": ["https://example.com"]}),
                 "web_fetch allowed_domains must be",
             ),
             (json!({"blocked_domains": [""]}), "web_fetch blocked_domains must be"),
+            (
+                json!({"allowed_domains": ["."]}),
+                "web_fetch allowed_domains entry \".\" is not a host name",
+            ),
+            (
+                json!({"blocked_domains": ["example.com/blog"]}),
+                "web_fetch blocked_domains entry \"example.com/blog\" must be a host name without a scheme or path",
+            ),
+            (
+                json!({"allowed_domains": ["*.example.com"]}),
+                "web_fetch allowed_domains entry \"*.example.com\" is not a host name",
+            ),
             (
                 json!({"allowed_domains": ["a.com"], "blocked_domains": ["b.com"]}),
                 "cannot be used together",
@@ -465,6 +497,12 @@ mod tests {
             let message = invalid_request(&mut request);
             assert!(message.contains(expected), "{extra}: {message}");
         }
+    }
+
+    #[test]
+    fn host_name_entries_are_accepted_after_normalization() {
+        let mut request = fetch_request(&json!({"allowed_domains": ["Example.COM.", "93.184.216.34"]}));
+        assert!(normalize_native_server_tools(&mut request).is_ok());
     }
 
     #[test]

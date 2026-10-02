@@ -12,7 +12,7 @@ use super::custom::{CustomHandler, CustomToolMap, insert_custom_entry};
 use super::executors::GatewayExecutors;
 use super::function::insert_function_entry;
 use super::mcp::registry::insert_discovered_mcp_entry;
-use super::normalize::{code_interpreter_unavailable_error, web_fetch_unavailable_error};
+use super::normalize::code_interpreter_unavailable_error;
 use super::ownership::{GatewayBinding, ToolOwnership};
 use super::shell::insert_shell_entry;
 use super::tool_search::{TOOL_SEARCH_NAME, insert_tool_search_entry};
@@ -184,7 +184,7 @@ fn insert_web_fetch_binding(
     executors: &GatewayExecutors,
     param: &WebFetchToolParam,
 ) -> Result<(), ToolError> {
-    let executor = executors.web_fetch_handler().ok_or_else(web_fetch_unavailable_error)?;
+    let executor = executors.require_web_fetch()?;
     insert_unique_tool_entries(entries, |resolved| insert_web_fetch_entry(resolved, param, executor))
 }
 

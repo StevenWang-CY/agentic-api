@@ -322,3 +322,27 @@ async fn unsupported_versions_and_parameters_are_rejected_with_400() {
         "nothing reached the upstream"
     );
 }
+
+#[tokio::test]
+async fn an_allowlist_that_names_no_host_is_rejected_with_400_on_both_endpoints() {
+    let gateway = spawn(WebFetchConfig::default()).await;
+    let tool = json!({"type": "web_fetch_20250910", "name": "web_fetch", "allowed_domains": ["."]});
+    for path in ["/v1/messages", "/v1/messages/count_tokens"] {
+        let response = client()
+            .post(format!("{}{path}", gateway.url))
+            .json(&messages_request("hi", &tool, false))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
+        let body: Value = response.json().await.unwrap();
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("allowed_domains entry \".\" is not a host name")),
+            "{path}: {body}"
+        );
+    }
+    assert!(gateway.backend.inferences.lock().unwrap().is_empty());
+    assert!(gateway.backend.counts.lock().unwrap().is_empty());
+}

@@ -55,7 +55,7 @@
       "reason": "The shared output-item conversion replays native code-interpreter calls while omitting gateway projections."
     },
     "crates/agentic-server-core/src/types/tools/params.rs": {
-      "limit": 580,
+      "limit": 581,
       "reason": "The shared tagged tool declaration carries the Messages-only web_fetch variant so one registry builder serves every gateway tool."
     },
     "crates/agentic-server/src/main.rs": {

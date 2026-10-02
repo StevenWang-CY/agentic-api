@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use super::web_fetch::WebFetchToolParam;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -113,7 +114,7 @@ pub enum ResponsesTool {
     /// Gateway-executed page fetch declared through the Messages seam. It
     /// has no Responses wire form and is never read from a request body.
     #[serde(skip)]
-    WebFetch(super::web_fetch::WebFetchToolParam),
+    WebFetch(WebFetchToolParam),
     #[serde(rename = "file_search")]
     FileSearch(FileSearchToolParam),
     #[serde(rename = "code_interpreter")]
