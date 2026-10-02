@@ -17,7 +17,7 @@ use serde_json::{Map, Value, json};
 use crate::types::event::MessageStatus;
 use crate::types::io::output::FunctionToolCall;
 use crate::types::tools::{
-    FunctionToolParam, ResponsesTool, WebFetchToolParam, WebSearchFilters, WebSearchToolParam, WebSearchUserLocation,
+    DomainFilters, FunctionToolParam, ResponsesTool, WebFetchToolParam, WebSearchToolParam, WebSearchUserLocation,
 };
 use crate::utils::common::deserialize_from_value_opt;
 
@@ -188,7 +188,7 @@ pub(crate) fn web_search_config(tool: &ToolParam) -> WebSearchToolParam {
         .get("blocked_domains")
         .cloned()
         .and_then(deserialize_from_value_opt);
-    let filters = (allowed_domains.is_some() || blocked_domains.is_some()).then_some(WebSearchFilters {
+    let filters = (allowed_domains.is_some() || blocked_domains.is_some()).then_some(DomainFilters {
         allowed_domains,
         blocked_domains,
     });

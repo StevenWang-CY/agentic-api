@@ -23,6 +23,12 @@ All notable changes to Agentic API are documented here.
   `config.toml` or `AGENTIC_WEB_FETCH_ENABLED`, `AGENTIC_WEB_FETCH_ALLOW_PRIVATE_NETWORKS`,
   `AGENTIC_WEB_FETCH_MAX_RESPONSE_BYTES`, and `AGENTIC_WEB_FETCH_TIMEOUT_SECS`.
 
+### Changed
+
+- The domain lists of `web_search` and `web_fetch` declarations are one shared type, `DomainFilters` (formerly
+  `WebSearchFilters`, the same two fields), validated and matched by one shared policy module; the request and
+  response wire shapes are unchanged, and the OpenAPI component is named `DomainFilters`.
+
 ## [0.9.0] - 2026-09-30
 
 ### Added

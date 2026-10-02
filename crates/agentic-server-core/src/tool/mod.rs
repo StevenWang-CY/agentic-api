@@ -6,6 +6,7 @@
 pub mod code_interpreter;
 pub mod codex;
 pub mod custom;
+pub(crate) mod domain_policy;
 pub mod executors;
 pub mod function;
 pub mod handler;

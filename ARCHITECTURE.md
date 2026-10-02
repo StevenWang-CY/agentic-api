@@ -1300,7 +1300,8 @@ the operator enables it, and Eryx runtime readiness succeeds.
     by `mcp/client.rs`'s MCP protocol client and `mcp/pool.rs`'s connection pool).
     `web_fetch/mod.rs` (`WebFetchHandler`, Messages-only, backed by a `WebFetchBackend` —
     the built-in `web_fetch/http.rs` fetcher — with `web_fetch/policy.rs` for URL and
-    address admission and `web_fetch/extract.rs` for HTML-to-text extraction) follows the
+    address admission, `web_fetch/extract.rs` for HTML-to-text extraction, and the shared
+    `domain_policy.rs` for the domain lists both web tools declare) follows the
     same pattern. They have no client translator association because the gateway owns
     their execution and public lifecycle.
 - **`ownership.rs`** — `ToolOwnership::Client` versus

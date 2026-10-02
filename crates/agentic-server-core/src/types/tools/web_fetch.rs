@@ -11,7 +11,7 @@ use std::num::NonZeroU32;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::params::WebSearchFilters;
+use super::domain::DomainFilters;
 
 /// Per-request settings of one `web_fetch` declaration.
 ///
@@ -20,7 +20,7 @@ use super::params::WebSearchFilters;
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WebFetchToolParam {
     /// `allowed_domains` / `blocked_domains`, matched on the URL host only.
-    pub filters: Option<WebSearchFilters>,
+    pub filters: Option<DomainFilters>,
     /// Approximate ceiling on the text returned to the model, in tokens.
     pub max_content_tokens: Option<NonZeroU32>,
 }
@@ -57,7 +57,7 @@ impl WebFetchToolParam {
         };
         let allowed_domains = domains("allowed_domains")?;
         let blocked_domains = domains("blocked_domains")?;
-        let filters = (allowed_domains.is_some() || blocked_domains.is_some()).then_some(WebSearchFilters {
+        let filters = (allowed_domains.is_some() || blocked_domains.is_some()).then_some(DomainFilters {
             allowed_domains,
             blocked_domains,
         });

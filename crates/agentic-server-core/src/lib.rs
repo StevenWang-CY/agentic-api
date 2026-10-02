@@ -24,8 +24,8 @@ pub use types::{
     CodeInterpreterCallArgumentsError, CodeInterpreterCallOutput, CodeInterpreterCallStatus,
     CodeInterpreterCallStreamEvent, CodeInterpreterToolParam, CodexNamespaceMember, CodexNamespaceToolParam,
     CompactRequest, CompactedResponse, CompactionItem, ContextManagement, CustomToolCall, CustomToolCallOutputMessage,
-    CustomToolParam, EmptyToolNameError, FileSearchToolParam, FunctionTool, FunctionToolCall, FunctionToolParam,
-    FunctionToolResultMessage, GatewayCallStatus, IncompleteDetails, InputContent, InputFileContent,
+    CustomToolParam, DomainFilters, EmptyToolNameError, FileSearchToolParam, FunctionTool, FunctionToolCall,
+    FunctionToolParam, FunctionToolResultMessage, GatewayCallStatus, IncompleteDetails, InputContent, InputFileContent,
     InputFunctionToolCall, InputImageContent, InputItem, InputMessage, InputMessageContent, InputTextContent,
     InputTokenDetails, LocalShellEnvironment, McpCall, McpCallStatus, McpToolParam, NonEmptyToolName, OpaqueReasoning,
     OpaqueReasoningError, OutputItem, OutputMessage, OutputTextContent, OutputTokenDetails, ReasoningConfig,
@@ -35,6 +35,6 @@ pub use types::{
     ShellCallOutputMessage, ShellCallStatus, ShellEnvironment, ShellToolParam, ToolCallOutput, ToolChoice,
     ToolOutputContent, UpstreamRequest, UpstreamTool, WebSearchAction, WebSearchActionFindInPage,
     WebSearchActionOpenPage, WebSearchActionSearch, WebSearchCall, WebSearchCallStatus, WebSearchContextSize,
-    WebSearchFilters, WebSearchSource, WebSearchToolParam, WebSearchUserLocation,
+    WebSearchSource, WebSearchToolParam, WebSearchUserLocation,
 };
 pub use utils::{utcnow_str, uuid7_str};

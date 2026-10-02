@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use super::domain::DomainFilters;
 use super::web_fetch::WebFetchToolParam;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -268,13 +269,6 @@ impl WebSearchContextSize {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-pub struct WebSearchFilters {
-    pub allowed_domains: Option<Vec<String>>,
-    pub blocked_domains: Option<Vec<String>>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct WebSearchUserLocation {
     #[serde(rename = "type")]
     pub type_: Option<String>,
@@ -289,7 +283,7 @@ pub struct WebSearchUserLocation {
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct WebSearchToolParam {
     pub search_context_size: Option<WebSearchContextSize>,
-    pub filters: Option<WebSearchFilters>,
+    pub filters: Option<DomainFilters>,
     pub user_location: Option<WebSearchUserLocation>,
 }
 
