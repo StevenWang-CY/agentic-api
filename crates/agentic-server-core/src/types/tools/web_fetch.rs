@@ -1,10 +1,11 @@
 //! Declaration parameters for the gateway-executed `web_fetch` tool.
 //!
-//! A native Messages `web_fetch_20250910` declaration is classified by the
-//! Messages tool seam and carried into the request-scoped registry as
-//! [`ResponsesTool::WebFetch`](super::ResponsesTool::WebFetch). The tool has no
-//! Responses wire form, so this shape is never deserialized from a request
-//! body; it holds only what the handler needs for every call of one request.
+//! A native Messages `web_fetch_20250910` declaration is read by the tool
+//! layer's Messages mapping (`tool::registry_tools`) and carried into the
+//! request-scoped registry as the `WebFetch` kind of its internal
+//! `ToolDeclaration`. The tool has no Responses wire form, so this shape is
+//! never deserialized from a request body; it holds only what the handler
+//! needs for every call of one request.
 
 use std::num::NonZeroU32;
 

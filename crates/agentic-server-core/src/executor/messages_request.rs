@@ -13,6 +13,7 @@ use serde_json::{Value, json};
 
 use crate::executor::{ExecutorError, ExecutorResult};
 use crate::tool::ToolHandler;
+use crate::tool::declaration::web_search_config;
 use crate::tool::web_fetch::{self, WebFetchErrorCode, WebFetchHandler};
 use crate::tool::web_search::WebSearchHandler;
 use crate::types::io::FunctionTool;
@@ -20,7 +21,7 @@ use crate::types::messages::GatewayToolResult;
 use crate::types::messages::request::ToolParam;
 use crate::types::messages::tool_seam::{
     NATIVE_WEB_FETCH_TYPE, NATIVE_WEB_SEARCH_TYPE, WEB_FETCH_EXECUTOR, WEB_SEARCH_EXECUTOR, is_native_web_fetch_type,
-    tool_result_block, web_search_config,
+    tool_result_block,
 };
 use crate::types::tools::WebFetchToolParam;
 

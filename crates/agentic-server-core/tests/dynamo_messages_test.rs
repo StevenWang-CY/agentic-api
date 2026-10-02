@@ -12,11 +12,12 @@ use agentic_core::executor::{
     run_messages_loop, run_messages_stream,
 };
 use agentic_core::storage::{ConversationStore, ResponseStore};
+use agentic_core::tool::registry_tools;
 use agentic_core::tool::{
     GatewayExecutor, ToolError, ToolHandler, ToolOutput, ToolRegistry, ToolType, WebSearchHandler,
 };
 use agentic_core::types::io::FunctionTool;
-use agentic_core::types::messages::{ToolParam, registry_tools};
+use agentic_core::types::messages::ToolParam;
 use agentic_core::types::tools::WebSearchToolParam;
 use axum::{Router, routing::post};
 use futures::{FutureExt, StreamExt};

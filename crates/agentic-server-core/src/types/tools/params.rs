@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 
 use super::domain::DomainFilters;
-use super::web_fetch::WebFetchToolParam;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -112,10 +111,6 @@ pub enum ResponsesTool {
         alias = "web_search_2025_08_26"
     )]
     WebSearch(WebSearchToolParam),
-    /// Gateway-executed page fetch declared through the Messages seam. It
-    /// has no Responses wire form and is never read from a request body.
-    #[serde(skip)]
-    WebFetch(WebFetchToolParam),
     #[serde(rename = "file_search")]
     FileSearch(FileSearchToolParam),
     #[serde(rename = "code_interpreter")]
@@ -558,7 +553,7 @@ impl ResponsesTool {
             Self::Shell(_) => Some("shell"),
             Self::Namespace(_) => Some("namespace"),
             Self::Custom(_) => Some("custom"),
-            Self::WebFetch(_) | Self::Unknown => None,
+            Self::Unknown => None,
         }
     }
 

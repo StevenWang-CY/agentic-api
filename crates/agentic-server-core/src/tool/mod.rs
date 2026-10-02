@@ -6,6 +6,7 @@
 pub mod code_interpreter;
 pub mod codex;
 pub mod custom;
+pub mod declaration;
 pub(crate) mod domain_policy;
 pub mod executors;
 pub mod function;
@@ -22,6 +23,7 @@ pub mod web_search;
 pub use code_interpreter::CodeInterpreterHandler;
 pub use codex::{CodexNamespaceHandler, NamespaceMap, model_visible_namespace_member_name};
 pub use custom::CustomHandler;
+pub use declaration::{DeclaredTool, ToolDeclaration, ToolDeclarationRef, registry_tools};
 pub use executors::{GatewayExecutorRegistration, GatewayExecutors};
 pub use function::FunctionHandler;
 pub use handler::{GatewayExecutor, GatewayToolEventPlan, ToolError, ToolHandler, ToolOutput};
