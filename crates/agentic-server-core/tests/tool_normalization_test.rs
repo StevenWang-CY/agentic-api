@@ -7,6 +7,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use agentic_core::executor::RequestContext;
+use agentic_core::tool::responses_declarations;
 use agentic_core::tool::{
     CodexNamespaceHandler, GatewayExecutors, ToolDeclaration, ToolRegistry, ToolType,
     model_visible_namespace_member_name,
@@ -139,7 +140,7 @@ fn assert_tools_normalize(cassette_file: &str) {
         };
         let tools: Vec<ResponsesTool> = serde_json::from_value(tools_val).expect("tools parse");
         let resolved = CodexNamespaceHandler
-            .resolve_namespace_members(&tools)
+            .resolve_namespace_members(&responses_declarations(&tools))
             .unwrap_or_else(|err| panic!("{cassette_file} turn {i}: namespace resolution failed: {err}"));
         let normalized: Vec<_> = resolved.iter().flat_map(ToolDeclaration::to_function_tools).collect();
         for ft in &normalized {
@@ -183,9 +184,10 @@ async fn assert_registry_lookup(cassette_file: &str) {
         let Some(tools_val) = tools_from_turn(turn) else {
             continue;
         };
-        let mut tools: Vec<ResponsesTool> = serde_json::from_value(tools_val).expect("tools parse");
+        let tools: Vec<ResponsesTool> = serde_json::from_value(tools_val).expect("tools parse");
         let declared_tools = tools.clone();
-        let registry = ToolRegistry::build_with_handlers(&mut tools, &mut GatewayExecutors::default())
+        let mut declarations = responses_declarations(&tools);
+        let registry = ToolRegistry::build_with_handlers(&mut declarations, &mut GatewayExecutors::default())
             .await
             .unwrap_or_else(|err| panic!("{cassette_file} turn {i}: registry failed: {err}"));
         for tool in &declared_tools {
@@ -382,7 +384,7 @@ fn codex_namespace_cassettes_flatten_to_safe_upstream_function_name() {
             );
 
             let resolved = CodexNamespaceHandler
-                .resolve_namespace_members(&tools)
+                .resolve_namespace_members(&responses_declarations(&tools))
                 .unwrap_or_else(|err| panic!("{filename} turn {i}: namespace resolution failed: {err}"));
             assert!(
                 resolved.iter().any(|tool| {
@@ -426,7 +428,7 @@ fn codex_direct_vllm_flat_namespace_cassette_is_plain_function_tool() {
         );
 
         let flattened = CodexNamespaceHandler
-            .resolve_namespace_members(&tools)
+            .resolve_namespace_members(&responses_declarations(&tools))
             .unwrap_or_else(|err| panic!("{filename} turn {i}: namespace resolution failed: {err}"));
         assert_eq!(flattened.len(), 1);
         assert!(

@@ -752,6 +752,7 @@ mod tests {
         MAX_CONCURRENT_MATERIALIZATIONS,
     };
     use crate::executor::response_budget::ExecutorResponseBudget;
+    use crate::tool::ToolDeclaration;
     use crate::tool::{
         GatewayBinding, GatewayExecutor, GatewayExecutors, GatewayToolEventPlan, ToolError, ToolHandler, ToolOutput,
         ToolRegistry, ToolType,
@@ -1041,7 +1042,7 @@ mod tests {
             serde_json::from_value(serde_json::json!({"type": "web_search_preview"})).expect("web_search tool param");
         let mut executors = GatewayExecutors::default();
         executors.insert(Arc::new(SlowExecutor));
-        let mut tools = [web_search];
+        let mut tools = [ToolDeclaration::from(web_search)];
         let registry = ToolRegistry::build_with_handlers(&mut tools, &mut executors)
             .await
             .expect("registry builds");
@@ -1080,7 +1081,7 @@ mod tests {
         // output, not fail the whole request.
         let web_search: ResponsesTool =
             serde_json::from_value(serde_json::json!({"type": "web_search_preview"})).expect("web_search tool param");
-        let mut tools = [web_search];
+        let mut tools = [ToolDeclaration::from(web_search)];
         let mut executors = GatewayExecutors::default();
         let registry = ToolRegistry::build_with_handlers(&mut tools, &mut executors)
             .await
@@ -1113,7 +1114,7 @@ mod tests {
             serde_json::from_value(serde_json::json!({"type": "web_search_preview"})).expect("web_search tool param");
         let mut executors = GatewayExecutors::default();
         executors.insert(Arc::new(SizedOutputExecutor { bytes: 250 * 1024 + 1 }));
-        let mut tools = [web_search];
+        let mut tools = [ToolDeclaration::from(web_search)];
         let registry = ToolRegistry::build_with_handlers(&mut tools, &mut executors)
             .await
             .expect("registry builds");
@@ -1140,7 +1141,7 @@ mod tests {
         executors.insert(Arc::new(SizedErrorExecutor {
             message: "\"".repeat(crate::tool::handler::MAX_GATEWAY_TOOL_OUTPUT_BYTES / 2 + 1),
         }));
-        let mut tools = [web_search];
+        let mut tools = [ToolDeclaration::from(web_search)];
         let registry = ToolRegistry::build_with_handlers(&mut tools, &mut executors)
             .await
             .expect("registry builds");
@@ -1165,7 +1166,7 @@ mod tests {
         executors.insert(Arc::new(DrainTrackingExecutor {
             slow_call_finished: Arc::clone(&slow_call_finished),
         }));
-        let mut tools = [web_search];
+        let mut tools = [ToolDeclaration::from(web_search)];
         let registry = ToolRegistry::build_with_handlers(&mut tools, &mut executors)
             .await
             .expect("registry builds");
@@ -1202,7 +1203,7 @@ mod tests {
             entered: entered_tx,
             release: Arc::clone(&release),
         }));
-        let mut tools = [web_search];
+        let mut tools = [ToolDeclaration::from(web_search)];
         let registry = ToolRegistry::build_with_handlers(&mut tools, &mut executors)
             .await
             .expect("registry builds");
@@ -1257,7 +1258,7 @@ mod tests {
         .expect("file_search tool param");
         let web_search: ResponsesTool =
             serde_json::from_value(serde_json::json!({"type": "web_search_preview"})).expect("web_search tool param");
-        let mut tools = [file_search, web_search];
+        let mut tools = [ToolDeclaration::from(file_search), ToolDeclaration::from(web_search)];
         let mut executors = GatewayExecutors::default();
         let registry = ToolRegistry::build_with_handlers(&mut tools, &mut executors)
             .await
@@ -1319,7 +1320,7 @@ mod tests {
             serde_json::from_value(serde_json::json!({"type": "web_search_preview"})).expect("web_search tool param");
         let mut executors = GatewayExecutors::default();
         executors.insert(Arc::new(SlowExecutor));
-        let mut tools = [web_search];
+        let mut tools = [ToolDeclaration::from(web_search)];
         let registry = ToolRegistry::build_with_handlers(&mut tools, &mut executors)
             .await
             .expect("registry builds");
@@ -1354,7 +1355,7 @@ mod tests {
             serde_json::from_value(serde_json::json!({"type": "web_search_preview"})).expect("web_search tool param");
         let mut executors = GatewayExecutors::default();
         executors.insert(Arc::new(SlowExecutor));
-        let mut tools = [web_search];
+        let mut tools = [ToolDeclaration::from(web_search)];
         let registry = ToolRegistry::build_with_handlers(&mut tools, &mut executors)
             .await
             .expect("registry builds");
@@ -1419,7 +1420,7 @@ mod tests {
             serde_json::from_value(serde_json::json!({"type": "web_search_preview"})).expect("web_search tool param");
         let mut executors = GatewayExecutors::default();
         executors.insert(Arc::new(ExclusiveSlowExecutor));
-        let mut tools = [web_search];
+        let mut tools = [ToolDeclaration::from(web_search)];
         let registry = ToolRegistry::build_with_handlers(&mut tools, &mut executors)
             .await
             .expect("registry builds");

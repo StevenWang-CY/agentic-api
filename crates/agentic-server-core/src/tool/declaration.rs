@@ -1,14 +1,16 @@
-//! The tool layer's view of a declared tool, independent of the API that
+//! The tool layer's declaration of a tool, independent of the API that
 //! declared it.
 //!
 //! The Responses API declares tools as [`ResponsesTool`], a wire type; the
-//! Messages API declares them as Anthropic [`ToolParam`] blocks. Registry
-//! building, declaration validation, and normalization read both through
-//! [`ToolDeclarationRef`], the borrowed view every [`DeclaredTool`] yields, so
-//! there is one registry-building path and no API-specific variant leaks into
-//! the other API's wire enum. The Messages mapping ([`registry_tools`])
-//! produces owned [`ToolDeclaration`]s; that is where the Messages-only
-//! `web_fetch` declaration lives.
+//! Messages API declares them as Anthropic [`ToolParam`] blocks. Each adapter
+//! converts its declarations into [`ToolDeclaration`] at its boundary —
+//! [`responses_declarations`] for Responses, [`registry_tools`] for Messages —
+//! and registry building, validation, and normalization work on that one
+//! concrete type. What MCP discovery records on a declaration travels back to
+//! a Responses request through [`record_discovered_mcp_tools`], so no wire
+//! type carries tool-layer behaviour and no API-specific variant leaks into
+//! the other API's wire enum. The Messages-only `web_fetch` declaration lives
+//! here, in [`ToolDeclaration::WebFetch`].
 
 use crate::types::messages::request::ToolParam;
 use crate::types::messages::tool_seam::{
@@ -16,19 +18,17 @@ use crate::types::messages::tool_seam::{
 };
 use crate::types::tools::{
     CodeInterpreterToolParam, CodexNamespaceToolParam, CustomToolParam, DomainFilters, FileSearchToolParam,
-    FunctionToolParam, McpDiscoveredToolParam, McpToolParam, ResponsesTool, ShellToolParam, ToolSearchToolParam,
-    WebFetchToolParam, WebSearchToolParam, WebSearchUserLocation,
+    FunctionToolParam, McpToolParam, ResponsesTool, ShellToolParam, ToolSearchToolParam, WebFetchToolParam,
+    WebSearchToolParam, WebSearchUserLocation,
 };
 use crate::utils::common::deserialize_from_value_opt;
 
-/// A declared tool as the tool layer understands it, owned.
+/// A declared tool as the tool layer understands it.
 ///
 /// One variant per kind the gateway implements, plus [`Unsupported`] for a
 /// declaration of a kind it does not: that one registers nothing and is not
-/// sent upstream. [`registry_tools`] builds these for the Messages API; the
-/// Responses API reads its wire [`ResponsesTool`]s through [`DeclaredTool`]
-/// and never converts, and [`From<ResponsesTool>`] is the owned conversion
-/// for a caller that keeps one.
+/// sent upstream. [`registry_tools`] builds these for the Messages API;
+/// [`responses_declarations`] converts a Responses request's wire tools.
 ///
 /// [`Unsupported`]: ToolDeclaration::Unsupported
 #[derive(Debug, Clone)]
@@ -48,107 +48,6 @@ pub enum ToolDeclaration {
     Unsupported,
 }
 
-/// A borrowed view of a declared tool: what [`DeclaredTool::declaration`]
-/// yields for an owned [`ToolDeclaration`] and for a wire [`ResponsesTool`]
-/// alike, so the tool layer matches one shape.
-#[derive(Debug, Clone, Copy)]
-pub enum ToolDeclarationRef<'a> {
-    Function(&'a FunctionToolParam),
-    ToolSearch(&'a ToolSearchToolParam),
-    Mcp(&'a McpToolParam),
-    WebSearch(&'a WebSearchToolParam),
-    WebFetch(&'a WebFetchToolParam),
-    FileSearch(&'a FileSearchToolParam),
-    CodeInterpreter(&'a CodeInterpreterToolParam),
-    Shell(&'a ShellToolParam),
-    Namespace(&'a CodexNamespaceToolParam),
-    Custom(&'a CustomToolParam),
-    Unsupported,
-}
-
-impl ToolDeclarationRef<'_> {
-    /// An owned copy of the viewed declaration.
-    #[must_use]
-    pub fn to_declaration(self) -> ToolDeclaration {
-        match self {
-            Self::Function(param) => ToolDeclaration::Function(param.clone()),
-            Self::ToolSearch(param) => ToolDeclaration::ToolSearch(param.clone()),
-            Self::Mcp(param) => ToolDeclaration::Mcp(param.clone()),
-            Self::WebSearch(param) => ToolDeclaration::WebSearch(param.clone()),
-            Self::WebFetch(param) => ToolDeclaration::WebFetch(param.clone()),
-            Self::FileSearch(param) => ToolDeclaration::FileSearch(param.clone()),
-            Self::CodeInterpreter(param) => ToolDeclaration::CodeInterpreter(param.clone()),
-            Self::Shell(param) => ToolDeclaration::Shell(param.clone()),
-            Self::Namespace(param) => ToolDeclaration::Namespace(param.clone()),
-            Self::Custom(param) => ToolDeclaration::Custom(param.clone()),
-            Self::Unsupported => ToolDeclaration::Unsupported,
-        }
-    }
-}
-
-/// A declared tool the registry can build from: anything that yields the
-/// tool layer's view of itself and can record what MCP discovery found.
-///
-/// Implemented by the owned [`ToolDeclaration`] (Messages) and by the wire
-/// [`ResponsesTool`] (Responses), so `ToolRegistry::build_with_handlers` is
-/// one path for both APIs and a Responses request keeps its own declarations,
-/// with discovered MCP tools written into them, for storage and replay.
-pub trait DeclaredTool {
-    /// The tool layer's view of this declaration.
-    fn declaration(&self) -> ToolDeclarationRef<'_>;
-
-    /// Records the tools an `mcp` declaration's discovery found, so the request
-    /// sends them upstream and stores them. A no-op for every other kind.
-    fn set_discovered_mcp_tools(&mut self, tools: Vec<McpDiscoveredToolParam>);
-}
-
-impl DeclaredTool for ToolDeclaration {
-    fn declaration(&self) -> ToolDeclarationRef<'_> {
-        match self {
-            Self::Function(param) => ToolDeclarationRef::Function(param),
-            Self::ToolSearch(param) => ToolDeclarationRef::ToolSearch(param),
-            Self::Mcp(param) => ToolDeclarationRef::Mcp(param),
-            Self::WebSearch(param) => ToolDeclarationRef::WebSearch(param),
-            Self::WebFetch(param) => ToolDeclarationRef::WebFetch(param),
-            Self::FileSearch(param) => ToolDeclarationRef::FileSearch(param),
-            Self::CodeInterpreter(param) => ToolDeclarationRef::CodeInterpreter(param),
-            Self::Shell(param) => ToolDeclarationRef::Shell(param),
-            Self::Namespace(param) => ToolDeclarationRef::Namespace(param),
-            Self::Custom(param) => ToolDeclarationRef::Custom(param),
-            Self::Unsupported => ToolDeclarationRef::Unsupported,
-        }
-    }
-
-    fn set_discovered_mcp_tools(&mut self, tools: Vec<McpDiscoveredToolParam>) {
-        if let Self::Mcp(param) = self {
-            param.discovered_tools = tools;
-        }
-    }
-}
-
-impl DeclaredTool for ResponsesTool {
-    fn declaration(&self) -> ToolDeclarationRef<'_> {
-        match self {
-            Self::Function(param) => ToolDeclarationRef::Function(param),
-            Self::ToolSearch(param) => ToolDeclarationRef::ToolSearch(param),
-            Self::Mcp(param) => ToolDeclarationRef::Mcp(param),
-            Self::WebSearch(param) => ToolDeclarationRef::WebSearch(param),
-            Self::FileSearch(param) => ToolDeclarationRef::FileSearch(param),
-            Self::CodeInterpreter(param) => ToolDeclarationRef::CodeInterpreter(param),
-            Self::Shell(param) => ToolDeclarationRef::Shell(param),
-            Self::Namespace(param) => ToolDeclarationRef::Namespace(param),
-            Self::Custom(param) => ToolDeclarationRef::Custom(param),
-            Self::Unknown => ToolDeclarationRef::Unsupported,
-        }
-    }
-
-    fn set_discovered_mcp_tools(&mut self, tools: Vec<McpDiscoveredToolParam>) {
-        if let Self::Mcp(param) = self {
-            param.discovered_tools = tools;
-        }
-    }
-}
-
 impl From<ResponsesTool> for ToolDeclaration {
     fn from(tool: ResponsesTool) -> Self {
         match tool {
@@ -162,6 +61,52 @@ impl From<ResponsesTool> for ToolDeclaration {
             ResponsesTool::Namespace(param) => Self::Namespace(param),
             ResponsesTool::Custom(param) => Self::Custom(param),
             ResponsesTool::Unknown => Self::Unsupported,
+        }
+    }
+}
+
+/// The conversion for a wire declaration the request keeps: the typed
+/// parameters are cloned into the internal declaration.
+impl From<&ResponsesTool> for ToolDeclaration {
+    fn from(tool: &ResponsesTool) -> Self {
+        match tool {
+            ResponsesTool::Function(param) => Self::Function(param.clone()),
+            ResponsesTool::ToolSearch(param) => Self::ToolSearch(param.clone()),
+            ResponsesTool::Mcp(param) => Self::Mcp(param.clone()),
+            ResponsesTool::WebSearch(param) => Self::WebSearch(param.clone()),
+            ResponsesTool::FileSearch(param) => Self::FileSearch(param.clone()),
+            ResponsesTool::CodeInterpreter(param) => Self::CodeInterpreter(param.clone()),
+            ResponsesTool::Shell(param) => Self::Shell(param.clone()),
+            ResponsesTool::Namespace(param) => Self::Namespace(param.clone()),
+            ResponsesTool::Custom(param) => Self::Custom(param.clone()),
+            ResponsesTool::Unknown => Self::Unsupported,
+        }
+    }
+}
+
+/// The Responses adapter boundary: a request's declared tools as the
+/// declarations the tool layer builds, validates, and normalizes from. The
+/// request keeps its wire tools; the tool layer never sees the wire enum.
+#[must_use]
+pub fn responses_declarations(tools: &[ResponsesTool]) -> Vec<ToolDeclaration> {
+    tools.iter().map(ToolDeclaration::from).collect()
+}
+
+/// Record what MCP discovery found back into a Responses request's wire
+/// declarations, so the discovered tools go upstream and are stored with the
+/// request. `declarations` are the request's tools as [`responses_declarations`]
+/// converted them, in the same order, after the registry was built from them;
+/// each `mcp` pair carries its discovered tools across and every other kind is
+/// left as the client declared it.
+pub fn record_discovered_mcp_tools(declarations: Vec<ToolDeclaration>, tools: &mut [ResponsesTool]) {
+    debug_assert_eq!(
+        declarations.len(),
+        tools.len(),
+        "declarations mirror the request's tools"
+    );
+    for (declaration, tool) in declarations.into_iter().zip(tools) {
+        if let (ToolDeclaration::Mcp(discovered), ResponsesTool::Mcp(declared)) = (declaration, tool) {
+            declared.discovered_tools = discovered.discovered_tools;
         }
     }
 }
@@ -251,6 +196,7 @@ mod tests {
     use super::*;
     use crate::tool::ToolType;
     use crate::types::messages::request::MessagesRequest;
+    use crate::types::tools::McpDiscoveredToolParam;
 
     fn tools_of(json_req: Value) -> Option<Vec<ToolParam>> {
         serde_json::from_value::<MessagesRequest>(json_req).unwrap().tools
@@ -362,7 +308,7 @@ mod tests {
     }
 
     #[test]
-    fn a_wire_declaration_and_its_converted_form_yield_the_same_view() {
+    fn a_wire_declaration_converts_to_the_same_kind_by_reference_and_by_value() {
         let tools = wire(json!([
             {"type": "function", "name": "get_weather"},
             {"type": "tool_search", "execution": "client"},
@@ -375,12 +321,15 @@ mod tests {
             {"type": "custom", "name": "raw"},
             {"type": "something_new"}
         ]));
-        let kinds: Vec<Option<ToolType>> = tools.iter().map(|tool| tool.declaration().tool_type()).collect();
+        let by_reference: Vec<Option<ToolType>> = responses_declarations(&tools)
+            .iter()
+            .map(ToolDeclaration::tool_type)
+            .collect();
         let converted: Vec<ToolDeclaration> = tools.into_iter().map(ToolDeclaration::from).collect();
-        let converted_kinds: Vec<Option<ToolType>> = converted.iter().map(ToolDeclaration::tool_type).collect();
-        assert_eq!(kinds, converted_kinds);
+        let by_value: Vec<Option<ToolType>> = converted.iter().map(ToolDeclaration::tool_type).collect();
+        assert_eq!(by_reference, by_value);
         assert_eq!(
-            kinds,
+            by_value,
             vec![
                 Some(ToolType::Function),
                 Some(ToolType::ToolSearch),
@@ -396,13 +345,13 @@ mod tests {
         );
         assert!(matches!(converted.last(), Some(ToolDeclaration::Unsupported)));
         assert!(matches!(
-            converted[0].declaration().to_declaration(),
+            &converted[0],
             ToolDeclaration::Function(function) if function.name.as_str() == "get_weather"
         ));
     }
 
     #[test]
-    fn discovered_mcp_tools_are_recorded_on_both_declaration_kinds() {
+    fn discovered_mcp_tools_are_recorded_back_into_the_responses_declarations() {
         let discovered = vec![McpDiscoveredToolParam {
             server_label: "docs".to_owned(),
             tool_name: "lookup".to_owned(),
@@ -416,22 +365,22 @@ mod tests {
             {"type": "function", "name": "get_weather"},
             {"type": "mcp", "server_label": "docs", "server_url": "http://127.0.0.1:1/mcp"}
         ]));
-        tools[0].set_discovered_mcp_tools(discovered.clone());
-        tools[1].set_discovered_mcp_tools(discovered.clone());
-        let ResponsesTool::Mcp(param) = &tools[1] else {
-            panic!("mcp declaration")
+        let mut declarations = responses_declarations(&tools);
+        let ToolDeclaration::Mcp(param) = &mut declarations[1] else {
+            panic!("expected an mcp declaration, got {declarations:?}");
         };
-        assert_eq!(param.discovered_tools.len(), 1);
-        assert!(
-            matches!(&tools[0], ResponsesTool::Function(_)),
-            "other kinds are untouched"
-        );
+        param.discovered_tools = discovered;
 
-        let mut declaration = ToolDeclaration::from(tools[1].clone());
-        declaration.set_discovered_mcp_tools(Vec::new());
-        let ToolDeclarationRef::Mcp(param) = declaration.declaration() else {
-            panic!("mcp declaration")
+        record_discovered_mcp_tools(declarations, &mut tools);
+
+        let ResponsesTool::Mcp(recorded) = &tools[1] else {
+            panic!("expected the mcp wire declaration, got {tools:?}");
         };
-        assert!(param.discovered_tools.is_empty());
+        assert_eq!(recorded.discovered_tools.len(), 1);
+        assert_eq!(recorded.discovered_tools[0].internal_name, "mcp__docs__lookup");
+        assert!(matches!(
+            &tools[0],
+            ResponsesTool::Function(function) if function.name.as_str() == "get_weather"
+        ));
     }
 }

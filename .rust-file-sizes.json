@@ -34,7 +34,7 @@
       "reason": "Gateway-owned code-interpreter calls emit their public SSE lifecycle through the existing scheduler after policy extraction."
     },
     "crates/agentic-server-core/src/tool/registry.rs": {
-      "limit": 544,
+      "limit": 545,
       "reason": "The web_fetch executor binds through the existing registry validation and executor registration flow, like the code interpreter."
     },
     "crates/agentic-server-core/src/tool/tool_search.rs": {

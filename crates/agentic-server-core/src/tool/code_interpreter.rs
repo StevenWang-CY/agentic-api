@@ -1,6 +1,6 @@
 //! Gateway-executed Python code interpreter and backend-independent public projection.
 
-use super::declaration::{DeclaredTool, ToolDeclarationRef};
+use super::declaration::ToolDeclaration;
 use crate::types::io::FunctionTool;
 use crate::types::tools::CodeInterpreterToolParam;
 
@@ -13,10 +13,10 @@ pub(crate) const CODE_INTERPRETER_FUNCTION_NAME: &str = "code_interpreter";
 pub struct CodeInterpreterHandler;
 
 impl CodeInterpreterHandler {
-    pub(crate) fn validate_declarations<D: DeclaredTool>(tools: &[D]) -> Result<(), ToolError> {
+    pub(crate) fn validate_declarations(tools: &[ToolDeclaration]) -> Result<(), ToolError> {
         let declarations = tools
             .iter()
-            .filter(|tool| matches!(tool.declaration(), ToolDeclarationRef::CodeInterpreter(_)))
+            .filter(|tool| matches!(tool, ToolDeclaration::CodeInterpreter(_)))
             .count();
         if declarations > 1 {
             return Err(ToolError::Config(
@@ -27,9 +27,9 @@ impl CodeInterpreterHandler {
             return Ok(());
         }
         for tool in tools {
-            let conflicts = match tool.declaration() {
-                ToolDeclarationRef::Function(function) => function.name.as_str() == CODE_INTERPRETER_FUNCTION_NAME,
-                ToolDeclarationRef::Custom(custom) => custom.name.as_str() == CODE_INTERPRETER_FUNCTION_NAME,
+            let conflicts = match tool {
+                ToolDeclaration::Function(function) => function.name.as_str() == CODE_INTERPRETER_FUNCTION_NAME,
+                ToolDeclaration::Custom(custom) => custom.name.as_str() == CODE_INTERPRETER_FUNCTION_NAME,
                 _ => false,
             };
             if conflicts {

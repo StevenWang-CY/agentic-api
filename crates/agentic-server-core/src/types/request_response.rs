@@ -6,7 +6,7 @@ use serde_json::{Map, Value};
 
 use super::io::{FunctionTool, InputItem, MultiAgentConfig, OutputItem, ResponseUsage, ResponsesInput, ToolChoice};
 use super::tools::ResponsesTool;
-use crate::tool::{CodexNamespaceHandler, CustomHandler, ToolDeclaration, ToolError};
+use crate::tool::{CodexNamespaceHandler, CustomHandler, ToolDeclaration, ToolError, responses_declarations};
 
 mod response_stream;
 mod serde_helpers;
@@ -254,6 +254,13 @@ impl<T: ?Sized> RequestPayload<T> {
 }
 
 impl RequestPayload {
+    /// The Responses adapter boundary: this request's declared tools as the
+    /// tool layer's declarations, with the wire tools left in place.
+    #[must_use]
+    pub fn tool_declarations(&self) -> Option<Vec<ToolDeclaration>> {
+        self.tools.as_deref().map(responses_declarations)
+    }
+
     /// Construct an `UpstreamRequest` suitable for forwarding to vLLM.
     ///
     /// Codex `namespace` tools' members are first renamed to their flat,
@@ -277,8 +284,8 @@ impl RequestPayload {
         // handler's same-tool parallel-safety policy to whatever calls appear.
         let parallel_tool_calls = Some(self.parallel_tool_calls.unwrap_or(false));
 
-        let renamed_tools = self
-            .tools
+        let declarations = self.tool_declarations();
+        let renamed_tools = declarations
             .as_deref()
             .map(|tools| CodexNamespaceHandler.resolve_namespace_members(tools))
             .transpose()?;
@@ -295,10 +302,10 @@ impl RequestPayload {
                 .collect()
         });
         let tools = tools.filter(|tools| !tools.is_empty());
-        let namespace_map = CodexNamespaceHandler.build_namespace_map(self.tools.as_deref())?;
+        let namespace_map = CodexNamespaceHandler.build_namespace_map(declarations.as_deref())?;
         let input = CodexNamespaceHandler.resolve_input(namespace_map.as_ref(), self.input.normalized_model_input());
         let tool_choice = CodexNamespaceHandler.resolve_tool_choice(namespace_map.as_ref(), self.tool_choice.as_ref());
-        CustomHandler::validate_tool_choice(self.tools.as_deref(), &tool_choice)?;
+        CustomHandler::validate_tool_choice(declarations.as_deref(), &tool_choice)?;
         Ok(UpstreamRequest {
             model: &self.model,
             input,

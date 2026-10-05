@@ -30,9 +30,11 @@ All notable changes to Agentic API are documented here.
   entry as a host name (`web_search` keeps its non-empty-entry rule in the Messages adapter); the request and
   response wire shapes are unchanged, and the OpenAPI component is named `DomainFilters`.
 - `agentic_core`: `ToolOutput` carries an explicit success/failure status set by the handler, which the Messages
-  loop reports as `is_error`; the request-scoped tool registry is built from a protocol-neutral `ToolDeclaration`
-  through one path for both APIs, so the Responses `ResponsesTool` wire enum no longer carries the Messages-only
-  `web_fetch` variant, and `registry_tools` moved to `agentic_core::tool`.
+  loop reports as `is_error`; the request-scoped tool registry and the declaration helpers take one concrete
+  `ToolDeclaration`, which each API converts to at its adapter boundary (`responses_declarations` for the Responses
+  wire tools, `registry_tools` for Messages), so `ResponsesTool` is a pure wire enum without the Messages-only
+  `web_fetch` variant and without declaration behaviour; discovered MCP tools reach a Responses request through
+  `record_discovered_mcp_tools`.
 
 ## [0.9.0] - 2026-09-30
 

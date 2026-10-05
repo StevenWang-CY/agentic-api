@@ -167,9 +167,9 @@ fn restore_response_map_with_map(object: &mut Map<String, Value>, map: &Namespac
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tool::CodexNamespaceHandler;
     use crate::tool::ToolDeclaration;
     use crate::tool::codex::model_visible_namespace_member_name;
+    use crate::tool::{CodexNamespaceHandler, responses_declarations};
     use crate::types::event::MessageStatus;
     use crate::types::io::ToolChoice;
     use crate::types::tools::{CodexNamespaceMember, NonEmptyToolName, ResponsesTool};
@@ -188,14 +188,16 @@ mod tests {
     fn long_namespace_member_round_trips_through_shortened_name() {
         let namespace = "mcp__codex_apps__github";
         let member = "_remove_reaction_from_pr_review_comment";
-        let tools: Vec<ResponsesTool> = serde_json::from_value(serde_json::json!([
-            {
-                "type": "namespace",
-                "name": namespace,
-                "tools": [{"type": "function", "name": member}]
-            }
-        ]))
-        .unwrap();
+        let tools = responses_declarations(
+            &serde_json::from_value::<Vec<ResponsesTool>>(serde_json::json!([
+                {
+                    "type": "namespace",
+                    "name": namespace,
+                    "tools": [{"type": "function", "name": member}]
+                }
+            ]))
+            .unwrap(),
+        );
         let upstream_name = model_visible_namespace_member_name(namespace, member);
         let mut output = vec![completed_call(&upstream_name, "{}")];
 
@@ -233,14 +235,16 @@ mod tests {
     }
     #[test]
     fn flat_namespace_member_call_preserves_tools_argument() {
-        let tools: Vec<ResponsesTool> = serde_json::from_value(serde_json::json!([
-            {
-                "type": "namespace",
-                "name": "mcp__agentic_fixture",
-                "tools": [{"type": "function", "name": "run"}]
-            }
-        ]))
-        .unwrap();
+        let tools = responses_declarations(
+            &serde_json::from_value::<Vec<ResponsesTool>>(serde_json::json!([
+                {
+                    "type": "namespace",
+                    "name": "mcp__agentic_fixture",
+                    "tools": [{"type": "function", "name": "run"}]
+                }
+            ]))
+            .unwrap(),
+        );
         let mut output = vec![completed_call(
             "agentic_ns__mcp__agentic_fixture__run",
             "{\"tools\":\"legitimate\",\"cmd\":\"pwd\"}",
@@ -260,14 +264,16 @@ mod tests {
     }
     #[test]
     fn plain_function_call_round_trip() {
-        let tools: Vec<ResponsesTool> = serde_json::from_value(serde_json::json!([
-            {
-                "type": "function",
-                "name": "get_weather",
-                "parameters": {"type": "object"}
-            }
-        ]))
-        .unwrap();
+        let tools = responses_declarations(
+            &serde_json::from_value::<Vec<ResponsesTool>>(serde_json::json!([
+                {
+                    "type": "function",
+                    "name": "get_weather",
+                    "parameters": {"type": "object"}
+                }
+            ]))
+            .unwrap(),
+        );
         let resolved = CodexNamespaceHandler
             .resolve_namespace_members(&tools)
             .expect("valid namespace members");
@@ -291,14 +297,16 @@ mod tests {
     }
     #[test]
     fn response_value_normalizes_nested_function_call_item() {
-        let tools: Vec<ResponsesTool> = serde_json::from_value(serde_json::json!([
-            {
-                "type": "namespace",
-                "name": "mcp__agentic_fixture",
-                "tools": [{"type": "function", "name": "add_numbers"}]
-            }
-        ]))
-        .unwrap();
+        let tools = responses_declarations(
+            &serde_json::from_value::<Vec<ResponsesTool>>(serde_json::json!([
+                {
+                    "type": "namespace",
+                    "name": "mcp__agentic_fixture",
+                    "tools": [{"type": "function", "name": "add_numbers"}]
+                }
+            ]))
+            .unwrap(),
+        );
         let mut value = serde_json::json!({
             "type": "response.output_item.done",
             "item": {
@@ -319,12 +327,14 @@ mod tests {
     }
     #[test]
     fn response_lifecycle_metadata_restores_public_namespace_tool_choice() {
-        let tools: Vec<ResponsesTool> = serde_json::from_value(serde_json::json!([{
-            "type": "namespace",
-            "name": "travel",
-            "tools": [{"type": "function", "name": "get_timezone"}]
-        }]))
-        .unwrap();
+        let tools = responses_declarations(
+            &serde_json::from_value::<Vec<ResponsesTool>>(serde_json::json!([{
+                "type": "namespace",
+                "name": "travel",
+                "tools": [{"type": "function", "name": "get_timezone"}]
+            }]))
+            .unwrap(),
+        );
         let map = CodexNamespaceHandler
             .build_namespace_map(Some(&tools))
             .expect("valid namespace map");
@@ -351,14 +361,16 @@ mod tests {
     }
     #[test]
     fn namespace_wire_translation_preserves_provider_fields() {
-        let tools: Vec<ResponsesTool> = serde_json::from_value(serde_json::json!([
-            {
-                "type": "namespace",
-                "name": "mcp__agentic_fixture",
-                "tools": [{"type": "function", "name": "add_numbers"}]
-            }
-        ]))
-        .unwrap();
+        let tools = responses_declarations(
+            &serde_json::from_value::<Vec<ResponsesTool>>(serde_json::json!([
+                {
+                    "type": "namespace",
+                    "name": "mcp__agentic_fixture",
+                    "tools": [{"type": "function", "name": "add_numbers"}]
+                }
+            ]))
+            .unwrap(),
+        );
         let map = CodexNamespaceHandler
             .build_namespace_map(Some(&tools))
             .expect("valid namespace map");

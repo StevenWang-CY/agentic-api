@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
-use crate::tool::declaration::{DeclaredTool, ToolDeclarationRef};
+use crate::tool::declaration::ToolDeclaration;
 use crate::tool::handler::MAX_GATEWAY_TOOL_OUTPUT_BYTES;
 use crate::tool::{GatewayExecutor, GatewayToolEventPlan, ToolError, ToolHandler, ToolOutput, ToolType};
 use crate::types::io::FunctionTool;
@@ -94,10 +94,10 @@ impl McpHandler {
     ///
     /// Returns [`ToolError::Config`] when multiple MCP declarations use the
     /// same `server_label`.
-    pub(crate) fn validate_server_labels<D: DeclaredTool>(tools: &[D]) -> Result<(), ToolError> {
+    pub(crate) fn validate_server_labels(tools: &[ToolDeclaration]) -> Result<(), ToolError> {
         let mut server_labels = HashSet::new();
-        for param in tools.iter().filter_map(|tool| match tool.declaration() {
-            ToolDeclarationRef::Mcp(param) => Some(param),
+        for param in tools.iter().filter_map(|tool| match tool {
+            ToolDeclaration::Mcp(param) => Some(param),
             _ => None,
         }) {
             if !server_labels.insert(param.server_label.clone()) {

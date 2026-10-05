@@ -697,15 +697,16 @@ mod tests {
         });
 
         let tool: ResponsesTool = serde_json::from_value(declaration.clone()).expect("valid tool-search declaration");
+        let normalized = crate::tool::ToolDeclaration::from(&tool);
 
         assert_eq!(tool.original_type(), Some("tool_search"));
-        assert_eq!(tool.tool_type(), Some(crate::tool::ToolType::ToolSearch));
+        assert_eq!(normalized.tool_type(), Some(crate::tool::ToolType::ToolSearch));
         assert!(
-            !tool.is_gateway_owned(),
+            !normalized.is_gateway_owned(),
             "client-executed tool search must bypass gateway dispatch"
         );
         assert_eq!(
-            serde_json::to_value(tool.to_function_tools()).unwrap(),
+            serde_json::to_value(normalized.to_function_tools()).unwrap(),
             serde_json::json!([{
                 "type": "function",
                 "name": "tool_search",
@@ -731,7 +732,9 @@ mod tests {
 
         let tool: ResponsesTool = serde_json::from_value(declaration.clone()).expect("valid minimal declaration");
 
-        tool.validate().expect("omitted optional fields are valid");
+        crate::tool::ToolDeclaration::from(&tool)
+            .validate()
+            .expect("omitted optional fields are valid");
         assert_eq!(serde_json::to_value(tool).expect("tool serializes"), declaration);
     }
 
@@ -768,7 +771,8 @@ mod tests {
 
         assert_eq!(serde_json::to_value(&tool).expect("tool serializes"), declaration);
         assert!(
-            tool.validate()
+            crate::tool::ToolDeclaration::from(&tool)
+                .validate()
                 .expect_err("private function lowering requires an object schema")
                 .to_string()
                 .contains("parameters must be a JSON object")
@@ -790,7 +794,8 @@ mod tests {
             }))
             .expect("structurally valid declaration");
 
-            tool.validate()
+            crate::tool::ToolDeclaration::from(&tool)
+                .validate()
                 .expect("typed public values are normalized only when building the private synthetic function");
         }
     }

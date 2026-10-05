@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use super::code_interpreter::CodeInterpreterHandler;
-use super::declaration::{DeclaredTool, ToolDeclarationRef};
+use super::declaration::ToolDeclaration;
 use super::mcp::handler::McpServerToolSet;
 use super::mcp::{McpClientPool, McpDiscoveredHandler, McpHandler};
 use super::normalize::code_interpreter_unavailable_error;
@@ -197,17 +197,17 @@ impl GatewayExecutors {
     /// This runs before request state may be persisted, and again after
     /// conversation settings are rehydrated, so an inherited declaration
     /// cannot bypass operator gating.
-    pub(crate) fn validate_declarations<D: DeclaredTool>(&self, tools: Option<&[D]>) -> Result<(), ToolError> {
+    pub(crate) fn validate_declarations(&self, tools: Option<&[ToolDeclaration]>) -> Result<(), ToolError> {
         let Some(tools) = tools else {
             return Ok(());
         };
         CodeInterpreterHandler::validate_declarations(tools)?;
         for tool in tools {
-            tool.declaration().validate()?;
+            tool.validate()?;
         }
         if tools
             .iter()
-            .any(|tool| matches!(tool.declaration(), ToolDeclarationRef::CodeInterpreter(_)))
+            .any(|tool| matches!(tool, ToolDeclaration::CodeInterpreter(_)))
         {
             let ready = self.code_interpreter.is_some();
             if !ready {
@@ -403,6 +403,7 @@ impl std::fmt::Debug for GatewayExecutors {
 
 #[cfg(test)]
 mod tests {
+    use crate::tool::ToolDeclaration;
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -489,11 +490,13 @@ mod tests {
 
     #[test]
     fn request_validation_rejects_code_interpreter_without_a_ready_executor() {
-        let tools = [serde_json::from_value::<ResponsesTool>(serde_json::json!({
-            "type": "code_interpreter",
-            "container": {"type": "auto"}
-        }))
-        .expect("valid declaration")];
+        let tools = [ToolDeclaration::from(
+            serde_json::from_value::<ResponsesTool>(serde_json::json!({
+                "type": "code_interpreter",
+                "container": {"type": "auto"}
+            }))
+            .expect("valid declaration"),
+        )];
 
         let error = GatewayExecutors::default()
             .validate_declarations(Some(&tools))

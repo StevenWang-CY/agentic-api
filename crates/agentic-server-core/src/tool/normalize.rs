@@ -1,11 +1,10 @@
 use crate::types::io::FunctionTool;
 use crate::types::io::input::FunctionToolResultMessage;
-use crate::types::tools::ResponsesTool;
 
 use super::code_interpreter::CodeInterpreterHandler;
 use super::codex::CodexNamespaceHandler;
 use super::custom::CustomHandler;
-use super::declaration::{DeclaredTool, ToolDeclaration, ToolDeclarationRef};
+use super::declaration::ToolDeclaration;
 use super::function::FunctionHandler;
 use super::handler::{ToolError, ToolHandler, ToolOutput};
 use super::mcp::McpHandler;
@@ -27,17 +26,18 @@ pub(crate) fn code_interpreter_unavailable_error() -> ToolError {
     ToolError::Config(CODE_INTERPRETER_UNAVAILABLE.to_owned())
 }
 
-/// Declaration-level validation and normalization, implemented once on the
-/// tool layer's view of a declaration and reached from both the owned
-/// [`ToolDeclaration`] and the wire [`ResponsesTool`].
-impl ToolDeclarationRef<'_> {
+/// Declaration-level validation and normalization through the tool handlers.
+/// Both APIs reach these on their converted declarations: the Responses
+/// request path (`RequestPayload::to_upstream_request`) and request
+/// validation, and the Messages registry build.
+impl ToolDeclaration {
     /// Validate this declaration through its tool handler before normalization.
     ///
     /// # Errors
     ///
     /// Returns [`ToolError::Config`] when the declaration cannot be safely
     /// represented by the corresponding model-visible tool.
-    pub fn validate(self) -> Result<(), ToolError> {
+    pub fn validate(&self) -> Result<(), ToolError> {
         match self {
             Self::Function(param) => FunctionHandler.validate(param),
             Self::Mcp(param) => McpHandler::spec_from_param(param).validate(param),
@@ -55,7 +55,7 @@ impl ToolDeclarationRef<'_> {
 
     /// Return the gateway routing type this declaration would register as.
     #[must_use]
-    pub fn tool_type(self) -> Option<ToolType> {
+    pub fn tool_type(&self) -> Option<ToolType> {
         match self {
             Self::Function(_) => Some(ToolType::Function),
             Self::ToolSearch(_) => Some(ToolType::ToolSearch),
@@ -72,7 +72,7 @@ impl ToolDeclarationRef<'_> {
     }
 
     #[must_use]
-    pub fn is_gateway_owned(self) -> bool {
+    pub fn is_gateway_owned(&self) -> bool {
         self.tool_type().is_some_and(ToolType::is_gateway_owned)
     }
 
@@ -98,7 +98,7 @@ impl ToolDeclarationRef<'_> {
     ///
     /// [`From<&FunctionToolParam>`]: crate::types::tools::FunctionToolParam
     #[must_use]
-    pub fn to_function_tools(self) -> Vec<FunctionTool> {
+    pub fn to_function_tools(&self) -> Vec<FunctionTool> {
         match self {
             // name is NonEmptyToolName — empty names are rejected by serde at
             // deserialization time, so no runtime check is needed here.
@@ -123,69 +123,6 @@ impl ToolDeclarationRef<'_> {
     }
 }
 
-impl ToolDeclaration {
-    /// Validate this declaration through its tool handler before normalization.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ToolError::Config`] when the declaration cannot be safely
-    /// represented by the corresponding model-visible tool.
-    pub fn validate(&self) -> Result<(), ToolError> {
-        self.declaration().validate()
-    }
-
-    /// Return the gateway routing type this declaration would register as.
-    #[must_use]
-    pub fn tool_type(&self) -> Option<ToolType> {
-        self.declaration().tool_type()
-    }
-
-    #[must_use]
-    pub fn is_gateway_owned(&self) -> bool {
-        self.declaration().is_gateway_owned()
-    }
-
-    /// The `FunctionTool`s vLLM sees for this declaration; see
-    /// [`ToolDeclarationRef::to_function_tools`].
-    #[must_use]
-    pub fn to_function_tools(&self) -> Vec<FunctionTool> {
-        self.declaration().to_function_tools()
-    }
-}
-
-/// The wire declaration reaches the same handler contract through its view;
-/// the Responses request path (`RequestPayload::to_upstream_request`) and
-/// request validation call these.
-impl ResponsesTool {
-    /// Validate this declaration through its tool handler before normalization.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ToolError::Config`] when the declaration cannot be safely
-    /// represented by the corresponding model-visible tool.
-    pub fn validate(&self) -> Result<(), ToolError> {
-        self.declaration().validate()
-    }
-
-    /// Return the gateway routing type this declaration would register as.
-    #[must_use]
-    pub fn tool_type(&self) -> Option<ToolType> {
-        self.declaration().tool_type()
-    }
-
-    #[must_use]
-    pub fn is_gateway_owned(&self) -> bool {
-        self.declaration().is_gateway_owned()
-    }
-
-    /// The `FunctionTool`s vLLM sees for this declaration; see
-    /// [`ToolDeclarationRef::to_function_tools`].
-    #[must_use]
-    pub fn to_function_tools(&self) -> Vec<FunctionTool> {
-        self.declaration().to_function_tools()
-    }
-}
-
 impl From<ToolOutput> for FunctionToolResultMessage {
     fn from(o: ToolOutput) -> Self {
         Self {
@@ -198,6 +135,7 @@ impl From<ToolOutput> for FunctionToolResultMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::tools::ResponsesTool;
 
     #[test]
     fn code_interpreter_normalizes_to_its_fixed_function_contract() {
@@ -207,7 +145,7 @@ mod tests {
         }))
         .expect("tool parses");
 
-        let [function] = tool
+        let [function] = ToolDeclaration::from(tool)
             .to_function_tools()
             .try_into()
             .expect("normalization emits exactly one function");

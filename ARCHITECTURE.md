@@ -445,10 +445,11 @@ access happen — those live in `tool/`, `executor/`, and `storage/` respectivel
   `ResponsesTool` (tagged enum: `Function`, `ToolSearch`, `Mcp`, `WebSearch`, `FileSearch`,
   `CodeInterpreter`, `Namespace`, `Custom`, `Unknown`) and each variant's param struct.
   This is a good concrete example of the module boundary: `ResponsesTool` is *defined*
-  here as a pure wire shape; the tool layer reads it through `tool/declaration.rs`'s
-  `DeclaredTool` view (`ToolDeclarationRef`), and its behavior — `validate()` and
-  `to_function_tools()` — is implemented on that view in `tool/normalize.rs`, which
-  delegates to per-type handlers. Types own the shape; tool owns what it means.
+  here as a pure wire shape; the Responses adapter converts it into the tool layer's
+  `ToolDeclaration` (`tool/declaration.rs`, `responses_declarations`), and the
+  declaration's behavior — `validate()` and `to_function_tools()` — is implemented on
+  that one internal type in `tool/normalize.rs`, which delegates to per-type handlers.
+  Types own the shape; tool owns what it means.
 - **`types/messages/`** — a separate, parallel type layer for the Anthropic Messages
   API (`MessagesRequest`, `ContentBlock`, etc.). `tool_seam.rs` is the pure, I/O-free
   adapter for `tool_use`/`tool_result` blocks and the gateway-ownership map; the
@@ -1230,14 +1231,16 @@ the operator enables it, and Eryx runtime readiness succeeds.
 | `GatewayExecutor` and `gateway.rs` | Execute gateway-owned calls and map their start, completion, failure, result, and public output lifecycle. |
 | `GatewayStreamAccumulator` | Project gateway and upstream lifecycle frames into one continuous, correctly indexed and sequenced client stream. |
 
-- **`declaration.rs`** — the protocol-neutral `ToolDeclaration` (owned; what the Messages
-  mapping `registry_tools` produces), the borrowed `ToolDeclarationRef` view, and the
-  `DeclaredTool` trait that both it and the wire `ResponsesTool` implement, so the registry
-  and the normalization helpers read one shape for both APIs.
+- **`declaration.rs`** — the protocol-neutral `ToolDeclaration`, the one concrete type the
+  registry and the declaration helpers accept, and each API's conversion into it at its
+  adapter boundary: `responses_declarations` (and `From<ResponsesTool>`) for the Responses
+  wire enum, `registry_tools` for the Messages `ToolParam` blocks. What MCP discovery
+  records on a declaration is propagated back into a Responses request's wire tools by
+  `record_discovered_mcp_tools`, explicitly, where the request needs it for upstream use
+  and persistence.
 - **`normalize.rs`** — `validate()`, `tool_type()`, and `to_function_tools()` on
-  `ToolDeclarationRef`, reached from `ToolDeclaration` and `ResponsesTool` alike. These are
-  the declaration-level validation and normalization entry points used by
-  `RequestPayload::to_upstream_request`. Each supported variant's
+  `ToolDeclaration`. These are the declaration-level validation and normalization entry
+  points used by `RequestPayload::to_upstream_request` on the converted declarations. Each supported variant's
   policy belongs to its corresponding `ToolHandler`: `FunctionHandler`,
   `ToolSearchHandler`, `McpHandler`, `WebSearchHandler`, `WebFetchHandler`,
   `CodexNamespaceHandler`, `CustomHandler`, or `CodeInterpreterHandler`. Web search's fixed canonical builder
@@ -1326,14 +1329,16 @@ the operator enables it, and Eryx runtime readiness succeeds.
   is `Client` or `Gateway`; a gateway entry may also carry its typed
   `GatewayBinding`. Its constructor,
   ```rust
-  pub async fn build_with_handlers<D: DeclaredTool>(
-      tools: &mut [D],
+  pub async fn build_with_handlers(
+      tools: &mut [ToolDeclaration],
       executors: &mut GatewayExecutors,
   ) -> Result<Self, ToolError>
   ```
   is the stable entry point every caller uses to build a registry for a request —
-  Responses passes its `ResponsesTool`s, Messages the `ToolDeclaration`s from
-  `registry_tools` — **its signature should not change**. It resolves namespace
+  Responses passes the declarations `responses_declarations` converted from its
+  `ResponsesTool`s and records discovery back with `record_discovered_mcp_tools`,
+  Messages the `ToolDeclaration`s from `registry_tools` — **its signature should not
+  change**. It resolves namespace
   members, inserts one entry per declared/discovered tool, and for `Mcp`/`WebSearch`
   pulls the actual executor from `GatewayExecutors` (discovering live MCP tools via
   `tools/list` in the process). `ToolRegistry::dispatch(call)` is the per-call routing
