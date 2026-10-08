@@ -272,8 +272,9 @@ tenant rather than deriving ownership from the authenticated principal
 
 Anthropic Messages requests are forwarded to `{LLM_API_BASE}` with Anthropic
 headers and body fields preserved. When a request declares a tool the gateway
-owns, such as the native `web_search_20250305` and `web_fetch_20250910`
-server tools, the gateway runs
+owns, such as Claude's native web search and web fetch server tools (the
+basic `web_search_20250305` and `web_fetch_20250910`, and their later versions
+when `allowed_callers` includes `"direct"`), the gateway runs
 the tool loop itself: it executes each gateway call, appends the result, and
 streams only the client-visible content. Every upstream round must be a
 complete, well-formed Messages stream; a truncated or malformed round ends the
