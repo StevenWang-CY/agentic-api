@@ -86,7 +86,8 @@ fn declared_version(
     })
 }
 
-/// A setting the declared version does not define is refused, not ignored.
+/// `use_cache` or `response_inclusion` on a version that does not define it is
+/// refused, not ignored.
 fn undefined_setting(version: NativeToolVersion, setting: &str) -> ExecutorError {
     invalid(format!("{} does not define {setting}", version.type_name))
 }
@@ -782,8 +783,14 @@ mod tests {
                 }
             }
             if use_cache {
-                let mut request = native_request(tool_type, &direct(&json!({"use_cache": "false"})));
-                assert_eq!(invalid_request(&mut request), "web_fetch use_cache must be a boolean");
+                for malformed in [json!("false"), json!(null), json!(1)] {
+                    let mut request = native_request(tool_type, &direct(&json!({"use_cache": malformed})));
+                    assert_eq!(
+                        invalid_request(&mut request),
+                        "web_fetch use_cache must be a boolean",
+                        "{tool_type} {malformed}"
+                    );
+                }
             }
         }
     }
@@ -806,14 +813,17 @@ mod tests {
                 }
             }
             if response_inclusion {
-                let mut request = native_request(tool_type, &direct(&json!({"response_inclusion": "partial"})));
-                assert_eq!(
-                    invalid_request(&mut request),
-                    format!(
-                        "{} response_inclusion must be \"full\" or \"excluded\"",
-                        tool_name(tool_type)
-                    )
-                );
+                for malformed in [json!("partial"), json!(null), json!(1), json!(true), json!({})] {
+                    let mut request = native_request(tool_type, &direct(&json!({"response_inclusion": malformed})));
+                    assert_eq!(
+                        invalid_request(&mut request),
+                        format!(
+                            "{} response_inclusion must be \"full\" or \"excluded\"",
+                            tool_name(tool_type)
+                        ),
+                        "{tool_type} {malformed}"
+                    );
+                }
             }
         }
     }
@@ -876,9 +886,36 @@ mod tests {
             "web_fetch_20250910x",
             "web_search_20250305 ",
         ] {
-            let message = invalid_request(&mut native_request(tool_type, &settings));
-            assert!(message.starts_with("unsupported "), "{tool_type}: {message}");
-            assert!(message.contains(&format!("'{tool_type}'")), "{tool_type}: {message}");
+            let tool = tool_name(tool_type);
+            let supported: Vec<&str> = DOCUMENTED
+                .iter()
+                .map(|(listed, ..)| *listed)
+                .filter(|listed| tool_name(listed) == tool)
+                .collect();
+            assert_eq!(
+                invalid_request(&mut native_request(tool_type, &settings)),
+                format!(
+                    "unsupported {tool} tool type '{tool_type}'; supported versions are {}",
+                    supported.join(", ")
+                )
+            );
+        }
+    }
+
+    /// A later web fetch version is held to the same name as the basic one.
+    #[test]
+    fn every_web_fetch_version_must_be_named_web_fetch() {
+        let versions = DOCUMENTED
+            .iter()
+            .map(|(tool_type, ..)| *tool_type)
+            .filter(|tool_type| tool_name(tool_type) == WEB_FETCH_EXECUTOR);
+        for tool_type in versions {
+            let mut request = native_request(tool_type, &direct(&json!({})));
+            request["tools"][0]["name"] = json!("fetch");
+            assert_eq!(
+                invalid_request(&mut request),
+                format!("{tool_type} declarations must be named web_fetch")
+            );
         }
     }
 

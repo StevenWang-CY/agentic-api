@@ -56,10 +56,11 @@ All notable changes to Agentic API are documented here.
 - `agentic_core`: `NATIVE_WEB_SEARCH_TYPE` and `NATIVE_WEB_FETCH_TYPE` still name the basic versions, which are no
   longer the only versions the Messages gateway executes; code that compares a declared type with them should look it
   up with `NativeToolVersion::find` in `NATIVE_WEB_SEARCH_VERSIONS` or `NATIVE_WEB_FETCH_VERSIONS` (#419). On
-  `/v1/messages`, a `web_search` declaration that sets `use_cache`, which no web search version defines, or
-  `response_inclusion` before `web_search_20260318` is rejected with HTTP 400 instead of being ignored, and a basic
-  version whose `allowed_callers` omits `"direct"` is refused with the same message as every other version, which
-  names the type, `allowed_callers`, and the reason.
+  `/v1/messages` and `/v1/messages/count_tokens`, a `web_search` declaration that sets `use_cache`, which no web
+  search version defines, or `response_inclusion` before `web_search_20260318` is rejected with HTTP 400 instead of
+  being ignored; a basic version whose `allowed_callers` omits `"direct"` is refused in the message shape every
+  version uses, which names the type, `allowed_callers`, and the reason; and the refusal of an unlisted `web_search_*`
+  version now lists the supported versions.
 - The domain lists of `web_search` and `web_fetch` declarations are one shared type, `DomainFilters` (formerly
   `WebSearchFilters`, the same two fields), matched by one shared policy module that also validates a `web_fetch`
   entry as a host name (`web_search` keeps its non-empty-entry rule in the Messages adapter); the request and

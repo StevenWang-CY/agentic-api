@@ -639,18 +639,18 @@ YOU_API_KEY=<you.com-key> YOU_API_BASE_URL=<you.com-base-url> \
 The gateway supports the basic `web_search_20250305` contract, including `max_uses`, `allowed_domains`,
 `blocked_domains`, and the country in `user_location`. The later versions, `web_search_20260209` and
 `web_search_20260318`, add dynamic filtering, which calls the search from Anthropic's code execution by default. The
-gateway does not run code execution, so it accepts a later version whose `allowed_callers` includes `"direct"` and runs
-it as the basic search; `response_inclusion` (`web_search_20260318`) is accepted because it only affects results that
-code execution consumed. Without `"direct"`, the request is rejected with HTTP 400 naming `allowed_callers`, as
-Anthropic's API answers for models that cannot call tools from code:
+gateway does not run code execution, so it runs a later version as the basic search when its `allowed_callers` includes
+`"direct"`:
 
 ```json
 {"type": "web_search_20260318", "name": "web_search", "allowed_callers": ["direct"]}
 ```
 
-A `web_search` declaration of another version is rejected with HTTP 400 rather than forwarded in a shape the upstream
-cannot execute, and so is one that sets `use_cache`, which no web search version defines, or `response_inclusion` on a
-version before `web_search_20260318`.
+Without `"direct"`, the request is rejected with HTTP 400 naming `allowed_callers`, as Anthropic's API answers for
+models that cannot call tools from code. `response_inclusion` (`web_search_20260318`) is accepted because it only
+affects results that code execution consumed. A `web_search` declaration of another version is rejected with HTTP 400
+rather than forwarded in a shape the upstream cannot execute, and so is one that sets `use_cache`, which no web search
+version defines, or `response_inclusion` on a version before `web_search_20260318`.
 
 `max_uses` limits the searches performed across the whole request, not the number of tool calls. The model may batch
 several queries into one call, and every query counts as one search. A call that the remaining budget cannot cover is

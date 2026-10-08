@@ -1115,10 +1115,10 @@ Both tools are executed in every version `tool_seam` lists (`NATIVE_WEB_SEARCH_V
 defines beyond the basic one, as Anthropic documents it, and the adapter reads those
 fields rather than comparing version strings. A dynamic-filtering version's default
 caller is code execution, so its declaration is accepted only when `allowed_callers`
-includes `"direct"`, and is then rewritten into the basic version's function tool.
-`use_cache` and `response_inclusion` are accepted only on the versions that define them,
-because the fetcher keeps no cache and the gateway never calls a tool from code
-execution, and are refused on every other version of either tool. The registry seam
+includes `"direct"`, and is then rewritten into the basic version's function tool. The
+fetcher keeps no cache and the gateway never calls a tool from code execution, so
+`use_cache` and `response_inclusion` are accepted on the versions that define them; on
+every other version of either tool they are refused. The registry seam
 (`tool::declaration::web_search_config`) reads the shared settings of every listed
 version, so a later version keeps its domain lists and location, and the rewrite itself
 reports whether it changed a declaration, which is what `count_tokens` uses to decide

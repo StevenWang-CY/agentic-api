@@ -276,27 +276,35 @@ async fn count_tokens_accepts_the_native_declaration() {
     assert_eq!(tools[1]["name"], "echo", "other tools are forwarded unchanged");
 }
 
+/// Every version is refused on both endpoints when the operator disables the
+/// fetcher.
 #[tokio::test]
 async fn a_disabled_executor_rejects_the_declaration_with_400() {
     let gateway = spawn(WebFetchConfig::default().with_enabled(false)).await;
     let page_url = format!("{}/page/doc.html", gateway.backend_url);
 
-    for path in ["/v1/messages", "/v1/messages/count_tokens"] {
-        let response = client()
-            .post(format!("{}{path}", gateway.url))
-            .json(&messages_request(&page_url, &native_fetch(), false))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
-        let body: Value = response.json().await.unwrap();
-        assert_eq!(body["type"], "error", "{body}");
-        assert!(
-            body["error"]["message"]
-                .as_str()
-                .is_some_and(|message| message.contains("web_fetch is disabled")),
-            "{body}"
-        );
+    for version in NATIVE_WEB_FETCH_VERSIONS {
+        let mut tool = native_fetch();
+        tool["type"] = json!(version.type_name);
+        tool["allowed_callers"] = json!(["direct"]);
+        for path in ["/v1/messages", "/v1/messages/count_tokens"] {
+            let response = client()
+                .post(format!("{}{path}", gateway.url))
+                .json(&messages_request(&page_url, &tool, false))
+                .send()
+                .await
+                .unwrap();
+            let case = format!("{} {path}", version.type_name);
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{case}");
+            let body: Value = response.json().await.unwrap();
+            assert_eq!(body["type"], "error", "{case}: {body}");
+            assert!(
+                body["error"]["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("web_fetch is disabled")),
+                "{case}: {body}"
+            );
+        }
     }
     assert!(gateway.backend.inferences.lock().unwrap().is_empty());
     assert!(gateway.backend.counts.lock().unwrap().is_empty());

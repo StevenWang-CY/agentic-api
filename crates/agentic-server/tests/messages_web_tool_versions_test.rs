@@ -229,7 +229,7 @@ async fn an_unsupported_web_search_version_is_refused_with_the_supported_ones() 
 
 /// `use_cache` and `response_inclusion` are refused on a version that does not
 /// define them, and a basic version whose `allowed_callers` omits `"direct"` is
-/// refused with the message every version uses, on both endpoints.
+/// refused in the message shape every version uses, on both endpoints.
 #[tokio::test]
 async fn settings_a_version_does_not_define_are_refused_with_400() {
     let gateway = spawn().await;
