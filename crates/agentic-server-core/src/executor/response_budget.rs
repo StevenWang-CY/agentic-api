@@ -647,7 +647,7 @@ mod tests {
             incomplete_details: None,
             error: None,
             previous_response_id: None,
-            conversation_id: None,
+            conversation: None,
             instructions: None,
             max_tool_calls: None,
             service_tier: None,

@@ -205,7 +205,7 @@ impl StreamFailureContext {
                 "code": error.error_code(),
             })),
             previous_response_id: self.previous_response_id.clone(),
-            conversation_id: self.conversation_id.clone(),
+            conversation: self.conversation_id.clone(),
             instructions: self.instructions.clone(),
             max_tool_calls: self.max_tool_calls,
             service_tier: None,

@@ -65,7 +65,7 @@ to every other `/v1/*` route; the configured upstream credential is injected onl
 ### `POST /v1/responses`
 
 HTTP Responses requests use the OpenAI-compatible Responses shape. Requests
-with `store=true`, `previous_response_id`, `conversation_id`, any non-function
+with `store=true`, `previous_response_id`, `conversation`, any non-function
 tool, `multi_agent.enabled`, tool-search state, compaction input, or
 `context_management` run through the executor. Other stateless `store=false`
 requests are passed directly to the configured vLLM backend. A `store=false`
@@ -242,7 +242,7 @@ lane retains its latest response, including `generate: false` prewarm responses,
 so you can continue with `previous_response_id` without a database. After reconnecting,
 replay the full item history or a compacted window; an unstored response ID returns
 `400 previous_response_not_found`. With `store: true`, an uncached response can be
-loaded from durable storage. Explicit `conversation_id` requests retain the durable
+loaded from durable storage. Explicit `conversation` requests retain the durable
 Conversations API behavior.
 
 A failed same-lane continuation evicts its referenced cached parent. Failed forks
