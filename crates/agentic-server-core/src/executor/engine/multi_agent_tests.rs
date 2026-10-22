@@ -6,6 +6,8 @@ mod client_tools;
 mod explicit_compaction;
 #[path = "multi_agent_tests/live_control.rs"]
 mod live_control;
+#[path = "multi_agent_tests/metrics.rs"]
+mod metrics;
 #[path = "multi_agent_tests/root_completion.rs"]
 mod root_completion;
 #[path = "multi_agent_tests/service_tier.rs"]
@@ -19,7 +21,6 @@ use crate::executor::{
 use crate::storage::{ConversationStore, ResponseStore, create_pool_with_schema};
 use crate::types::io::{FunctionToolResultMessage, InputItem, MessagePhase, ResponsesInput, ToolCallOutput};
 use crate::types::request_response::ContextManagement;
-use crate::types::tools::{FunctionToolParam, ResponsesTool};
 use crate::utils::common::uuid7_str;
 use axum::body::Body;
 use axum::response::IntoResponse;
@@ -29,8 +30,8 @@ use futures::StreamExt;
 use root_completion::{reasoning_only_recovery_output, root_completion_output};
 use serde_json::{Value, json};
 use shell_continuation::shell_review_output;
+use std::fmt::Write;
 use std::sync::Arc;
-use std::{collections::HashMap, fmt::Write};
 use tokio::sync::{Barrier, Semaphore};
 
 #[test]
@@ -54,6 +55,10 @@ fn function(call_id: &str, name: &str, arguments: Value) -> Value {
 fn message(text: &str) -> Value {
     json!({"type":"message","id":uuid7_str("msg_"),"role":"assistant","status":"completed",
         "content":[{"type":"output_text","text":text,"annotations":[]}]})
+}
+
+fn has_message_text(item: &Value, text: &str) -> bool {
+    item["content"] == text || item["content"][0]["text"] == text
 }
 
 // Check the actual upstream request on initial execution and stored continuation.
@@ -160,7 +165,7 @@ async fn setup_with_compaction_gate(
                 output
             } else if let Some(output) = shell_review_output(&request) {
                 output
-            } else if input.iter().any(|item| item["content"] == "simple compaction test") {
+            } else if input.iter().any(|item| has_message_text(item, "simple compaction test")) {
                 vec![message("finished")]
             } else if let Some(child) = child {
                 let call_id = format!("proposal_{child}");
@@ -449,14 +454,11 @@ async fn concurrent_children_pause_and_resume_from_durable_tree_json_and_sse() {
                     enabled: true,
                     max_concurrent_subagents: Some(2),
                 }),
-                tools: Some(vec![ResponsesTool::Function(FunctionToolParam {
-                    name: "get_proposal".try_into().unwrap(),
-                    description: None,
-                    parameters: Some(json!({"type":"object","properties":{"proposal":{"type":"string"}}})),
-                    strict: None,
-                    defer_loading: None,
-                    extra: HashMap::default(),
-                })]),
+                tools: Some(vec![
+                    serde_json::from_value(json!({"type":"function","name":"get_proposal",
+                    "parameters":{"type":"object","properties":{"proposal":{"type":"string"}}}}))
+                    .unwrap(),
+                ]),
                 ..Default::default()
             };
             let first = response(request, exec.clone()).await;
@@ -476,7 +478,7 @@ async fn concurrent_children_pause_and_resume_from_durable_tree_json_and_sse() {
                 store: true,
                 stream,
                 previous_response_id: Some(first.id.clone()),
-                input: ResponsesInput::Items(
+                input: ResponsesInput::from(
                     calls
                         .iter()
                         .map(|call| {
@@ -485,7 +487,7 @@ async fn concurrent_children_pause_and_resume_from_durable_tree_json_and_sse() {
                                 output: ToolCallOutput::Text("proposal details".into()),
                             })
                         })
-                        .collect(),
+                        .collect::<Vec<_>>(),
                 ),
                 ..Default::default()
             };
@@ -507,7 +509,7 @@ async fn concurrent_children_pause_and_resume_from_durable_tree_json_and_sse() {
 #[test]
 fn forks_do_not_duplicate_pending_parent_calls() {
     let history: Vec<InputItem> = serde_json::from_value(json!([
-        {"role":"user","content":"context"},
+        {"type":"message","role":"user","content":"context"},
         {"type":"function_call","call_id":"open","name":"get_proposal","arguments":"{}"},
         {"type":"function_call","call_id":"closed","name":"get_proposal","arguments":"{}"},
         {"type":"function_call_output","call_id":"closed","output":"value"},

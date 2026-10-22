@@ -1,10 +1,12 @@
+use crate::types::io::InOutItem;
+use std::borrow::Cow;
 use std::{collections::HashSet, num::NonZeroUsize};
 
 use super::super::agent_turn::AgentTurn;
 use crate::executor::{
     error::{ExecutorError, ExecutorResult},
     multi_agent::{
-        AgentPhase, AgentRegistry, AgentState, CheckpointLimits, PendingClientCalls, RegistryLimits,
+        AgentPhase, AgentRegistry, AgentState, CheckpointLimits, ClientCallError, PendingClientCalls, RegistryLimits,
         ValidatedTreeCheckpoint,
     },
     pipeline::AgentPipeline,
@@ -12,7 +14,7 @@ use crate::executor::{
     request::{ExecutionContext, RequestContext},
     response_budget::ExecutorResponseBudget,
 };
-use crate::tool::ToolSearchHandler;
+use crate::tool::{ToolError, ToolSearchHandler};
 use crate::types::{
     agent::{AgentCompletion, AgentIdentity, AgentMail, AgentMailContent, AgentTurnKey},
     agent_tree::{StoredAgent, StoredTreeSnapshot},
@@ -52,16 +54,13 @@ pub(in crate::executor::engine) fn prepare_without_inference(
     settings.input = ResponsesInput::Items(Vec::new());
     for agent in &mut restored.agents {
         let mut effective = settings.clone();
-        effective.input = ResponsesInput::Items(std::mem::take(&mut agent.history));
+        effective.input = ResponsesInput::from(std::mem::take(&mut agent.history));
         let search = ToolSearchHandler::prepare_request(
             &mut effective,
             &agent.loaded_tools,
             request.original_request.tools.is_some(),
         )?;
-        agent.history = match effective.input {
-            ResponsesInput::Items(history) => history,
-            input @ ResponsesInput::Text(_) => Vec::from(&input),
-        };
+        agent.history = effective.input.input_items().map(Cow::into_owned).collect();
         if let Some(search) = search {
             agent.loaded_tools = search.into_public_metadata().loaded_tools;
         }
@@ -80,16 +79,27 @@ pub(in crate::executor::engine) fn prepare_without_inference(
 }
 
 impl RestoredAgents {
-    pub(super) fn continue_input(&mut self, response_id: &str, input: &[InputItem]) -> ExecutorResult<()> {
+    pub(super) fn continue_input(&mut self, response_id: &str, input: &[InOutItem]) -> ExecutorResult<()> {
         let mut outputs = Vec::new();
         let mut root_input = Vec::new();
         for item in input {
             match item {
-                InputItem::FunctionCallOutput(output) => outputs.push(ClientToolOutput::Function(output.clone())),
-                InputItem::ShellCallOutput(output) => outputs.push(ClientToolOutput::Shell(output.clone())),
-                InputItem::CustomToolCallOutput(output) => outputs.push(ClientToolOutput::Custom(output.clone())),
-                InputItem::ToolSearchOutput(output) => outputs.push(ClientToolOutput::ToolSearch(output.clone())),
-                InputItem::Message(_) => root_input.push(item.clone()),
+                InOutItem::Input(InputItem::FunctionCallOutput(output)) => {
+                    outputs.push(ClientToolOutput::Function(output.clone()));
+                }
+                InOutItem::Input(InputItem::ShellCallOutput(output)) => {
+                    outputs.push(ClientToolOutput::Shell(output.clone()));
+                }
+                InOutItem::Input(InputItem::CustomToolCallOutput(output)) => {
+                    outputs.push(ClientToolOutput::Custom(output.clone()));
+                }
+                InOutItem::Input(InputItem::ToolSearchOutput(output)) => {
+                    outputs.push(ClientToolOutput::ToolSearch(output.clone()));
+                }
+                InOutItem::Input(message @ InputItem::Message(_)) => root_input.push(message.clone()),
+                InOutItem::Output(OutputItem::Message(message)) => {
+                    root_input.push(InputItem::Message(message.clone().into()));
+                }
                 _ => {
                     return Err(invalid(
                         "multi-agent continuation accepts new messages and pending function, shell, custom, or tool-search outputs",
@@ -101,25 +111,37 @@ impl RestoredAgents {
             .iter()
             .map(|output| output.call_id().to_owned())
             .collect::<Vec<_>>();
-        if self
+        // Pending async calls may stay unanswered; their outputs can arrive in a later request.
+        // Missing and unknown outputs use the same errors as a single-agent continuation.
+        if let Some(call) = self
             .pending
-            .pending()
-            .any(|call| !ids.iter().any(|id| id == call.call_id.as_str()))
+            .awaiting_outputs()
+            .find(|call| !ids.iter().any(|id| id == call.call_id.as_str()))
         {
-            return Err(invalid("provide outputs for every outstanding multi-agent client call"));
+            return Err(ToolError::MissingOutput {
+                call_id: call.call_id.as_str().to_owned(),
+            }
+            .into());
         }
         self.pending
             .accept_outputs(ClientToolOutputBatch {
                 response_id: response_id.to_owned(),
                 outputs,
             })
-            .map_err(|error| invalid(&error.to_string()))?;
+            .map_err(|rejected| match rejected.reason {
+                ClientCallError::UnknownCall(call_id) => ToolError::UnknownCallOutput { call_id }.into(),
+                reason => invalid(&reason.to_string()),
+            })?;
         let mut resumed = HashSet::new();
+        let mut resume_root = !root_input.is_empty();
         for id in ids {
             let routed = self
                 .pending
                 .take_accepted(&id)
                 .expect("accepted output retained until transfer");
+            // A late async output is new information for the root, like a new message. An idle
+            // subagent reads its late output in a turn the run starts (`resume_unread_agents`).
+            resume_root |= routed.owner.async_execution && routed.owner.agent_turn.agent.is_root();
             let key = routed.owner.agent_turn;
             self.agents
                 .iter_mut()
@@ -145,7 +167,7 @@ impl RestoredAgents {
         }
         // Client outputs resume only their owners. Parents parked at the previous
         // response boundary remain asleep until registry mailbox delivery wakes them.
-        if !root_input.is_empty() {
+        if resume_root {
             self.registry.resume_root();
             self.agents
                 .iter_mut()
@@ -207,10 +229,12 @@ pub(super) fn restore_agents(
             turn: root.turn,
             state: AgentState::Active(AgentPhase::Runnable),
             mailbox: Vec::new(),
-            history: match &request.enriched_request.input {
-                ResponsesInput::Items(items) => items.clone(),
-                ResponsesInput::Text(_) => Vec::from(&request.enriched_request.input),
-            },
+            history: request
+                .enriched_request
+                .input
+                .input_items()
+                .map(Cow::into_owned)
+                .collect(),
             loaded_tools: Vec::new(),
             last_task: String::new(),
             final_answer: None,
@@ -233,7 +257,7 @@ pub(super) async fn prepare_agent(
     budget: &ExecutorResponseBudget,
 ) -> ExecutorResult<AgentContext> {
     let mut request = parent.enriched_request.clone();
-    request.input = ResponsesInput::Items(stored.history.clone());
+    request.input = ResponsesInput::from(stored.history.clone());
     request.previous_response_id = None;
     request.conversation = None;
     let management = request.context_management.get_or_insert_with(Vec::new);
@@ -251,10 +275,7 @@ pub(super) async fn prepare_agent(
         parent.original_request.tools.is_some(),
     )?;
     // Discovery resolves public search pairs before this private history is used for inference.
-    stored.history = match &request.input {
-        ResponsesInput::Items(items) => items.clone(),
-        ResponsesInput::Text(_) => Vec::from(&request.input),
-    };
+    stored.history = request.input.input_items().map(Cow::into_owned).collect();
     let ctx = RequestContext {
         multi_agent_tree: None,
         original_request: request.clone(),
@@ -280,6 +301,7 @@ pub(super) async fn prepare_agent(
         generation: 0,
         compacted_generation: None,
         compacting: false,
+        inputs_during_round: Vec::new(),
         stored,
         execution,
         request: ctx.enriched_request,

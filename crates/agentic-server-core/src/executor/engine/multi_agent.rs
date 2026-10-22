@@ -32,13 +32,17 @@ use crate::executor::{
     relay::{AgentFrame, AgentRoundId},
     request::ExecutionContext,
     response_budget::ExecutorResponseBudget,
+    telemetry::{
+        Api,
+        metrics::{ExecutionClock, RoundCounter},
+    },
 };
 use crate::tool::ToolSearchState;
 use crate::types::{
     agent::{AgentIdentity, AgentTurnKey},
     agent_commands::{AgentListingStatus, CollaborationResult},
     agent_tree::{StoredAgent, StoredTreeSnapshot},
-    io::{MultiAgentAction, MultiAgentConfig, OutputItem},
+    io::{InputItem, MultiAgentAction, MultiAgentConfig, OutputItem},
     request_response::{RequestPayload, ResponsePayload},
 };
 use crate::utils::common::utcnow_str;
@@ -57,6 +61,9 @@ struct AgentContext {
     generation: u64,
     compacted_generation: Option<u64>,
     compacting: bool,
+    /// Outputs accepted while this agent's inference round runs. Completing the round replaces the
+    /// history with the round's own input, so these are applied again after it.
+    inputs_during_round: Vec<InputItem>,
     stored: StoredAgent,
     execution: AgentExecutionState,
     request: RequestPayload,
@@ -89,6 +96,10 @@ pub(super) struct MultiAgentRun {
     sealer: TranscriptSealer,
     payload: ResponsePayload,
     rounds: usize,
+    /// Every agent's upstream rounds, recorded once for the execution.
+    round_counter: RoundCounter,
+    /// The execution's timing state, shared with each round's pipeline.
+    clock: Option<ExecutionClock>,
     max_retained_bytes: usize,
     frame_sender: mpsc::Sender<AgentFrame>,
     frames: mpsc::Receiver<AgentFrame>,
@@ -116,12 +127,7 @@ impl MultiAgentRun {
             agents,
             ..
         } = restored;
-        if registry
-            .agents()
-            .filter(|agent| !agent.identity.is_root() && matches!(agent.state, AgentState::Active(_)))
-            .count()
-            > limit
-        {
+        if registry.active_subagents() > limit {
             return Err(invalid(
                 "max_concurrent_subagents is below the stored active-agent count",
             ));
@@ -148,11 +154,16 @@ impl MultiAgentRun {
             service_tier: None,
             tools: pipeline.request.enriched_request.tools.clone(),
             tool_choice: pipeline.request.enriched_request.tool_choice.clone(),
+            standard_fields: {
+                let mut fields = crate::types::request_response::StandardResponseFields::default();
+                fields.apply_request(&pipeline.request.original_request);
+                fields
+            },
         };
         // One bounded event in flight, plus one size-limited awaited frame per
         // active worker. Client backpressure reaches upstream readers.
         let (frame_sender, frames) = mpsc::channel(1);
-        Ok(Self {
+        let mut run = Self {
             control: pipeline.control.take(),
             frame_sender,
             frames,
@@ -168,8 +179,13 @@ impl MultiAgentRun {
             sealer: TranscriptSealer::new()?,
             payload,
             rounds: 0,
+            round_counter: exec.metrics.rounds(Api::Responses),
+            clock: pipeline.execution_clock().cloned(),
             max_retained_bytes: exec.responses_config.max_retained_bytes,
-        })
+        };
+        // Late async outputs from this request, or parked by an earlier one at the subagent limit.
+        run.resume_unread_agents();
+        Ok(run)
     }
 
     pub(super) async fn run(
@@ -217,6 +233,7 @@ impl MultiAgentRun {
             &CheckpointLimits::for_response(self.max_retained_bytes),
         )?);
         self.payload.output = self.completed_items.into_values().collect();
+        self.payload.standard_fields.completed_at = (self.payload.status == "completed").then(utcnow_str);
         Ok(self.payload)
     }
 
@@ -257,8 +274,8 @@ impl MultiAgentRun {
                     .map(|wait| wait.deadline_ms)
                     .min();
                 // A live socket does not keep an otherwise quiescent response open.
-                // Pending client outputs are persisted for explicit continuation.
-                if self.pending.pending().next().is_some() || waiting.is_none() {
+                // Pending synchronous client outputs are persisted for explicit continuation.
+                if self.pending.awaiting_outputs().next().is_some() || waiting.is_none() {
                     let waiters = self
                         .contexts
                         .iter()

@@ -1,3 +1,5 @@
+#[cfg(test)]
+use crate::types::io::InOutItem;
 use serde_json::json;
 
 use super::*;
@@ -82,6 +84,7 @@ fn normalization_uses_safe_defaults() {
 #[test]
 fn synthetic_public_call_construction_is_validated_in_tool_layer() {
     let valid = FunctionToolCall {
+        async_execution: false,
         agent: None,
         id: "fc_search".to_owned(),
         call_id: "call_search".to_owned(),
@@ -121,6 +124,7 @@ fn synthetic_public_call_construction_is_validated_in_tool_layer() {
 #[test]
 fn terminal_projection_preserves_incomplete_and_discards_failed_calls() {
     let synthetic = FunctionToolCall {
+        async_execution: false,
         agent: None,
         id: "fc_search".to_owned(),
         call_id: "call_search".to_owned(),
@@ -202,9 +206,9 @@ fn preparation_retains_mcp_list_metadata_until_upstream_projection() {
         panic!("expected prepared item input");
     };
     assert!(
-        prepared_items
-            .iter()
-            .any(|item| matches!(item, InputItem::McpListTools(list) if list.server_label == "counter"))
+        prepared_items.iter().any(
+            |item| matches!(item, InOutItem::Input(InputItem::McpListTools(list)) if list.server_label == "counter")
+        )
     );
 
     let model_input = request.input.model_input();
@@ -214,7 +218,7 @@ fn preparation_retains_mcp_list_metadata_until_upstream_projection() {
     assert!(
         model_items
             .iter()
-            .all(|item| !matches!(item, InputItem::McpListTools(_)))
+            .all(|item| !matches!(item, InOutItem::Input(InputItem::McpListTools(_))))
     );
 }
 

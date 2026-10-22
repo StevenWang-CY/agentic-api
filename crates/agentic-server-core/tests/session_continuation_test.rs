@@ -15,10 +15,11 @@ use agentic_core::executor::{
     ResponseSession, ResponseSessionGroup, commit, rehydrate_in_session,
 };
 use agentic_core::storage::{
-    ConversationStore, InOutItem, ResponseMetadata, ResponseStore, StorageError, create_pool_with_schema,
+    ConversationStore, ResponseMetadata, ResponseStore, StorageError, create_pool_with_schema,
 };
 use agentic_core::tool::{GatewayExecutor, ToolError, ToolHandler, ToolOutput, ToolType};
 use agentic_core::types::io::FunctionTool;
+use agentic_core::types::io::InOutItem;
 use agentic_core::types::io::output::{FunctionToolCall, GatewayCallStatus, OutputItem, WebSearchCall};
 use agentic_core::types::request_response::{RequestPayload, ResponsePayload};
 use agentic_core::types::tools::WebSearchToolParam;
@@ -177,9 +178,48 @@ fn search_request() -> RequestPayload {
     payload
 }
 
+#[tokio::test]
+async fn session_tool_choice_inherits_request_policy_after_internal_relaxation() {
+    use agentic_core::types::io::ToolChoice;
+
+    let mut model = LocalModel::start(vec![
+        search_round("first_search", "searching"),
+        model_message("first_answer", "first answer"),
+        search_round("second_search", "searching again"),
+        model_message("second_answer", "second answer"),
+    ])
+    .await;
+    let calls = with_local_search(&mut model);
+    let session = session();
+    let mut first_request = search_request();
+    first_request.tool_choice = Some(ToolChoice::Required);
+    let first = execute_local(&model, &session, first_request).await;
+    session.wait_until_idle().await.unwrap();
+    let second = execute_local(&model, &session, request(Some(&first.id), json!("Search again"))).await;
+    session.wait_until_idle().await.unwrap();
+
+    assert_eq!(first.tool_choice, Some(ToolChoice::Required));
+    assert_eq!(second.tool_choice, Some(ToolChoice::Required));
+    assert_eq!(calls.load(Ordering::Relaxed), 2);
+    let requests = model.requests.lock().await;
+    assert_eq!(requests.len(), 4);
+    for round in [0, 2] {
+        assert_eq!(
+            requests[round]["tool_choice"], "required",
+            "first round of each client request"
+        );
+        assert!(
+            requests[round + 1].get("tool_choice").is_none(),
+            "internal round still uses auto"
+        );
+    }
+    drop(requests);
+    model.close().await;
+}
+
 async fn execute_local(model: &LocalModel, session: &ResponseSession, payload: RequestPayload) -> ResponsePayload {
     let result = ExecuteRequest::new(payload, Arc::new(model.exec.clone()))
-        .with_session(session)
+        .with_session(session, None)
         .unwrap()
         .run()
         .await
@@ -278,7 +318,7 @@ async fn session_explicit_conversation_generated_turns_match_no_session_history(
                 payload.store = store;
                 let execution = ExecuteRequest::new(payload, Arc::new(model.exec.clone()));
                 let execution = if use_session {
-                    execution.with_session(&session).unwrap()
+                    execution.with_session(&session, None).unwrap()
                 } else {
                     execution
                 };
@@ -342,7 +382,7 @@ async fn explicit_conversation_tool_history(use_session: bool, gateway_tool: boo
         }
         let execution = ExecuteRequest::new(payload, Arc::new(model.exec.clone()));
         let execution = if use_session {
-            execution.with_session(&session).unwrap()
+            execution.with_session(&session, None).unwrap()
         } else {
             execution
         };
@@ -870,7 +910,7 @@ async fn grouped_aggregate_rejection_precedes_durable_child_writes_and_preserves
         let mut payload = request(Some(&parent.id), json!("fork"));
         payload.store = true;
         let result = ExecuteRequest::new(payload, Arc::new(model.exec.clone()))
-            .with_session(&target)
+            .with_session(&target, None)
             .unwrap()
             .run()
             .await;
@@ -1064,7 +1104,7 @@ async fn grouped_aggregate_cancellation_while_waiting_for_storage_releases_capac
         assert!(futures::poll!(&mut pending).is_pending());
         assert!(
             ExecuteRequest::new(request(None, json!("busy")), Arc::new(exec.clone()))
-                .with_session(target)
+                .with_session(target, None)
                 .is_err()
         );
         let probe_ctx = rehydrate_in_session(request(None, json!("p".repeat(2_000))), &exec, &probe)
@@ -1146,7 +1186,7 @@ async fn grouped_aggregate_durable_fallback_is_rejected_before_inference_and_can
     let mut payload = request(Some(&parent.id), json!("continue"));
     payload.store = true;
     let result = ExecuteRequest::new(payload, Arc::new(model.exec.clone()))
-        .with_session(&restored)
+        .with_session(&restored, None)
         .unwrap()
         .run()
         .await;
@@ -1194,7 +1234,7 @@ async fn session_budget_rejection_does_not_partially_store_a_child() {
             let mut payload = request(Some(&parent.id), json!("child"));
             payload.store = true;
             let result = ExecuteRequest::new(payload, Arc::new(model.exec.clone()))
-                .with_session(&session)
+                .with_session(&session, None)
                 .unwrap()
                 .run()
                 .await;
@@ -1340,7 +1380,7 @@ async fn session_round_limit_retains_the_final_call_output_in_order() {
     let history = serde_json::to_value(&next.enriched_request.input).unwrap();
     let items = history.as_array().unwrap();
     assert_eq!(items.len(), 32);
-    for (round, items) in items[1..31].chunks_exact(3).enumerate() {
+    for (round, items) in items[1..31].as_chunks::<3>().0.iter().enumerate() {
         assert_eq!(items[0]["type"], "message");
         assert_eq!(items[1]["type"], "function_call");
         assert_eq!(items[2]["type"], "function_call_output");

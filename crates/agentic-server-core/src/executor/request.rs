@@ -7,12 +7,13 @@ use crate::error::Error;
 use crate::executor::gateway::GatewaySchedulerPolicy;
 use crate::executor::modes::{ConversationHandler, ResponseHandler};
 use crate::executor::multi_agent::ValidatedTreeCheckpoint;
+use crate::executor::telemetry::ExecutorMetrics;
 use crate::storage::backend::redact_database_urls;
 use crate::storage::{
     ConversationStore, ConversationVersion, DatabaseBackend, ResponseStore, create_pool_with_schema_and_configs,
 };
 use crate::tool::{GatewayExecutorRegistration, GatewayExecutors};
-use crate::types::io::InputItem;
+use crate::types::io::{InOutItem, ToolChoice};
 use crate::types::messages::GatewayToolMap;
 use crate::types::request_response::{RequestPayload, ResponsePayload};
 
@@ -26,7 +27,8 @@ const GATEWAY_TOOL_ALIASES_ENV: &str = "MESSAGES_GATEWAY_TOOL_ALIASES";
 pub struct RequestContext {
     /// Private canonical tree; committed atomically with response metadata.
     pub multi_agent_tree: Option<ValidatedTreeCheckpoint>,
-    /// Untouched original request from the client.
+    /// Client request. Before relaxing the inference selector, an omitted `tool_choice`
+    /// is filled with its resolved value so public response metadata stays consistent.
     pub original_request: RequestPayload,
     /// Enriched request with rehydrated conversation history injected into `.input`.
     /// This is the request forwarded to the LLM.
@@ -34,7 +36,7 @@ pub struct RequestContext {
     /// This turn's canonical input items for persistence, including built-in calls
     /// and call outputs. Session execution also records each round's other output
     /// items here in inference order; compaction can replace them with a new window.
-    pub new_input_items: Vec<InputItem>,
+    pub new_input_items: Vec<InOutItem>,
     /// Our generated response ID (uuid7 with "resp_" prefix).
     pub response_id: String,
     /// Resolved conversation ID. `None` when `store=false` or non-conversational.
@@ -47,6 +49,24 @@ pub struct RequestContext {
 }
 
 impl RequestContext {
+    /// Submitted or inherited selector for public metadata and continuation settings.
+    /// The enriched selector is only a fallback before any inference override.
+    pub(super) fn public_tool_choice(&self) -> Option<&ToolChoice> {
+        self.original_request
+            .tool_choice
+            .as_ref()
+            .or(self.enriched_request.tool_choice.as_ref())
+    }
+
+    /// Allow a follow-up inference to finish after tool execution, retaining the
+    /// submitted or inherited selector on the public request.
+    pub(super) fn relax_tool_choice(&mut self) {
+        let tool_choice = self.enriched_request.tool_choice.replace(ToolChoice::Auto);
+        if self.original_request.tool_choice.is_none() {
+            self.original_request.tool_choice = tool_choice;
+        }
+    }
+
     /// The request's `max_tool_calls` limit. Admission already rejected an
     /// invalid value, so `None` means the request set no limit.
     #[must_use]
@@ -63,6 +83,8 @@ impl RequestContext {
             .previous_response_id
             .clone_from(&self.original_request.previous_response_id);
         payload.max_tool_calls = self.max_tool_calls().map(NonZeroU64::get);
+        payload.standard_fields.apply_request(&self.original_request);
+        payload.standard_fields.completed_at = (payload.status == "completed").then(crate::utils::common::utcnow_str);
     }
 }
 
@@ -90,6 +112,9 @@ pub struct ExecutionContext {
     /// Bounded-concurrency policy applied to gateway-owned calls in each round.
     pub(crate) gateway_scheduler_policy: GatewaySchedulerPolicy,
     pub responses_config: ResponsesConfig,
+    /// Execution, stage, token, and timing instruments. Defaults to the
+    /// globally registered meter provider at construction time.
+    pub metrics: ExecutorMetrics,
     storage_pool: Option<Arc<crate::storage::DbPool>>,
 }
 
@@ -124,8 +149,17 @@ impl ExecutionContext {
             streaming_timeout: streaming_timeout_from_env(),
             gateway_scheduler_policy: GatewaySchedulerPolicy::default(),
             responses_config: ResponsesConfig::default(),
+            metrics: ExecutorMetrics::from_global(),
             storage_pool: None,
         }
+    }
+
+    /// Record executor metrics with instruments from the embedding
+    /// application's meter instead of the global provider.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: ExecutorMetrics) -> Self {
+        self.metrics = metrics;
+        self
     }
 
     #[must_use]
@@ -202,6 +236,7 @@ impl ExecutionContext {
             streaming_timeout: streaming_timeout_from_env(),
             gateway_scheduler_policy: GatewaySchedulerPolicy::new(cfg.tools.max_concurrent_gateway_calls),
             responses_config: cfg.responses,
+            metrics: ExecutorMetrics::from_global(),
             storage_pool: Some(pool),
         })
     }

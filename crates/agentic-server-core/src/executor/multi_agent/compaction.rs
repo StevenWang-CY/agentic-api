@@ -4,8 +4,9 @@ use crate::executor::error::ExecutorResult;
 use crate::executor::pending_calls::resolved_prefix_len;
 use crate::executor::request::ExecutionContext;
 use crate::types::agent::AgentIdentity;
+use crate::types::io::input::async_records;
 use crate::types::io::{InputItem, ResponseUsage, ResponsesInput};
-use crate::types::request_response::{PromptCacheRetention, RequestPayload};
+use crate::types::request_response::{PromptCacheOptions, PromptCacheRetention, RequestPayload};
 
 pub struct CompactionPlan {
     agent: AgentIdentity,
@@ -15,6 +16,7 @@ pub struct CompactionPlan {
     instructions: Option<String>,
     prompt_cache_key: Option<String>,
     prompt_cache_retention: Option<PromptCacheRetention>,
+    prompt_cache_options: Option<PromptCacheOptions>,
     service_tier: Option<String>,
 }
 
@@ -75,6 +77,7 @@ impl CompactionPlan {
             instructions: request.instructions.clone(),
             prompt_cache_key: request.prompt_cache_key.clone(),
             prompt_cache_retention: request.prompt_cache_retention,
+            prompt_cache_options: request.prompt_cache_options,
             service_tier: request.service_tier.clone(),
         }))
     }
@@ -91,16 +94,32 @@ impl CompactionPlan {
             .filter(|item| matches!(item, InputItem::McpListTools(_)))
             .cloned()
             .collect::<Vec<_>>();
+        // Async calls and their last outputs stay with the summary: an open call's output can still
+        // arrive, and a further output for an answered call still finds its call. The model view
+        // shows them only while the call is open or answered again after the summary.
+        let async_records: Vec<InputItem> = self
+            .prefix
+            .iter()
+            .zip(async_records(&self.prefix))
+            .filter(|(_, record)| *record)
+            .map(|(item, _)| item.clone())
+            .collect();
         let request = RequestPayload {
             model: self.model,
             instructions: self.instructions,
             prompt_cache_key: self.prompt_cache_key,
             prompt_cache_retention: self.prompt_cache_retention,
+            prompt_cache_options: self.prompt_cache_options,
             service_tier: self.service_tier,
             ..Default::default()
         };
         let (mut replacement, usage, service_tier) =
-            compact_items(&request, ResponsesInput::Items(self.prefix), exec, auth).await?;
+            compact_items(&request, ResponsesInput::from(self.prefix), exec, auth).await?;
+        let at = replacement
+            .iter()
+            .rposition(|item| matches!(item, InputItem::Compaction(_)))
+            .unwrap_or(replacement.len());
+        replacement.splice(at..at, async_records);
         replacement.extend(discovery);
         Ok(CompactionResult {
             agent: self.agent,
@@ -143,7 +162,7 @@ mod tests {
             usage: ResponseUsage::default(),
             service_tier: None,
         };
-        let mut history = vec![InputItem::Unknown, InputItem::CompactionTrigger];
+        let mut history = vec![InputItem::CompactionTrigger, InputItem::CompactionTrigger];
         assert_eq!(result().commit(8, &mut history), CompactionCommit::Stale);
         assert_eq!(history.len(), 2);
         assert_eq!(result().commit(7, &mut history), CompactionCommit::Applied);

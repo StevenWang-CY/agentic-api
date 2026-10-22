@@ -23,11 +23,12 @@ use crate::auth::{ANTHROPIC_COUNT_TOKENS_PATH, ANTHROPIC_MESSAGES_PATH, OidcAuth
 use crate::handler::{
     chat_completions, compact_response, completions, count_tokens, create_conversation, create_item,
     delete_conversation, delete_item, embeddings, health, list_items, messages, models, ready, responses,
-    responses_ws_with_auth, retrieve_conversation, retrieve_item, retrieve_model, retrieve_response,
-    update_conversation,
+    responses_ws_with_auth, retrieve_conversation, retrieve_item, retrieve_model, retrieve_response, transcriptions,
+    translations, update_conversation,
 };
 use crate::model_capabilities::ModelCapabilities;
 use crate::telemetry::http::{HttpMetrics, track_request};
+use crate::telemetry::websocket::WebSocketMetrics;
 
 /// Default ceiling on serialized inbound request bytes for HTTP bodies and
 /// WebSocket messages.
@@ -39,10 +40,10 @@ pub struct WebSocketTracker {
     inner: Arc<WebSocketTrackerInner>,
 }
 
-#[derive(Default)]
 struct WebSocketTrackerInner {
     active: AtomicUsize,
     idle: Notify,
+    metrics: WebSocketMetrics,
     #[cfg(debug_assertions)]
     local_completion_barrier: std::sync::Mutex<Option<LocalCompletionBarrier>>,
 }
@@ -116,13 +117,45 @@ struct LocalCompletionBarrier {
     release: oneshot::Receiver<()>,
 }
 
+impl Default for WebSocketTrackerInner {
+    fn default() -> Self {
+        Self::with_metrics(WebSocketMetrics::from_global())
+    }
+}
+
+impl WebSocketTrackerInner {
+    fn with_metrics(metrics: WebSocketMetrics) -> Self {
+        Self {
+            active: AtomicUsize::new(0),
+            idle: Notify::new(),
+            metrics,
+            #[cfg(debug_assertions)]
+            local_completion_barrier: std::sync::Mutex::new(None),
+        }
+    }
+}
+
 pub(crate) struct WebSocketGuard {
     inner: Arc<WebSocketTrackerInner>,
 }
 
 impl WebSocketTracker {
+    /// A tracker recording its connection and queue metrics with `metrics`
+    /// instead of the global meter provider's.
+    #[must_use]
+    pub fn with_metrics(metrics: WebSocketMetrics) -> Self {
+        Self {
+            inner: Arc::new(WebSocketTrackerInner::with_metrics(metrics)),
+        }
+    }
+
+    pub(crate) fn metrics(&self) -> &WebSocketMetrics {
+        &self.inner.metrics
+    }
+
     pub(crate) fn track(&self) -> WebSocketGuard {
         self.inner.active.fetch_add(1, Ordering::AcqRel);
+        self.inner.metrics.connection_opened();
         WebSocketGuard {
             inner: Arc::clone(&self.inner),
         }
@@ -168,16 +201,17 @@ impl WebSocketTracker {
             .lock()
             .expect("local completion test barrier mutex poisoned")
             .take();
-        if let Some(barrier) = barrier {
-            if barrier.rehydrated.send(()).is_ok() {
-                let _ = barrier.release.await;
-            }
+        if let Some(barrier) = barrier
+            && barrier.rehydrated.send(()).is_ok()
+        {
+            let _ = barrier.release.await;
         }
     }
 }
 
 impl Drop for WebSocketGuard {
     fn drop(&mut self) {
+        self.inner.metrics.connection_closed();
         if self.inner.active.fetch_sub(1, Ordering::AcqRel) == 1 {
             self.inner.idle.notify_waiters();
         }
@@ -333,6 +367,8 @@ pub fn build_router_with_auth(
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/completions", post(completions))
         .route("/v1/embeddings", post(embeddings))
+        .route("/v1/audio/transcriptions", post(transcriptions))
+        .route("/v1/audio/translations", post(translations))
         .route("/v1/models", get(models))
         // A wildcard, because model IDs such as `org/name` contain slashes.
         .route("/v1/models/{*model}", get(retrieve_model))

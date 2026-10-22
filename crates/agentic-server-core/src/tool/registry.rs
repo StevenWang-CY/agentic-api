@@ -22,7 +22,7 @@ use super::web_search::insert_web_search_entry;
 use super::{CodexNamespaceHandler, McpHandler, NamespaceMap, ToolError, ToolOutput};
 
 use crate::types::io::output::{FunctionToolCall, McpListTools};
-use crate::types::io::{InputItem, ResponsesInput};
+use crate::types::io::{InOutItem, InputItem, ResponsesInput};
 use crate::types::tools::{CodeInterpreterToolParam, FileSearchToolParam, WebFetchToolParam};
 
 const MAX_MCP_SERVERS_PER_REQUEST: usize = 64;
@@ -85,6 +85,9 @@ pub struct ToolEntry {
     /// For MCP tools: which server this tool belongs to.
     pub server_label: Option<String>,
     pub ownership: ToolOwnership,
+    /// The declaration is async: the model continues without waiting for this tool's output.
+    /// Only client-owned function, custom, and namespace member entries can be async.
+    pub async_execution: bool,
 }
 
 impl std::fmt::Debug for ToolEntry {
@@ -93,6 +96,7 @@ impl std::fmt::Debug for ToolEntry {
             .field("tool_type", &self.tool_type)
             .field("server_label", &self.server_label)
             .field("is_gateway", &self.ownership.is_gateway())
+            .field("async_execution", &self.async_execution)
             .finish()
     }
 }
@@ -105,6 +109,7 @@ impl ToolEntry {
             tool_type,
             server_label,
             ownership: ToolOwnership::Client,
+            async_execution: false,
         }
     }
 
@@ -116,7 +121,16 @@ impl ToolEntry {
             tool_type,
             server_label,
             ownership: ToolOwnership::Gateway(binding),
+            async_execution: false,
         }
+    }
+
+    /// Marks a client-owned entry async, as its declaration requests.
+    #[must_use]
+    pub(crate) fn with_async_execution(mut self, async_execution: bool) -> Self {
+        debug_assert!(!async_execution || matches!(self.ownership, ToolOwnership::Client));
+        self.async_execution = async_execution;
+        self
     }
 }
 
@@ -392,6 +406,14 @@ impl ToolRegistry {
         self.entries.keys().map(|name| (name.as_str(), self.tool_type(name)))
     }
 
+    /// Model-visible names of the request's async client tools.
+    pub(crate) fn async_tool_names(&self) -> impl Iterator<Item = &str> {
+        self.entries
+            .iter()
+            .filter(|(_, entry)| entry.async_execution)
+            .map(|(name, _)| name.as_str())
+    }
+
     #[cfg(test)]
     pub(crate) fn from_tool_types(tool_types: HashMap<String, ToolType>) -> Self {
         let entries = tool_types
@@ -430,8 +452,8 @@ impl ToolRegistry {
 
     pub(crate) fn cache_listed_mcp_tools(&mut self, input: &ResponsesInput) {
         if let ResponsesInput::Items(items) = input {
-            for item in items {
-                let InputItem::McpListTools(list_tools) = item else {
+            for item in items.iter().filter_map(InOutItem::as_input) {
+                let InputItem::McpListTools(list_tools) = &*item else {
                     continue;
                 };
                 // Only a currently declared MCP server can emit discovery in
@@ -563,18 +585,50 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::sync::Arc;
 
     use super::*;
+    use crate::tool::codex::model_visible_namespace_member_name;
     use crate::tool::declaration::ToolDeclaration;
     use crate::tool::executors::GatewayExecutorRegistration;
     use crate::tool::mcp::{McpDiscoveredHandler, McpHandler};
+    use crate::tool::responses_declarations;
     use crate::types::io::output::McpListTool;
     use crate::types::tools::{McpDiscoveredToolParam, ResponsesTool};
 
     #[test]
     fn code_interpreter_tool_type_is_inherently_gateway_owned() {
         assert!(ToolType::CodeInterpreter.is_gateway_owned());
+    }
+
+    /// Async declarations reach the registry under their model-visible names, including the
+    /// flattened name of an async namespace member.
+    #[tokio::test]
+    async fn async_declarations_register_their_model_visible_names() {
+        let wire: Vec<ResponsesTool> = serde_json::from_value(serde_json::json!([
+            {"type": "function", "name": "get_weather", "async": true},
+            {"type": "function", "name": "get_time"},
+            {"type": "custom", "name": "echo", "async": true},
+            {
+                "type": "namespace",
+                "name": "travel",
+                "tools": [
+                    {"type": "function", "name": "book", "async": true},
+                    {"type": "function", "name": "cancel"}
+                ]
+            }
+        ]))
+        .unwrap();
+        let mut tools = responses_declarations(&wire);
+
+        let registry = ToolRegistry::build_with_handlers(&mut tools, &mut GatewayExecutors::default())
+            .await
+            .expect("client tools register");
+
+        let names: BTreeSet<&str> = registry.async_tool_names().collect();
+        let member = model_visible_namespace_member_name("travel", "book");
+        assert_eq!(names, BTreeSet::from(["get_weather", "echo", member.as_str()]));
     }
 
     #[cfg(feature = "embedded-code-interpreter")]
@@ -782,7 +836,7 @@ mod tests {
     #[test]
     fn ignores_mcp_list_history_for_servers_absent_from_current_registry() {
         let mut registry = ToolRegistry::default();
-        let input = ResponsesInput::Items(vec![
+        let input = ResponsesInput::from(vec![
             InputItem::McpListTools(McpListTools::new("mcpl_1", "counter", Vec::new())),
             InputItem::McpListTools(McpListTools::new("mcpl_2", "search", Vec::new())),
         ]);
@@ -1055,6 +1109,7 @@ mod tests {
             ..ToolRegistry::default()
         };
         let call = FunctionToolCall {
+            async_execution: false,
             agent: None,
             id: "fc_1".to_owned(),
             call_id: "call_1".to_owned(),

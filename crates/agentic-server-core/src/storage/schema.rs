@@ -18,7 +18,7 @@ use crate::config::DEFAULT_POSTGRES_MIGRATION_TIMEOUT_SECONDS;
 type DbResult<T> = Result<T, sqlx::Error>;
 
 const POSTGRES_SCHEMA_ADVISORY_LOCK: i64 = 7_194_963_546_799_751;
-const REQUIRED_POSTGRES_SCHEMA_COLUMN_COUNT: i64 = 21;
+const REQUIRED_POSTGRES_SCHEMA_COLUMN_COUNT: i64 = 22;
 const REQUIRED_POSTGRES_CONSTRAINT_COUNT: i64 = 7;
 const REQUIRED_POSTGRES_INTEGER_COLUMN_COUNT: i64 = 5;
 const POSTGRES_INTEGER_WIDENING_SQL: &str = "
@@ -78,6 +78,7 @@ where
                  ('conversations', 'revision', 'integer', 'NO'), \
                  ('items', 'id', 'text', 'NO'), \
                  ('items', 'data', 'text', 'NO'), \
+                 ('items', 'public_id', 'text', 'YES'), \
                  ('items', 'created_at', 'integer', 'NO'), \
                  ('items', 'conversation_id', 'text', 'YES'), \
                  ('items', 'seq', 'integer', 'YES'), \
@@ -316,11 +317,11 @@ pub(crate) async fn pin_postgres_persistence_schema(connection: &mut sqlx::AnyCo
 async fn run_embedded_migrations(pool: &DbPool, postgres_migration_timeout: Duration) -> DbResult<()> {
     let mut connection = pool.acquire().await?;
     let is_postgres = DatabaseBackend::from_connection(&connection) == DatabaseBackend::Postgres;
-    if is_postgres {
-        if let Err(error) = configure_postgres_migration_timeout(&mut connection, postgres_migration_timeout).await {
-            let _ = connection.close().await;
-            return Err(error);
-        }
+    if is_postgres
+        && let Err(error) = configure_postgres_migration_timeout(&mut connection, postgres_migration_timeout).await
+    {
+        let _ = connection.close().await;
+        return Err(error);
     }
 
     let migration_result = sqlx::migrate!("./migrations")
@@ -601,6 +602,7 @@ mod tests {
             include_str!("../../migrations/0004_link_conversation_latest_response.sql"),
             include_str!("../../migrations/0005_conversation_revision.sql"),
             include_str!("../../migrations/0006_item_references.sql"),
+            include_str!("../../migrations/0007_response_item_public_ids.sql"),
         ] {
             sqlx::raw_sql(migration)
                 .execute(&mut *connection)

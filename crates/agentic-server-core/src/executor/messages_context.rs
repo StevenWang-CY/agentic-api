@@ -363,16 +363,14 @@ impl MessagesRequestContext {
             serde_json::to_value(tool_results).map_err(ExecutorError::JsonError)?,
         );
         messages.push(Value::Object(user));
-        if fulfilled_choice {
-            if let Some(choice) = &mut self.tool_choice {
-                match choice {
-                    MessagesToolChoice::Any(options) | MessagesToolChoice::Tool { options, .. } => {
-                        *choice = MessagesToolChoice::Auto(std::mem::take(options));
-                    }
-                    MessagesToolChoice::Auto(_) | MessagesToolChoice::None { .. } => {}
+        if fulfilled_choice && let Some(choice) = &mut self.tool_choice {
+            match choice {
+                MessagesToolChoice::Any(options) | MessagesToolChoice::Tool { options, .. } => {
+                    *choice = MessagesToolChoice::Auto(std::mem::take(options));
                 }
-                self.raw["tool_choice"] = serde_json::to_value(choice).map_err(ExecutorError::JsonError)?;
+                MessagesToolChoice::Auto(_) | MessagesToolChoice::None { .. } => {}
             }
+            self.raw["tool_choice"] = serde_json::to_value(choice).map_err(ExecutorError::JsonError)?;
         }
         Ok(())
     }
@@ -430,8 +428,8 @@ mod tests {
         // The typed view keeps the client's native declaration, which is what
         // the tool seam classifies on...
         let tools = ctx.tools().expect("tools");
-        assert_eq!(tools[0].name, "web_search");
-        assert_eq!(tools[0].type_.as_deref(), Some("web_search_20250305"));
+        assert_eq!(tools[0].name(), "web_search");
+        assert_eq!(tools[0].tool_type(), Some("web_search_20250305"));
         // ...while the raw body carries the function-tool shape vLLM accepts.
         assert_eq!(ctx.raw["tools"][0]["name"], "web_search");
         assert!(ctx.raw["tools"][0].get("type").is_none());

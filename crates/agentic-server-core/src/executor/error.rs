@@ -3,7 +3,10 @@ use thiserror::Error;
 
 use crate::StorageError;
 use crate::tool::ToolError;
-use crate::types::request_response::{MAX_TOOL_CALLS_PARAM, MaxToolCallsError};
+use crate::types::io::input::InputValidationError;
+use crate::types::request_response::{
+    MAX_TOOL_CALLS_PARAM, MaxToolCallsError, PromptCacheOptionsError, UnsupportedParameterError, UpstreamRequestError,
+};
 use crate::utils::common::serialize_to_vec_or_default;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,9 +111,22 @@ pub enum ExecutorError {
     #[error("invalid request: {0}")]
     InvalidRequest(String),
 
+    #[error("invalid request: {0}")]
+    InvalidInput(#[from] InputValidationError),
+
     /// The request's `max_tool_calls` is not an integer of at least one.
     #[error(transparent)]
     InvalidMaxToolCalls(#[from] MaxToolCallsError),
+    /// A recognized request value that cannot be used in this combination, reported with
+    /// `code: unsupported_value` and the offending request parameter.
+    #[error("{message}")]
+    UnsupportedValue { param: &'static str, message: &'static str },
+    /// A recognized request member this gateway cannot honour (`background: true`, `prompt`).
+    #[error(transparent)]
+    UnsupportedParameter(#[from] UnsupportedParameterError),
+
+    #[error(transparent)]
+    InvalidPromptCacheOptions(#[from] PromptCacheOptionsError),
 
     /// The request exceeds a documented transport or component size budget.
     #[error("{0}")]
@@ -129,6 +145,15 @@ pub enum ExecutorError {
 
     #[error("tool error: {0}")]
     Tool(#[from] ToolError),
+}
+
+impl From<UpstreamRequestError> for ExecutorError {
+    fn from(error: UpstreamRequestError) -> Self {
+        match error {
+            UpstreamRequestError::Input(error) => error.into(),
+            UpstreamRequestError::Tool(error) => error.into(),
+        }
+    }
 }
 
 impl ExecutorError {
@@ -162,9 +187,18 @@ impl ExecutorError {
             Self::Storage(e) if e.is_validation() => StatusCode::BAD_REQUEST,
             Self::LLMRequest { status, .. } | Self::LLMTransport { status, .. } => *status,
             Self::ConversationLocked { .. }
-            | Self::Tool(ToolError::Config(_) | ToolError::MissingOutput { .. })
+            | Self::Tool(
+                ToolError::Config(_)
+                | ToolError::MissingOutput { .. }
+                | ToolError::UnknownCallOutput { .. }
+                | ToolError::UnknownParameter { .. },
+            )
             | Self::InvalidRequest(_)
+            | Self::InvalidInput(_)
+            | Self::InvalidPromptCacheOptions(_)
             | Self::InvalidMaxToolCalls(_)
+            | Self::UnsupportedValue { .. }
+            | Self::UnsupportedParameter(_)
             | Self::PreviousResponseNotFound { .. }
             | Self::JsonError(_) => StatusCode::BAD_REQUEST,
             Self::Tool(
@@ -189,9 +223,18 @@ impl ExecutorError {
     pub fn error_type(&self) -> &'static str {
         match self.client_visible_error() {
             Self::ConversationLocked { .. }
-            | Self::Tool(ToolError::Config(_) | ToolError::MissingOutput { .. })
+            | Self::Tool(
+                ToolError::Config(_)
+                | ToolError::MissingOutput { .. }
+                | ToolError::UnknownCallOutput { .. }
+                | ToolError::UnknownParameter { .. },
+            )
             | Self::InvalidRequest(_)
+            | Self::InvalidInput(_)
+            | Self::InvalidPromptCacheOptions(_)
             | Self::InvalidMaxToolCalls(_)
+            | Self::UnsupportedValue { .. }
+            | Self::UnsupportedParameter(_)
             | Self::PreviousResponseNotFound { .. }
             | Self::ParseError(_)
             | Self::JsonError(_)
@@ -225,7 +268,11 @@ impl ExecutorError {
             Self::Storage(StorageError::ItemAlreadyInConversation) => "item_already_in_conversation",
             Self::PayloadTooLarge(_) => "body_too_large",
             Self::ResourceLimitExceeded { .. } => "response_resource_limit_exceeded",
+            Self::InvalidPromptCacheOptions(PromptCacheOptionsError::Unsupported) => "unsupported_parameter",
             Self::InvalidMaxToolCalls(error) => error.code(),
+            Self::UnsupportedValue { .. } => "unsupported_value",
+            Self::UnsupportedParameter(error) => error.code(),
+            Self::Tool(ToolError::UnknownParameter { .. }) => "unknown_parameter",
             other => other.error_type(),
         }
     }
@@ -234,13 +281,17 @@ impl ExecutorError {
     #[must_use]
     pub fn error_param(&self) -> Option<&str> {
         match self.client_visible_error() {
-            Self::Storage(StorageError::InvalidItemId { param, .. }) => Some(param),
+            Self::Storage(StorageError::InvalidItemId { param, .. })
+            | Self::Tool(ToolError::UnknownParameter { param }) => Some(param),
             Self::Storage(StorageError::ItemAlreadyInConversation) => Some("items"),
             Self::Storage(StorageError::ItemCursorNotFound { .. }) => Some("after"),
             Self::ConversationLocked { .. } => Some("conversation"),
             Self::PreviousResponseNotFound { .. } => Some("previous_response_id"),
-            Self::Tool(ToolError::MissingOutput { .. }) => Some("input"),
+            Self::Tool(ToolError::MissingOutput { .. } | ToolError::UnknownCallOutput { .. }) => Some("input"),
+            Self::InvalidPromptCacheOptions(_) => Some("prompt_cache_options"),
             Self::InvalidMaxToolCalls(_) => Some(MAX_TOOL_CALLS_PARAM),
+            Self::UnsupportedValue { param, .. } => Some(param),
+            Self::UnsupportedParameter(error) => Some(error.param()),
             _ => None,
         }
     }
@@ -255,7 +306,11 @@ impl ExecutorError {
                 | StorageError::ItemCursorNotFound { .. }),
             ) => error.to_string(),
             Self::Storage(StorageError::Database(_)) => "Internal server error".to_owned(),
-            Self::Tool(error @ ToolError::MissingOutput { .. }) => error.to_string(),
+            Self::Tool(
+                error @ (ToolError::MissingOutput { .. }
+                | ToolError::UnknownCallOutput { .. }
+                | ToolError::UnknownParameter { .. }),
+            ) => error.to_string(),
             other => other.to_string(),
         }
     }
@@ -264,7 +319,8 @@ impl ExecutorError {
     pub(crate) fn response_error(&self) -> serde_json::Value {
         let code = if matches!(
             self.client_visible_error(),
-            Self::Tool(ToolError::MissingOutput { .. }) | Self::Storage(StorageError::ItemCursorNotFound { .. })
+            Self::Tool(ToolError::MissingOutput { .. } | ToolError::UnknownCallOutput { .. })
+                | Self::Storage(StorageError::ItemCursorNotFound { .. })
         ) {
             serde_json::Value::Null
         } else {
@@ -459,6 +515,104 @@ mod tests {
                     "code": null
                 }
             })
+        );
+    }
+
+    fn envelope(error: ExecutorError) -> serde_json::Value {
+        assert_eq!(error.http_status(), StatusCode::BAD_REQUEST);
+        serde_json::from_slice(&error.into_response_body()).expect("valid error response JSON")
+    }
+
+    // The three async-tool errors below match the bodies recorded from OpenAI in
+    // tests/cassettes/async_tools (edge-cases, client-tool-types, multi-agent-parallel).
+
+    #[test]
+    fn unknown_call_output_matches_openai_error_envelope() {
+        let error = ExecutorError::Tool(ToolError::UnknownCallOutput {
+            call_id: "call_async_unknown_probe".to_owned(),
+        });
+        assert_eq!(
+            envelope(error),
+            serde_json::json!({
+                "error": {
+                    "message": "No tool call found for function call output with call_id call_async_unknown_probe.",
+                    "type": "invalid_request_error",
+                    "param": "input",
+                    "code": null
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn unknown_tool_parameter_matches_openai_error_envelope() {
+        let error = ExecutorError::Tool(ToolError::UnknownParameter {
+            param: "tools[0].async".to_owned(),
+        });
+        assert_eq!(
+            envelope(error),
+            serde_json::json!({
+                "error": {
+                    "message": "Unknown parameter: 'tools[0].async'.",
+                    "type": "invalid_request_error",
+                    "param": "tools[0].async",
+                    "code": "unknown_parameter"
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn unsupported_value_matches_openai_error_envelope() {
+        let error = ExecutorError::UnsupportedValue {
+            param: "multi_agent",
+            message: "Async parallel tool calls are not yet supported in multi-agent mode.",
+        };
+        assert_eq!(
+            envelope(error),
+            serde_json::json!({
+                "error": {
+                    "message": "Async parallel tool calls are not yet supported in multi-agent mode.",
+                    "type": "invalid_request_error",
+                    "param": "multi_agent",
+                    "code": "unsupported_value"
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn unsupported_parameters_match_openai_error_envelopes() {
+        let background = ExecutorError::from(UnsupportedParameterError::BackgroundMode);
+        assert_eq!(background.http_status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            envelope(background),
+            serde_json::json!({"error": {
+                "message": "background mode is not supported; omit `background` or set it to false",
+                "type": "invalid_request_error",
+                "code": "unsupported_value",
+                "param": "background"
+            }})
+        );
+        assert_eq!(
+            envelope(ExecutorError::from(UnsupportedParameterError::PromptTemplate)),
+            serde_json::json!({"error": {
+                "message": "reusable prompt templates are not supported; send `instructions` and `input` instead of `prompt`",
+                "type": "invalid_request_error",
+                "code": "unsupported_parameter",
+                "param": "prompt"
+            }})
+        );
+        assert_eq!(
+            envelope(ExecutorError::from(UnsupportedParameterError::BackgroundType(
+                crate::types::request_response::JsonKind::Object
+            ))),
+            serde_json::json!({"error": {
+                "message": "Invalid type for 'background': expected a boolean, but got an object instead.",
+                "type": "invalid_request_error",
+                "code": "invalid_type",
+                "param": "background"
+            }})
         );
     }
 }

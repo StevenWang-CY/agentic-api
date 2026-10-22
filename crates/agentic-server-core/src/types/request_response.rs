@@ -3,20 +3,32 @@ use std::collections::HashMap;
 use std::num::NonZeroU64;
 
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::Value;
 
+use super::io::input::InputValidationError;
 use super::io::{FunctionTool, InputItem, MultiAgentConfig, OutputItem, ResponseUsage, ResponsesInput, ToolChoice};
 use super::tools::ResponsesTool;
-use crate::tool::{CodexNamespaceHandler, CustomHandler, ToolDeclaration, ToolError, responses_declarations};
+use crate::tool::async_execution::lower_async_calls;
+use crate::tool::{
+    CodexNamespaceHandler, CustomHandler, ToolDeclaration, ToolError, declares_async, responses_declarations,
+};
 
+mod prompt_cache;
+pub use prompt_cache::{PromptCacheMode, PromptCacheOptions, PromptCacheOptionsError, PromptCacheTtl};
 mod max_tool_calls;
 mod response_stream;
 mod serde_helpers;
+mod standard_response;
+mod text_config;
+mod unsupported;
 pub use max_tool_calls::{JsonKind, MAX_TOOL_CALLS_PARAM, MaxToolCalls, MaxToolCallsError, OutOfRangeInteger};
 use serde_helpers::{
     default_true, deserialize_conversation, is_absent_or_default_tool_choice, serialize_conversation_object,
     serialize_upstream_tool_choice,
 };
+pub use standard_response::{ResponseReasoning, StandardResponseFields};
+pub use text_config::{ResponseTextConfig, ResponseTextFormat};
+pub use unsupported::{BACKGROUND_PARAM, Background, PROMPT_PARAM, RejectedValue, UnsupportedParameterError};
 #[cfg(feature = "openapi")]
 mod schema;
 
@@ -36,51 +48,6 @@ pub struct ReasoningConfig {
     pub summary: Option<String>,
 }
 
-/// Responses text-generation settings forwarded to the upstream service.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-pub struct ResponseTextConfig {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub format: Option<ResponseTextFormat>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub verbosity: Option<String>,
-    /// Unmodeled extension fields preserved for upstream compatibility.
-    #[serde(default)]
-    #[serde(flatten)]
-    pub extra: Map<String, Value>,
-}
-
-/// Output format requested through [`ResponseTextConfig`].
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-#[non_exhaustive]
-pub enum ResponseTextFormat {
-    Text {
-        /// Unmodeled extension fields preserved for upstream compatibility.
-        #[serde(default)]
-        #[serde(flatten)]
-        extra: Map<String, Value>,
-    },
-    JsonObject {
-        /// Unmodeled extension fields preserved for upstream compatibility.
-        #[serde(default)]
-        #[serde(flatten)]
-        extra: Map<String, Value>,
-    },
-    JsonSchema {
-        name: String,
-        schema: serde_json::Map<String, Value>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        description: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        strict: Option<bool>,
-        /// Unmodeled extension fields preserved for upstream compatibility.
-        #[serde(default)]
-        #[serde(flatten)]
-        extra: Map<String, Value>,
-    },
-}
-
 /// Legacy upstream prompt-cache retention policy. Cache lifetime remains upstream-owned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -95,8 +62,11 @@ pub enum PromptCacheRetention {
 /// uses `store: true` when storage is not specified. Set `store` explicitly when constructing
 /// a stored request with struct update syntax.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(bound(serialize = "Box<T>: Serialize", deserialize = "Box<T>: Deserialize<'de>"))]
-pub struct RequestPayload<T: ?Sized = ResponseTextConfig> {
+#[serde(bound(
+    serialize = "Box<T>: Serialize, C: Serialize",
+    deserialize = "Box<T>: Deserialize<'de>, C: Deserialize<'de>"
+))]
+pub struct RequestPayload<T: ?Sized = ResponseTextConfig, C = PromptCacheOptions> {
     pub model: String,
     pub input: ResponsesInput,
     pub instructions: Option<String>,
@@ -137,11 +107,29 @@ pub struct RequestPayload<T: ?Sized = ResponseTextConfig> {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_cache_retention: Option<PromptCacheRetention>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_options: Option<C>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service_tier: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_salt: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_management: Option<Vec<ContextManagement>>,
+    /// Detection only, never serialized: typed execution rejects `true` (background mode is #357)
+    /// and a non-boolean value.
+    #[serde(default, skip_serializing)]
+    pub background: Option<Background>,
+    /// Detection only, never serialized: typed execution rejects any non-null value.
+    #[serde(default, skip_serializing)]
+    pub prompt: Option<RejectedValue>,
+}
+
+/// Validation failures while constructing a typed upstream request.
+#[derive(Debug, thiserror::Error)]
+pub enum UpstreamRequestError {
+    #[error(transparent)]
+    Input(#[from] InputValidationError),
+    #[error(transparent)]
+    Tool(#[from] ToolError),
 }
 
 #[derive(Debug, Serialize)]
@@ -186,6 +174,8 @@ pub struct UpstreamRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_cache_retention: Option<PromptCacheRetention>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_options: Option<&'a PromptCacheOptions>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub service_tier: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_salt: Option<&'a str>,
@@ -201,7 +191,7 @@ pub enum UpstreamTool {
     Function(FunctionTool),
 }
 
-impl<T: ?Sized> RequestPayload<T> {
+impl<T: ?Sized, C> RequestPayload<T, C> {
     /// The validated `max_tool_calls` limit; `None` means no limit.
     ///
     /// # Errors
@@ -209,6 +199,14 @@ impl<T: ?Sized> RequestPayload<T> {
     /// Returns [`MaxToolCallsError`] when the client sent an invalid value.
     pub fn max_tool_calls_limit(&self) -> Result<Option<NonZeroU64>, MaxToolCallsError> {
         self.max_tool_calls.as_ref().map(MaxToolCalls::limit).transpose()
+    }
+
+    /// Whether any declared tool makes a model-visible tool async.
+    #[must_use]
+    pub fn declares_async_tools(&self) -> bool {
+        self.tools
+            .as_deref()
+            .is_some_and(|tools| tools.iter().any(declares_async))
     }
 
     /// Names the feature in this request that only the in-process executor
@@ -228,6 +226,10 @@ impl<T: ?Sized> RequestPayload<T> {
             .is_some_and(|tools| tools.iter().any(|tool| !matches!(tool, ResponsesTool::Function(_))))
         {
             return Some("gateway-owned tools");
+        }
+        // The gateway emulates async tools: the model server neither marks nor continues them.
+        if self.declares_async_tools() || self.input.has_async_call() {
+            return Some("async tools");
         }
         if self.input.contains_compaction() || self.input.has_compaction_trigger() {
             return Some("compaction input");
@@ -252,7 +254,20 @@ impl<T: ?Sized> RequestPayload<T> {
     pub fn try_map_text<U: ?Sized, E>(
         self,
         map: impl FnOnce(Box<T>) -> Result<Box<U>, E>,
-    ) -> Result<RequestPayload<U>, E> {
+    ) -> Result<RequestPayload<U, C>, E> {
+        self.try_map_configs(map, Ok)
+    }
+
+    /// Transform transport configuration views into typed execution settings.
+    /// All other request fields are moved without reparsing or reallocating them.
+    ///
+    /// # Errors
+    /// Returns either mapping function's error when a configuration cannot be transformed.
+    pub fn try_map_configs<U: ?Sized, D, E>(
+        self,
+        map_text: impl FnOnce(Box<T>) -> Result<Box<U>, E>,
+        map_cache: impl FnOnce(C) -> Result<D, E>,
+    ) -> Result<RequestPayload<U, D>, E> {
         Ok(RequestPayload {
             model: self.model,
             input: self.input,
@@ -265,7 +280,7 @@ impl<T: ?Sized> RequestPayload<T> {
             store: self.store,
             include: self.include,
             reasoning: self.reasoning,
-            text: self.text.map(map).transpose()?,
+            text: self.text.map(map_text).transpose()?,
             temperature: self.temperature,
             top_p: self.top_p,
             max_output_tokens: self.max_output_tokens,
@@ -276,15 +291,30 @@ impl<T: ?Sized> RequestPayload<T> {
             parallel_tool_calls: self.parallel_tool_calls,
             prompt_cache_key: self.prompt_cache_key,
             prompt_cache_retention: self.prompt_cache_retention,
+            prompt_cache_options: self.prompt_cache_options.map(map_cache).transpose()?,
             service_tier: self.service_tier,
             multi_agent: self.multi_agent,
             cache_salt: self.cache_salt,
             context_management: self.context_management,
+            background: self.background,
+            prompt: self.prompt,
         })
     }
 }
 
 impl RequestPayload {
+    /// Snapshot effective settings for an automatic successor without copying
+    /// canonical item history or carrying the current response's routing.
+    /// The original request, including its input, remains unchanged.
+    pub(crate) fn continuation_settings(&mut self) -> Self {
+        let input = std::mem::take(&mut self.input);
+        let mut settings = self.clone();
+        self.input = input;
+        settings.previous_response_id = None;
+        settings.conversation = None;
+        settings
+    }
+
     /// The Responses adapter boundary: this request's declared tools as the
     /// tool layer's declarations, with the wire tools left in place.
     #[must_use]
@@ -302,11 +332,13 @@ impl RequestPayload {
     ///
     /// # Errors
     ///
-    /// Returns [`ToolError::Config`] when a Codex namespace member's generated
+    /// Rejects unsupported message content before normalization. Returns a tool
+    /// validation error when a Codex namespace member's generated
     /// flat name collides with a top-level function tool or another namespace
     /// member, or when a custom tool declares a format whose constrained
     /// decoding cannot be preserved upstream.
-    pub fn to_upstream_request(&self, stream: bool) -> Result<UpstreamRequest<'_>, ToolError> {
+    pub fn to_upstream_request(&self, stream: bool) -> Result<UpstreamRequest<'_>, UpstreamRequestError> {
+        self.input.validate()?;
         // This is only the upstream model-generation preference: it controls
         // whether the model may emit parallel calls, not how the gateway
         // schedules calls after inference. Forward an explicit client value;
@@ -334,7 +366,9 @@ impl RequestPayload {
         });
         let tools = tools.filter(|tools| !tools.is_empty());
         let namespace_map = CodexNamespaceHandler.build_namespace_map(declarations.as_deref())?;
-        let input = CodexNamespaceHandler.resolve_input(namespace_map.as_ref(), self.input.normalized_model_input());
+        let input = lower_async_calls(
+            CodexNamespaceHandler.resolve_input(namespace_map.as_ref(), self.input.normalized_model_input()?),
+        );
         let tool_choice = CodexNamespaceHandler.resolve_tool_choice(namespace_map.as_ref(), self.tool_choice.as_ref());
         CustomHandler::validate_tool_choice(declarations.as_deref(), &tool_choice)?;
         Ok(UpstreamRequest {
@@ -356,6 +390,7 @@ impl RequestPayload {
             parallel_tool_calls,
             prompt_cache_key: self.prompt_cache_key.as_deref(),
             prompt_cache_retention: self.prompt_cache_retention,
+            prompt_cache_options: self.prompt_cache_options.as_ref(),
             service_tier: self.service_tier.as_deref(),
             cache_salt: self.cache_salt.as_deref(),
         })
@@ -387,6 +422,8 @@ pub struct CompactRequest {
     pub service_tier: Option<String>,
     #[serde(default)]
     pub prompt_cache_retention: Option<PromptCacheRetention>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_options: Option<PromptCacheOptions>,
     #[serde(default)]
     pub prompt_cache_key: Option<String>,
     /// Compatibility fields sent by current SDK and Codex clients.
@@ -438,17 +475,20 @@ pub struct ResponsePayload {
     /// The request's `max_tool_calls`, always echoed (`null` when unset). Never inherited.
     #[serde(default)]
     pub max_tool_calls: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, serialize_with = "standard_response::serialize_response_service_tier")]
     pub service_tier: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, serialize_with = "standard_response::serialize_response_tools")]
     pub tools: Option<Vec<ResponsesTool>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, serialize_with = "standard_response::serialize_response_tool_choice")]
     pub tool_choice: Option<ToolChoice>,
+    #[serde(flatten)]
+    pub standard_fields: StandardResponseFields,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::io::InOutItem;
 
     #[test]
     fn prompt_cache_retention_survives_text_mapping_and_request_round_trip() {
@@ -580,6 +620,35 @@ mod tests {
         assert_eq!(payload.in_process_feature(), None);
     }
 
+    /// A stateless request with only function tools normally goes straight to the model server,
+    /// which ignores `async`; async tools and replayed async calls need the executor.
+    #[test]
+    fn async_tools_and_replayed_async_calls_require_the_executor() {
+        let request = |tools: serde_json::Value, input: serde_json::Value| -> RequestPayload {
+            serde_json::from_value(serde_json::json!({
+                "model": "test-model", "store": false, "tools": tools, "input": input
+            }))
+            .unwrap()
+        };
+        let sync_tool = serde_json::json!([{"type": "function", "name": "get_weather"}]);
+        let async_tool = serde_json::json!([{"type": "function", "name": "get_weather", "async": true}]);
+        let call = |async_execution: bool| {
+            serde_json::json!([{"type": "function_call", "call_id": "call_1", "name": "get_weather",
+                "arguments": "{}", "async": async_execution}])
+        };
+
+        assert_eq!(request(sync_tool.clone(), call(false)).in_process_feature(), None);
+        assert_eq!(
+            request(async_tool, serde_json::json!("hi")).in_process_feature(),
+            Some("async tools")
+        );
+        assert_eq!(
+            request(sync_tool, call(true)).in_process_feature(),
+            Some("async tools"),
+            "a replayed async call keeps executor semantics after the tool is re-declared"
+        );
+    }
+
     #[test]
     fn request_payload_accepts_openai_conversation_field() {
         let request: RequestPayload = serde_json::from_value(serde_json::json!({
@@ -638,6 +707,7 @@ mod tests {
             service_tier: None,
             tools: None,
             tool_choice: None,
+            standard_fields: StandardResponseFields::default(),
             max_tool_calls: None,
         };
 
@@ -665,6 +735,7 @@ mod tests {
             tools: None,
             max_tool_calls: None,
             tool_choice: None,
+            standard_fields: StandardResponseFields::default(),
         };
 
         let json = serde_json::to_value(&payload).expect("response should serialize");
@@ -1384,16 +1455,26 @@ mod tests {
     }
 
     #[test]
-    fn responses_input_discards_unknown_items_when_converted_for_storage() {
-        let input: ResponsesInput = serde_json::from_value(serde_json::json!([
-            {"type": "message", "role": "user", "content": "hi"},
-            {"type": "future_item", "payload": {"a": 1}}
+    fn legacy_unknown_items_are_omitted_from_model_conversion() {
+        let mut items: Vec<InOutItem> = serde_json::from_value(serde_json::json!([
+            {"type": "message", "role": "user", "content": "hi"}
         ]))
         .unwrap();
+        items.push(InOutItem::Output(OutputItem::Unknown));
+        let input = ResponsesInput::from(items);
 
         let items = Vec::<InputItem>::from(&input);
         assert_eq!(items.len(), 1);
         assert!(matches!(items[0], InputItem::Message(_)));
+    }
+
+    #[test]
+    fn responses_input_rejects_unknown_items() {
+        let input = serde_json::from_value::<ResponsesInput>(serde_json::json!([
+            {"type": "message", "role": "user", "content": "hi"},
+            {"type": "future_item", "payload": {"a": 1}}
+        ]));
+        assert!(input.is_err(), "an unmodeled item type fails at the boundary");
     }
 
     #[test]
@@ -1415,6 +1496,7 @@ mod tests {
             service_tier: None,
             tools: None,
             tool_choice: None,
+            standard_fields: StandardResponseFields::default(),
         };
 
         for (status, expected_type) in [
@@ -1454,6 +1536,7 @@ mod tests {
             service_tier: None,
             tools: Some(vec![tool]),
             tool_choice: None,
+            standard_fields: StandardResponseFields::default(),
         };
 
         let response = serde_json::to_value(&payload).expect("blocking response");
@@ -1484,6 +1567,7 @@ mod tests {
             service_tier: None,
             tools: None,
             tool_choice: None,
+            standard_fields: StandardResponseFields::default(),
         };
 
         let chunk = payload.as_created_response_chunk();

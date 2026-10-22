@@ -5,6 +5,7 @@ use tokio::sync::Semaphore;
 
 use super::*;
 use crate::executor::messages_tools::{Admission, GATEWAY_TOOL_TIMEOUT, run};
+use crate::executor::telemetry::metrics::ExecutorMetrics;
 use crate::tool::{GatewayExecutors, ToolDeclaration, ToolOwnership};
 use crate::types::messages::tool_seam;
 
@@ -48,6 +49,7 @@ async fn messages_scheduling_timeout_excludes_each_permit_wait_and_releases_capa
     for wait_at in 0..3 {
         let (registry, mut started, active) = registry().await;
         let policy = policy(1);
+        let metrics = ExecutorMetrics::from_global();
         let slots = policy.execution_slots();
         let same_tool = (wait_at == 0).then(|| exclusion(&registry).try_acquire().unwrap());
         let round_slot = (wait_at == 1).then(|| slots.try_acquire().unwrap());
@@ -57,7 +59,7 @@ async fn messages_scheduling_timeout_excludes_each_permit_wait_and_releases_capa
                 materialization.push(policy.acquire_materialization_permit().await);
             }
         }
-        let mut call = Box::pin(run(admission("web_search"), &registry, &policy, &slots));
+        let mut call = Box::pin(run(admission("web_search"), &registry, &policy, &slots, &metrics));
         assert!(poll!(call.as_mut()).is_pending());
         tokio::time::advance(GATEWAY_TOOL_TIMEOUT * 2).await;
         assert!(
@@ -86,7 +88,7 @@ async fn messages_scheduling_timeout_excludes_each_permit_wait_and_releases_capa
         assert_eq!(exclusion(&registry).available_permits(), 1);
 
         // A following call must be able to use all three permit layers.
-        let mut next = Box::pin(run(admission("web_search"), &registry, &policy, &slots));
+        let mut next = Box::pin(run(admission("web_search"), &registry, &policy, &slots, &metrics));
         assert!(poll!(next.as_mut()).is_pending());
         started.try_recv().unwrap().complete();
         assert!(!next.await.is_error);
@@ -97,6 +99,7 @@ async fn messages_scheduling_timeout_excludes_each_permit_wait_and_releases_capa
 async fn messages_scheduling_errors_release_permits_and_preserve_tool_failure_status() {
     let (registry, mut started, active) = registry().await;
     let policy = policy(1);
+    let metrics = ExecutorMetrics::from_global();
     let slots = policy.execution_slots();
     for outcome in [
         Err(ToolError::Execution("backend failed".into())),
@@ -107,7 +110,7 @@ async fn messages_scheduling_errors_release_permits_and_preserve_tool_failure_st
             Err(error) => (format!("tool execution failed: {error}"), true),
             Ok(output) => (output.output.clone(), output.is_failure()),
         };
-        let mut call = Box::pin(run(admission("web_search"), &registry, &policy, &slots));
+        let mut call = Box::pin(run(admission("web_search"), &registry, &policy, &slots, &metrics));
         assert!(poll!(call.as_mut()).is_pending());
         started.try_recv().unwrap().finish.send(outcome).unwrap();
         let result = call.await;
@@ -123,11 +126,12 @@ async fn messages_scheduling_errors_release_permits_and_preserve_tool_failure_st
 async fn messages_scheduling_unexecuted_results_do_not_wait_for_capacity() {
     let (registry, _, active) = registry().await;
     let policy = policy(1);
+    let metrics = ExecutorMetrics::from_global();
     let slots = policy.execution_slots();
     let _busy = slots.acquire().await.unwrap();
     let refused = Admission::Refused(tool_seam::tool_result_block("refused", "budget exceeded".into(), true));
     for admission in [refused, admission("missing")] {
-        let mut call = Box::pin(run(admission, &registry, &policy, &slots));
+        let mut call = Box::pin(run(admission, &registry, &policy, &slots, &metrics));
         let std::task::Poll::Ready(result) = poll!(call.as_mut()) else {
             panic!("a call with no executable work must not wait for an execution permit");
         };
@@ -140,12 +144,13 @@ async fn messages_scheduling_unexecuted_results_do_not_wait_for_capacity() {
 async fn messages_scheduling_dropping_permit_wait_releases_partial_acquisition() {
     let (registry, _, active) = registry().await;
     let policy = policy(1);
+    let metrics = ExecutorMetrics::from_global();
     let slots = policy.execution_slots();
     let mut held = Vec::new();
     for _ in 0..MAX_CONCURRENT_MATERIALIZATIONS {
         held.push(policy.acquire_materialization_permit().await);
     }
-    let mut call = Box::pin(run(admission("web_search"), &registry, &policy, &slots));
+    let mut call = Box::pin(run(admission("web_search"), &registry, &policy, &slots, &metrics));
     assert!(poll!(call.as_mut()).is_pending());
     assert_eq!(slots.available_permits(), 0);
     assert_eq!(exclusion(&registry).available_permits(), 0);

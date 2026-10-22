@@ -1,4 +1,6 @@
 mod common;
+#[path = "responses/prompt_cache_options.rs"]
+mod prompt_cache_options;
 
 use axum::Router;
 use axum::body::Bytes;
@@ -21,9 +23,8 @@ use tokio_util::sync::CancellationToken;
 
 use agentic_core::executor::{ConversationHandler, ExecutionContext, ResponseHandler};
 use agentic_core::proxy::ProxyState;
-use agentic_core::storage::{
-    ConversationStore, DbPool, InOutItem, ResponseMetadata, ResponseStore, create_pool_with_schema,
-};
+use agentic_core::storage::{ConversationStore, DbPool, ResponseMetadata, ResponseStore, create_pool_with_schema};
+use agentic_core::types::io::InOutItem;
 use agentic_core::types::io::{InputItem, ResponsesInput};
 use agentic_server::app::{AppState, DEFAULT_MAX_REQUEST_BODY_SIZE, WebSocketTracker};
 
@@ -1157,6 +1158,41 @@ async fn test_invalid_json_is_rejected_before_upstream() {
 }
 
 #[tokio::test]
+async fn test_unsupported_input_item_is_rejected_before_upstream() {
+    let (llm_url, requests, _llm) = spawn_mock_vllm_json_capture_bytes().await;
+    let (gateway_url, _gateway) = spawn_gateway(test_state(&test_config(&llm_url))).await;
+    let client = reqwest::Client::new();
+
+    for store in [false, true] {
+        for stream in [false, true] {
+            let response = client
+                .post(format!("{gateway_url}/v1/responses"))
+                .json(&serde_json::json!({
+                    "model": "test",
+                    "store": store,
+                    "stream": stream,
+                    "input": [
+                        {"role": "user", "content": "hi"},
+                        {"type": "computer_call", "id": "cu_1", "call_id": "call_1", "action": {"type": "click"}}
+                    ]
+                }))
+                .send()
+                .await
+                .expect("unsupported input request");
+
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body: serde_json::Value = response.json().await.expect("error envelope");
+            assert_eq!(body["error"]["code"], "invalid_request_error");
+            assert_eq!(body["error"]["type"], "invalid_request_error");
+            assert!(body["error"].get("param").is_none(), "request shape, not a parameter");
+            let message = body["error"]["message"].as_str().expect("error message");
+            assert!(!message.is_empty(), "the boundary reports why the body was rejected");
+        }
+    }
+    assert!(requests.lock().await.is_empty(), "rejected before reaching upstream");
+}
+
+#[tokio::test]
 async fn test_store_false_with_web_search_reaches_executor() {
     // Arrange
     let (llm_url, requests, _h1) = spawn_mock_vllm_json_capture().await;
@@ -1499,6 +1535,143 @@ async fn test_max_tool_calls_is_validated_on_proxy_and_executor_routes() {
     assert!(
         requests[1].get("max_tool_calls").is_none(),
         "the executor enforces the limit instead of forwarding it"
+    );
+    gateway.abort();
+    llm.abort();
+}
+
+#[tokio::test]
+async fn test_unsupported_parameters_are_rejected_by_typed_execution_and_passed_through_directly() {
+    let (llm_url, requests, llm) = spawn_mock_vllm_json_capture().await;
+    let fixture = storage_backed_state(&llm_url).await;
+    let (gateway_url, gateway) = spawn_gateway(fixture.state.clone()).await;
+    let client = reqwest::Client::new();
+    let post = |request: serde_json::Value| client.post(format!("{gateway_url}/v1/responses")).json(&request).send();
+    let unsupported = [
+        (
+            "background",
+            serde_json::json!(true),
+            "unsupported_value",
+            "background mode is not supported; omit `background` or set it to false",
+        ),
+        (
+            "prompt",
+            serde_json::json!({"id": "pmpt_1", "version": "2"}),
+            "unsupported_parameter",
+            "reusable prompt templates are not supported; send `instructions` and `input` instead of `prompt`",
+        ),
+    ];
+
+    // Storage, a continuation, or any other executor feature selects typed
+    // execution, which rejects before history lookup or inference.
+    for route in [
+        serde_json::json!({"store": true, "stream": false}),
+        serde_json::json!({"store": true, "stream": true}),
+        serde_json::json!({"store": false, "previous_response_id": "resp_missing"}),
+    ] {
+        for (param, value, code, message) in &unsupported {
+            let mut request = serde_json::json!({"model": "test", "input": "hi"});
+            request
+                .as_object_mut()
+                .unwrap()
+                .extend(route.as_object().unwrap().clone());
+            request[*param] = value.clone();
+            let response = post(request.clone()).await.expect("response request");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{request}");
+            let body: serde_json::Value = response.json().await.expect("error body");
+            assert_eq!(
+                body,
+                serde_json::json!({"error": {
+                    "message": message, "type": "invalid_request_error", "code": code, "param": param
+                }}),
+                "{request}"
+            );
+        }
+    }
+    assert!(
+        requests.lock().await.is_empty(),
+        "typed execution rejects before any upstream call"
+    );
+
+    // Direct pass-through keeps the original body; the upstream decides.
+    for (param, value, ..) in &unsupported {
+        let mut request = serde_json::json!({"model": "test", "input": "hi", "store": false});
+        request[*param] = value.clone();
+        let response = post(request.clone()).await.expect("response request");
+        assert_eq!(response.status(), StatusCode::OK, "{request}");
+        let forwarded = requests.lock().await.last().cloned().expect("forwarded request");
+        assert_eq!(forwarded, request, "the direct route forwards the body unchanged");
+    }
+
+    // Typed execution accepts the explicit defaults and does not forward them.
+    let response = post(serde_json::json!({
+        "model": "test", "input": "hi", "store": true, "background": false, "prompt": null
+    }))
+    .await
+    .expect("response request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let forwarded = requests.lock().await.last().cloned().expect("forwarded request");
+    assert!(
+        forwarded.get("background").is_none() && forwarded.get("prompt").is_none(),
+        "{forwarded}"
+    );
+    gateway.abort();
+    llm.abort();
+}
+
+#[tokio::test]
+async fn test_non_boolean_background_is_forwarded_directly_and_rejected_by_typed_execution() {
+    let (llm_url, requests, llm) = spawn_mock_vllm_json_capture().await;
+    let fixture = storage_backed_state(&llm_url).await;
+    let (gateway_url, gateway) = spawn_gateway(fixture.state.clone()).await;
+    let client = reqwest::Client::new();
+    let post = |request: serde_json::Value| client.post(format!("{gateway_url}/v1/responses")).json(&request).send();
+    let values = [
+        (serde_json::json!(0), "an integer"),
+        (serde_json::json!("false"), "a string"),
+        (serde_json::json!({}), "an object"),
+        (serde_json::json!([]), "an array"),
+        (serde_json::json!(0.5), "a decimal number"),
+    ];
+
+    // Direct pass-through keeps the original body: the upstream decides.
+    for stream in [false, true] {
+        for (value, _) in &values {
+            let request = serde_json::json!({
+                "model": "test", "input": "hi", "store": false, "stream": stream, "background": value
+            });
+            let response = post(request.clone()).await.expect("response request");
+            assert_eq!(response.status(), StatusCode::OK, "{request}");
+            let forwarded = requests.lock().await.last().cloned().expect("forwarded request");
+            assert_eq!(forwarded, request, "the direct route forwards the body unchanged");
+        }
+    }
+    let forwarded = requests.lock().await.len();
+
+    // Typed execution rejects the value before any upstream call.
+    for stream in [false, true] {
+        for (value, kind) in &values {
+            let request = serde_json::json!({
+                "model": "test", "input": "hi", "store": true, "stream": stream, "background": value
+            });
+            let response = post(request.clone()).await.expect("response request");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{request}");
+            assert_eq!(
+                response.json::<serde_json::Value>().await.expect("error body"),
+                serde_json::json!({"error": {
+                    "message": format!("Invalid type for 'background': expected a boolean, but got {kind} instead."),
+                    "type": "invalid_request_error",
+                    "code": "invalid_type",
+                    "param": "background"
+                }}),
+                "{request}"
+            );
+        }
+    }
+    assert_eq!(
+        requests.lock().await.len(),
+        forwarded,
+        "typed execution never reaches the upstream"
     );
     gateway.abort();
     llm.abort();
@@ -2156,7 +2329,10 @@ async fn test_http_preserves_multiple_images_across_messages() {
 
     let requests = requests.lock().await;
     assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0]["input"], input);
+    let mut expected_input = input.clone();
+    expected_input[0]["content"][1]["detail"] = "auto".into();
+    expected_input[2]["content"][0]["detail"] = "auto".into();
+    assert_eq!(requests[0]["input"], expected_input);
     let images = requests[0]["input"]
         .as_array()
         .expect("input items")
@@ -2406,7 +2582,9 @@ async fn test_http_conversation_rehydration_preserves_images() {
     let requests = requests.lock().await;
     assert_eq!(requests.len(), 2);
     let history = requests[1]["input"].as_array().expect("rehydrated history");
-    assert_eq!(history[0]["content"], content);
+    let mut expected_content = content.clone();
+    expected_content[1]["detail"] = "auto".into();
+    assert_eq!(history[0]["content"], expected_content);
     assert_eq!(history.last().expect("newest turn")["content"], "follow up");
 }
 
@@ -2499,12 +2677,9 @@ async fn test_store_false_proxies_image_content_verbatim() {
 }
 
 #[tokio::test]
-async fn test_http_text_only_model_still_forwards_images_unchanged() {
-    // The gateway never strips image content on the model's behalf: whether a
-    // model accepts images is the upstream's decision, so a request naming a
-    // text-only model must still reach it with the image part intact. That is
-    // what lets a missing image be attributed to the client rather than to the
-    // gateway.
+async fn test_http_text_only_model_still_forwards_images() {
+    // The gateway preserves image content regardless of model capability and
+    // supplies vLLM's required default image detail when the client omits it.
     let (llm_url, requests, _llm) = spawn_mock_vllm_json_capture().await;
     let fixture = storage_backed_state(&llm_url).await;
     let (gateway_url, _gateway) = spawn_gateway(fixture.state.clone()).await;
@@ -2526,7 +2701,9 @@ async fn test_http_text_only_model_still_forwards_images_unchanged() {
 
     let requests = requests.lock().await;
     assert_eq!(requests[0]["model"], "text-only-model");
-    assert_eq!(requests[0]["input"][0]["content"], content);
+    let mut expected_content = content.clone();
+    expected_content[1]["detail"] = "auto".into();
+    assert_eq!(requests[0]["input"][0]["content"], expected_content);
 }
 
 async fn stored_row_counts(pool: &Arc<DbPool>) -> (i64, i64) {
@@ -2919,4 +3096,109 @@ async fn cache_usage_is_scoped_to_http_continuation_with_restored_history() {
         assert_eq!(requests[1]["input"][0]["content"], "parent context");
         assert!(requests[1].get("previous_response_id").is_none());
     }
+}
+
+/// Replays the recorded mixed-tool capture through the blocking HTTP transport. The client
+/// sees the declarations it submitted on the terminal payload and on retrieval, while
+/// inference keeps the lowered function schemas the capture recorded.
+#[tokio::test]
+async fn recorded_mixed_tool_capture_stays_public_over_http_json() {
+    let capture = common::load_mixed_gateway_capture(false);
+    let public_tools = common::mixed_capture_public_tools(&capture);
+    let upstream: serde_json::Value =
+        serde_json::from_str(&common::mixed_capture_upstream_fixture(&capture)).expect("recorded body is JSON");
+    let (llm_url, requests, _llm) = spawn_mock_vllm_json_capture_sequence(vec![upstream]).await;
+    let fixture = storage_backed_state(&llm_url).await;
+    let (gateway_url, _gateway) = spawn_gateway(fixture.state.clone()).await;
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(format!("{gateway_url}/v1/responses"))
+        .bearer_auth("test-key")
+        .json(&common::mixed_capture_client_request(&capture))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = response.json().await.unwrap();
+    common::assert_public_mixed_tools(&body, &public_tools, "terminal payload");
+    common::assert_recorded_mixed_output_kinds(&body, &capture, "terminal payload");
+
+    let id = body["id"].as_str().expect("response id");
+    let stored: serde_json::Value = client
+        .get(format!("{gateway_url}/v1/responses/{id}"))
+        .bearer_auth("test-key")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(stored, body, "retrieval returns the stored response");
+    common::assert_public_mixed_tools(&stored, &public_tools, "stored response");
+
+    let requests = requests.lock().await;
+    assert_eq!(requests.len(), 1, "the replayed turn runs one inference round");
+    common::assert_lowered_mixed_upstream(&requests[0]);
+}
+
+/// Replays the same capture through the SSE transport: every lifecycle snapshot that carries
+/// a `response` object reports the submitted declarations, including the terminal frame that
+/// omits them, and retrieval returns them too.
+#[tokio::test]
+async fn recorded_mixed_tool_capture_stays_public_over_http_sse() {
+    let capture = common::load_mixed_gateway_capture(true);
+    let public_tools = common::mixed_capture_public_tools(&capture);
+    let upstream = common::mixed_capture_upstream_fixture(&capture);
+    let (llm_url, requests, _llm) = spawn_tool_search_sse_sequence(vec![upstream]).await;
+    let fixture = storage_backed_state(&llm_url).await;
+    let (gateway_url, _gateway) = spawn_gateway(fixture.state.clone()).await;
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(format!("{gateway_url}/v1/responses"))
+        .bearer_auth("test-key")
+        .json(&common::mixed_capture_client_request(&capture))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let events = sse_events(&response.text().await.unwrap());
+
+    let lifecycle: Vec<&str> = events
+        .iter()
+        .filter(|event| event.get("response").is_some())
+        .filter_map(|event| event["type"].as_str())
+        .collect();
+    assert_eq!(
+        lifecycle,
+        ["response.created", "response.in_progress", "response.completed"],
+        "the replay covers the three lifecycle snapshots"
+    );
+    for event in &events {
+        if let Some(terminal) = event.get("response") {
+            common::assert_public_mixed_tools(terminal, &public_tools, event["type"].as_str().unwrap_or_default());
+        }
+    }
+
+    let terminal = events
+        .iter()
+        .find(|event| event["type"] == "response.completed")
+        .expect("completed snapshot");
+    common::assert_recorded_mixed_output_kinds(&terminal["response"], &capture, "terminal snapshot");
+    let id = terminal["response"]["id"].as_str().expect("response id");
+    let stored: serde_json::Value = client
+        .get(format!("{gateway_url}/v1/responses/{id}"))
+        .bearer_auth("test-key")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    common::assert_public_mixed_tools(&stored, &public_tools, "stored response");
+
+    let requests = requests.lock().await;
+    assert_eq!(requests.len(), 1, "the replayed turn runs one inference round");
+    common::assert_lowered_mixed_upstream(&requests[0]);
 }

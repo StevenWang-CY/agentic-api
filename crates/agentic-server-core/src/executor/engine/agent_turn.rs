@@ -5,27 +5,30 @@
 //! pipeline. The pipeline owns ingestion, not tool-loop or agent-tree decisions.
 //! These steps neither spawn agents nor finalize/persist a public response.
 
+mod round_policy;
+
 use super::accumulate_usage;
+use round_policy::{AsyncContinuations, ClientCalls, classify_round};
 use std::{collections::HashMap, num::NonZeroUsize};
 
 use tracing::{Instrument as _, debug};
 
 use crate::executor::compaction::maybe_compact_context;
 use crate::executor::error::{ExecutorError, ExecutorResult};
-use crate::executor::gateway::history::append_input_item;
 use crate::executor::gateway::{
     BuiltInToolCallBudget, GatewayCallResult, GatewayScheduler, append_gateway_calls_to_new_input,
     append_output_items_to_input, append_tool_outputs, emit_gateway_start_events, execute_and_emit_output_calls,
-    has_client_owned_calls, public_output_items, relay_round_events,
+    public_output_items, relay_round_events,
 };
 use crate::executor::pipeline::AgentPipeline;
 use crate::executor::rehydrate::prepare_reasoning_for_vllm;
 use crate::executor::relay::Release;
 use crate::executor::request::{ExecutionContext, RequestContext};
 use crate::executor::response_budget::ExecutorResponseBudget;
+use crate::executor::telemetry::metrics::Stage;
 use crate::executor::upstream::{fetch_blocking_payload, fetch_stream_payload};
 use crate::tool::{ToolRegistry, mcp, record_discovered_mcp_tools, responses_declarations};
-use crate::types::io::{InputItem, OutputItem, ResponsesInput, ToolChoice};
+use crate::types::io::{InputItem, OutputItem, ResponsesInput};
 use crate::types::request_response::ResponsePayload;
 
 /// Outcome of inspecting one inference round's output, deciding whether the
@@ -52,32 +55,6 @@ pub(super) enum RoundDecision {
 pub(super) struct RoundResult {
     pub(super) payload: ResponsePayload,
     pub(super) decision: RoundDecision,
-}
-
-/// Classify one turn's output into a [`RoundDecision`].
-///
-/// Order matters: client-owned calls take precedence (they must be handed back
-/// even when gateway calls are also present in the same turn), then a
-/// no-gateway-work turn is `Done`. Otherwise gateway tools ran — the loop would
-/// continue, unless this was the last permitted round, in which case the budget
-/// is exhausted and the turn is `Incomplete`.
-///
-/// `round` is zero-based; `max_rounds` is the total budget.
-fn classify_round(
-    has_client_owned_calls: bool,
-    gateway_results: &[GatewayCallResult],
-    round: usize,
-    max_rounds: usize,
-) -> RoundDecision {
-    if has_client_owned_calls {
-        RoundDecision::RequiresClientAction
-    } else if gateway_results.is_empty() {
-        RoundDecision::Done
-    } else if round + 1 >= max_rounds {
-        RoundDecision::Incomplete(format!("gateway tool execution exceeded {max_rounds} rounds"))
-    } else {
-        RoundDecision::Continue
-    }
 }
 
 pub(super) async fn build_tool_registry(
@@ -141,7 +118,8 @@ fn record_round_history(
             output_items
                 .iter()
                 .filter(|item| !matches!(item, OutputItem::McpListTools(_)))
-                .filter_map(OutputItem::to_input_item),
+                .filter_map(OutputItem::to_input_item)
+                .map(Into::into),
         );
         continuation.mark_outputs_recorded(public_output_count);
     } else {
@@ -161,6 +139,7 @@ pub(super) struct AgentTurn<'a> {
     max_rounds: NonZeroUsize,
     next_round: usize,
     tool_call_budget: BuiltInToolCallBudget,
+    async_continuations: AsyncContinuations,
 }
 
 /// A resumable execution snapshot. Canonical input remains with the coordinator
@@ -171,6 +150,7 @@ pub(super) struct AgentExecutionState {
     max_rounds: NonZeroUsize,
     next_round: usize,
     tool_call_budget: BuiltInToolCallBudget,
+    async_continuations: AsyncContinuations,
 }
 
 impl AgentExecutionState {
@@ -199,6 +179,7 @@ impl AgentExecutionState {
     }
     pub(super) fn restart(&mut self) {
         self.next_round = 0;
+        self.async_continuations = AsyncContinuations::default();
     }
 }
 
@@ -215,6 +196,7 @@ impl<'a> AgentTurn<'a> {
             max_rounds: state.max_rounds,
             next_round: state.next_round,
             tool_call_budget: state.tool_call_budget,
+            async_continuations: state.async_continuations,
         }
     }
 
@@ -224,6 +206,7 @@ impl<'a> AgentTurn<'a> {
             max_rounds: self.max_rounds,
             next_round: self.next_round,
             tool_call_budget: self.tool_call_budget.clone(),
+            async_continuations: self.async_continuations,
         }
     }
     pub(super) async fn new(
@@ -241,6 +224,7 @@ impl<'a> AgentTurn<'a> {
             max_rounds,
             next_round: 0,
             tool_call_budget,
+            async_continuations: AsyncContinuations::default(),
         })
     }
 
@@ -287,8 +271,9 @@ impl<'a> AgentTurn<'a> {
             compaction_usage.is_some(),
         )?;
         let round_span = crate::executor::telemetry::stages::inference_round(round);
-        let mut payload = if stream_upstream {
-            let payload = fetch_stream_payload(
+        let timer = self.exec_ctx.metrics.stage(Stage::Inference);
+        let fetched = if stream_upstream {
+            fetch_stream_payload(
                 self.pipeline,
                 self.exec_ctx,
                 auth,
@@ -297,11 +282,7 @@ impl<'a> AgentTurn<'a> {
                 response_budget,
             )
             .instrument(round_span)
-            .await?;
-            if round == 0 {
-                self.registry.clear_mcp_list_tool_items();
-            }
-            payload
+            .await
         } else {
             fetch_blocking_payload(
                 self.pipeline,
@@ -311,8 +292,16 @@ impl<'a> AgentTurn<'a> {
                 Some(response_budget),
             )
             .instrument(round_span)
-            .await?
+            .await
         };
+        timer.finish_result(&fetched);
+        let mut payload = fetched?;
+        if stream_upstream && round == 0 {
+            self.registry.clear_mcp_list_tool_items();
+        }
+        // Only what this round's upstream response reported; an absent
+        // `usage` records nothing.
+        self.exec_ctx.metrics.record_response_usage(payload.usage.as_ref());
         let mut round_usage = compaction_usage;
         accumulate_usage(&mut round_usage, payload.usage.take());
         payload.usage = round_usage;
@@ -329,7 +318,7 @@ impl<'a> AgentTurn<'a> {
 
         let current_output = std::mem::take(&mut payload.output);
         log_custom_tool_calls(&current_output, &self.pipeline.request.response_id);
-        let has_client_owned = has_client_owned_calls(&current_output, &self.registry);
+        let client_calls = ClientCalls::of(&current_output, &self.registry);
         let gateway_results = self
             .execute_round_output(&current_output, output_offset, response_budget)
             .await?;
@@ -344,13 +333,7 @@ impl<'a> AgentTurn<'a> {
             output_offset + payload.output.len(),
         );
 
-        // Completed gateway calls still need their outputs recorded when an
-        // incomplete response or client call prevents another inference round.
-        let decision = if payload.status == "incomplete" {
-            RoundDecision::UpstreamTerminal
-        } else {
-            classify_round(has_client_owned, &gateway_results, round, self.max_rounds.get())
-        };
+        let decision = self.round_decision(&mut payload, client_calls, &gateway_results, round);
         if matches!(decision, RoundDecision::Continue) || multi_agent {
             self.append_round_input(&current_output, &payload.output, multi_agent);
         }
@@ -358,8 +341,48 @@ impl<'a> AgentTurn<'a> {
         Ok(RoundResult { payload, decision })
     }
 
+    fn round_decision(
+        &mut self,
+        payload: &mut ResponsePayload,
+        client_calls: ClientCalls,
+        gateway_results: &[GatewayCallResult],
+        round: usize,
+    ) -> RoundDecision {
+        // Completed gateway calls still need their outputs recorded when an
+        // incomplete response or client call prevents another inference round.
+        let reason = payload
+            .incomplete_details
+            .as_ref()
+            .and_then(|details| details.reason.as_deref());
+        let locally_steered = self.pipeline.steering_requested() && reason == Some("steered");
+        if locally_steered && client_calls.synchronous {
+            // A completed client call still requires its actual output. Keep
+            // the ordinary completed parent available for explicit continuation.
+            "completed".clone_into(&mut payload.status);
+            payload.incomplete_details = None;
+            RoundDecision::RequiresClientAction
+        } else if payload.status == "incomplete" {
+            RoundDecision::UpstreamTerminal
+        } else if self.pipeline.steering_requested()
+            && !client_calls.synchronous
+            && (!gateway_results.is_empty() || client_calls.asynchronous)
+        {
+            // The entire admitted gateway batch has settled and its events have
+            // been emitted. Do not start another inference round after steering.
+            RoundDecision::Incomplete("steered".to_owned())
+        } else {
+            classify_round(
+                client_calls,
+                gateway_results,
+                round,
+                self.max_rounds.get(),
+                &mut self.async_continuations,
+            )
+        }
+    }
+
     fn append_round_input(&mut self, output: &[OutputItem], public: &[OutputItem], multi_agent: bool) {
-        self.pipeline.request.enriched_request.tool_choice = Some(ToolChoice::Auto);
+        self.pipeline.request.relax_tool_choice();
         if multi_agent {
             // Preserve client-call kinds for checkpoint validation and output routing.
             // Reuse the public projection; built-in calls retain their canonical history.
@@ -383,7 +406,7 @@ impl<'a> AgentTurn<'a> {
                     item => item.to_input_item(),
                 };
                 if let Some(input) = input {
-                    append_input_item(&mut self.pipeline.request.enriched_request.input, input);
+                    self.pipeline.request.enriched_request.input.push(input);
                 }
             }
         } else {
@@ -404,14 +427,13 @@ impl<'a> AgentTurn<'a> {
         output_offset: usize,
         response_budget: &ExecutorResponseBudget,
     ) -> ExecutorResult<Vec<GatewayCallResult>> {
-        let policy = self.exec_ctx.gateway_scheduler_policy.clone();
         let (ctx, relay) = self.pipeline.parts_mut();
         if !relay.has_deferred() {
             return execute_and_emit_output_calls(
                 output_items,
                 &self.registry,
                 output_offset,
-                policy,
+                self.exec_ctx,
                 response_budget,
                 &mut self.tool_call_budget,
                 relay,
@@ -423,9 +445,10 @@ impl<'a> AgentTurn<'a> {
             output_items,
             &self.registry,
             output_offset,
-            policy,
+            self.exec_ctx.gateway_scheduler_policy.clone(),
             &mut self.tool_call_budget,
-        );
+        )
+        .with_metrics(&self.exec_ctx.metrics);
         let initial_event_run_len = scheduler.initial_event_run_len(output_items, &self.registry);
         emit_gateway_start_events(scheduler.event_plans().take(initial_event_run_len), relay).await?;
 
@@ -455,37 +478,5 @@ fn log_custom_tool_calls(output: &[OutputItem], response_id: &str) {
                 "custom tool call requires client execution"
             );
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::types::io::InputItem;
-
-    #[test]
-    fn round_policy_keeps_client_handoff_precedence_and_uses_the_turns_limit() {
-        let results = [GatewayCallResult {
-            item_index: 0,
-            input_item: InputItem::Unknown,
-            public_output: None,
-            omitted: false,
-        }];
-        assert!(matches!(
-            classify_round(true, &results, 0, 1),
-            RoundDecision::RequiresClientAction
-        ));
-        assert!(matches!(classify_round(false, &[], 0, 1), RoundDecision::Done));
-        assert!(matches!(classify_round(false, &results, 0, 2), RoundDecision::Continue));
-        assert!(matches!(
-            classify_round(false, &results, 1, 2),
-            RoundDecision::Incomplete(_)
-        ));
-        // The legacy ten-round policy is supplied by the single-agent adapter,
-        // not hardcoded into shared turn execution or used as a tree budget.
-        assert!(matches!(
-            classify_round(false, &results, 10, 12),
-            RoundDecision::Continue
-        ));
     }
 }

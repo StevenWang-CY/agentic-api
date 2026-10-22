@@ -13,6 +13,7 @@ mod streaming;
 mod usage;
 
 pub use execute::{ExecuteRequest, execute, prepare_non_generating_turn};
+pub use retained::PreparedRetainedResponse;
 use usage::accumulate_usage;
 
 use std::num::NonZeroUsize;
@@ -20,7 +21,7 @@ use std::num::NonZeroUsize;
 #[cfg(test)]
 use either::Either;
 
-use super::compaction::compact_items;
+use super::compaction::{CompactionCarryOver, compact_items};
 use super::gateway::{
     compaction_event_plans, emit_gateway_completed_events, emit_gateway_start_events, emit_response_start_events,
 };
@@ -32,8 +33,10 @@ use crate::executor::request::{ExecutionContext, RequestContext};
 use crate::executor::response_budget::ExecutorResponseBudget;
 #[cfg(test)]
 use crate::executor::response_budget::MAX_EXECUTOR_RESPONSE_BYTES;
+use crate::executor::telemetry::Api;
+use crate::executor::telemetry::metrics::RoundCounter;
 use crate::tool::{ToolSearchMetadata, ToolSearchState};
-use crate::types::io::{InputItem, OutputItem, ResponseUsage, ResponsesInput};
+use crate::types::io::{InOutItem, InputItem, OutputItem, ResponseUsage, ResponsesInput};
 #[cfg(test)]
 use crate::types::request_response::RequestPayload;
 use crate::types::request_response::{IncompleteDetails, ResponsePayload};
@@ -63,10 +66,12 @@ async fn run_until_gateway_tools_complete(
         emit_gateway_completed_events(&payload.output, &event_plans, relay).await?;
         return Ok((payload, tool_search_metadata));
     }
-    EngineOrchestration::new(agent, exec_ctx)
-        .await?
-        .run(auth, stream_upstream)
-        .await
+    Box::pin(
+        EngineOrchestration::new(agent, exec_ctx)
+            .await?
+            .run(auth, stream_upstream),
+    )
+    .await
 }
 
 /// Response-level orchestration. Owns the shared retained-byte budget and
@@ -113,8 +118,7 @@ impl<'a> EngineOrchestration<'a> {
                 coordinator,
                 pipeline,
                 exec_ctx,
-            } => coordinator
-                .run(pipeline, exec_ctx, auth)
+            } => Box::pin(coordinator.run(pipeline, exec_ctx, auth))
                 .await
                 .map(|payload| (payload, None)),
         }
@@ -126,6 +130,7 @@ struct SingleAgentRun<'a> {
     response_budget: ExecutorResponseBudget,
     output: Vec<OutputItem>,
     usage: Option<ResponseUsage>,
+    rounds: RoundCounter,
 }
 
 impl<'a> SingleAgentRun<'a> {
@@ -138,6 +143,7 @@ impl<'a> SingleAgentRun<'a> {
             response_budget,
             output,
             usage: None,
+            rounds: exec_ctx.metrics.rounds(Api::Responses),
         })
     }
 
@@ -147,6 +153,7 @@ impl<'a> SingleAgentRun<'a> {
         stream_upstream: bool,
     ) -> ExecutorResult<(ResponsePayload, Option<ToolSearchMetadata>)> {
         loop {
+            self.rounds.begin_round();
             let RoundResult { mut payload, decision } = self
                 .root
                 .run_round(self.output.len(), auth, stream_upstream, &self.response_budget)
@@ -188,11 +195,22 @@ async fn run_compaction_trigger(
         MultiAgentRun::compact_root(ctx, exec_ctx, auth).await?
     } else {
         let input = std::mem::replace(&mut ctx.enriched_request.input, ResponsesInput::Items(Vec::new()));
+        // Earlier open async calls stay visible through the compaction window. The request's late
+        // outputs and its own open calls would be dropped with the items this turn replaces, so they
+        // are stored again, before the compaction output.
+        let carried = CompactionCarryOver::new(
+            input.input_items(),
+            ctx.new_input_items.iter().filter_map(InOutItem::as_input),
+            &[],
+        )
+        .stored
+        .into_inputs();
         let (mut compacted, usage, service_tier) = compact_items(&ctx.enriched_request, input, exec_ctx, auth).await?;
         let Some(InputItem::Compaction(compaction)) = compacted.pop() else {
             unreachable!("compact_items always appends a compaction item");
         };
-        ctx.new_input_items = compacted;
+        compacted.extend(carried);
+        ctx.new_input_items = compacted.into_iter().map(Into::into).collect();
         if let Some(continuation) = &mut ctx.continuation {
             continuation.mark_history_replaced();
         }
@@ -215,6 +233,7 @@ async fn run_compaction_trigger(
         service_tier,
         tools: None,
         tool_choice: None,
+        standard_fields: crate::types::request_response::StandardResponseFields::default(),
     };
     ctx.inject_ids(&mut payload);
     Ok(payload)
@@ -247,7 +266,15 @@ async fn run_blocking(
 
     let ch = exec_ctx.conv_handler.clone();
     let rh = exec_ctx.resp_handler.clone();
-    persist_if_needed(payload.clone(), ctx, tool_search_metadata, ch, rh).await?;
+    Box::pin(persist_if_needed(
+        payload.clone(),
+        ctx,
+        tool_search_metadata,
+        ch,
+        rh,
+        &exec_ctx.metrics,
+    ))
+    .await?;
 
     Ok(payload)
 }
@@ -268,7 +295,7 @@ pub async fn create_conversation(exec_ctx: &ExecutionContext) -> ExecutorResult<
 mod tests {
     use super::*;
     use crate::executor::modes::{ConversationHandler, ResponseHandler};
-    use crate::storage::{ConversationStore, InOutItem, ResponseStore, create_pool_with_schema};
+    use crate::storage::{ConversationStore, ResponseStore, create_pool_with_schema};
     use crate::tool::{GatewayExecutorRegistration, McpDiscoveredHandler, McpHandler};
     use crate::types::tools::{McpDiscoveredToolParam, ResponsesTool};
     use futures::StreamExt;
@@ -681,6 +708,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prompt_cache_options_survive_compaction_trigger_json_and_sse() {
+        for stream in [false, true] {
+            let captured = Arc::new(Mutex::new(None));
+            let (mut exec, server) = trigger_execution_context(Arc::clone(&captured)).await;
+            exec.responses_config.prompt_cache_options_supported = true;
+            let options = serde_json::json!({"mode":"explicit","ttl":"30m"});
+            let request = serde_json::from_value(serde_json::json!({
+                "model":"test-model", "store":false, "stream":stream, "prompt_cache_options":options,
+                "input":[{"role":"user","content":"remember context"},{"type":"compaction_trigger"}]
+            }))
+            .unwrap();
+            match ExecuteRequest::new(request, Arc::new(exec)).run().await.unwrap() {
+                Either::Left(response) => assert_eq!(response.status, "completed"),
+                Either::Right(events) => {
+                    let events: Vec<_> = events.collect().await;
+                    assert!(events.iter().any(|event| event.contains("response.completed")));
+                }
+            }
+            assert_eq!(captured.lock().await.as_ref().unwrap()["prompt_cache_options"], options);
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
     async fn compaction_trigger_persists_checkpoint_only_as_output() {
         let captured = Arc::new(Mutex::new(None));
         let (mut exec_ctx, server) = trigger_execution_context(Arc::clone(&captured)).await;
@@ -715,10 +766,10 @@ mod tests {
         assert!(matches!(history[0], InOutItem::Input(InputItem::Message(_))));
         assert!(matches!(history[1], InOutItem::Output(OutputItem::Compaction(_))));
 
-        let model_input = ResponsesInput::Items(InOutItem::into_input_items(history));
+        let model_input = ResponsesInput::from(InOutItem::into_input_items(history));
         let serialized = serde_json::to_value(model_input.model_input()).expect("model input serializes");
         assert_eq!(serialized.as_array().map(Vec::len), Some(2));
-        assert_eq!(serialized[0]["content"], "remember banana");
+        assert_eq!(serialized[0]["content"][0]["text"], "remember banana");
         assert_eq!(serialized[1]["role"], "assistant");
         assert_eq!(serialized[1]["content"][0]["text"], "durable summary");
         server.abort();

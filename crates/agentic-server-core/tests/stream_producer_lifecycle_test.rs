@@ -1,5 +1,6 @@
 //! Recorded Responses/tool exchanges exercise stream ownership, not provider qualification.
 
+use agentic_core::types::io::InOutItem;
 mod support;
 
 use std::{
@@ -75,7 +76,7 @@ impl Fixture {
 
     async fn stream(&self, request: RequestPayload, session: &ResponseSession) -> BoxStream {
         let Either::Right(stream) = ExecuteRequest::new(request, Arc::clone(&self.context))
-            .with_session(session)
+            .with_session(session, None)
             .unwrap()
             .run()
             .await
@@ -92,7 +93,7 @@ impl Fixture {
             support::make_request("probe", false, true, None, None),
             Arc::clone(&self.context),
         )
-        .with_session(session)
+        .with_session(session, None)
         .expect("stream drop must synchronously release the execution lease");
         drop(next);
     }
@@ -352,11 +353,9 @@ async fn dropping_a_streaming_fork_preserves_the_sources_reasoning_checkpoint() 
     let ResponsesInput::Items(items) = &parent.enriched_request.input else {
         panic!("parent history")
     };
-    assert!(
-        items
-            .iter()
-            .any(|item| matches!(item, InputItem::Reasoning(reasoning) if !reasoning.content.is_empty()))
-    );
+    assert!(items.iter().any(
+        |item| matches!(item, InOutItem::Input(InputItem::Reasoning(reasoning)) if !reasoning.content.is_empty())
+    ));
     drop(parent);
     assert_eq!(fixture.server.request_bodies().await.len(), 2);
     fixture.assert_no_rows().await;

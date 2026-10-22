@@ -31,72 +31,12 @@ pub const DEFAULT_MAX_CONCURRENT_GATEWAY_CALLS: NonZeroUsize = NonZeroUsize::new
 /// Brave Search's free plan allows roughly one request per second.
 pub const DEFAULT_BRAVE_MAX_CONCURRENT_QUERIES: NonZeroUsize = NonZeroUsize::new(1).expect("default is nonzero");
 
-pub const DEFAULT_MAX_RETAINED_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
-pub const DEFAULT_MAX_UPSTREAM_JSON_BYTES: usize = 16 * 1024 * 1024;
-pub const DEFAULT_MAX_UPSTREAM_SSE_LINE_BYTES: usize = 16 * 1024 * 1024;
-pub const DEFAULT_MAX_STREAM_EVENT_BYTES: usize = 16 * 1024 * 1024;
-
-pub const MIN_WIRE_HEADROOM_BYTES: usize = 64 * 1024;
-
-pub const MAX_RETAINED_RESPONSE_BYTES_ENV: &str = "AGENTIC_MAX_RETAINED_RESPONSE_BYTES";
-pub const MAX_UPSTREAM_JSON_BYTES_ENV: &str = "AGENTIC_MAX_UPSTREAM_JSON_BYTES";
-pub const MAX_UPSTREAM_SSE_LINE_BYTES_ENV: &str = "AGENTIC_MAX_UPSTREAM_SSE_LINE_BYTES";
-pub const MAX_STREAM_EVENT_BYTES_ENV: &str = "AGENTIC_MAX_STREAM_EVENT_BYTES";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ResponsesConfig {
-    pub max_retained_bytes: usize,
-    pub max_upstream_json_bytes: usize,
-    pub max_upstream_sse_line_bytes: usize,
-    pub max_stream_event_bytes: usize,
-}
-
-impl Default for ResponsesConfig {
-    fn default() -> Self {
-        Self {
-            max_retained_bytes: DEFAULT_MAX_RETAINED_RESPONSE_BYTES,
-            max_upstream_json_bytes: DEFAULT_MAX_UPSTREAM_JSON_BYTES,
-            max_upstream_sse_line_bytes: DEFAULT_MAX_UPSTREAM_SSE_LINE_BYTES,
-            max_stream_event_bytes: DEFAULT_MAX_STREAM_EVENT_BYTES,
-        }
-    }
-}
-
-impl ResponsesConfig {
-    /// Validates internal consistency between configured limits.
-    ///
-    /// The wire limits (`max_stream_event_bytes`, `max_upstream_sse_line_bytes`,
-    /// and `max_upstream_json_bytes`) must exceed `max_retained_bytes` by proportional
-    /// wire headroom (`max(MIN_WIRE_HEADROOM_BYTES, max_retained_bytes / 4)`) to account for
-    /// JSON serialization overhead, escaping, and message envelopes.
-    ///
-    /// # Errors
-    /// Returns [`Error::Config`] when streaming delivery, upstream line, or JSON limits
-    /// cannot admit the retained response plus wire headroom.
-    pub fn validate(&self) -> Result<(), Error> {
-        let headroom = MIN_WIRE_HEADROOM_BYTES.max(self.max_retained_bytes / 4);
-        let required = self.max_retained_bytes.saturating_add(headroom);
-        if self.max_stream_event_bytes < required {
-            return Err(Error::Config(format!(
-                "max_stream_event_bytes ({}) cannot be smaller than max_retained_bytes ({}) plus headroom ({})",
-                self.max_stream_event_bytes, self.max_retained_bytes, required
-            )));
-        }
-        if self.max_upstream_sse_line_bytes < required {
-            return Err(Error::Config(format!(
-                "max_upstream_sse_line_bytes ({}) cannot be smaller than max_retained_bytes ({}) plus headroom ({})",
-                self.max_upstream_sse_line_bytes, self.max_retained_bytes, required
-            )));
-        }
-        if self.max_upstream_json_bytes < required {
-            return Err(Error::Config(format!(
-                "max_upstream_json_bytes ({}) cannot be smaller than max_retained_bytes ({}) plus headroom ({})",
-                self.max_upstream_json_bytes, self.max_retained_bytes, required
-            )));
-        }
-        Ok(())
-    }
-}
+mod responses;
+pub use responses::{
+    DEFAULT_MAX_RETAINED_RESPONSE_BYTES, DEFAULT_MAX_STREAM_EVENT_BYTES, DEFAULT_MAX_UPSTREAM_JSON_BYTES,
+    DEFAULT_MAX_UPSTREAM_SSE_LINE_BYTES, MAX_RETAINED_RESPONSE_BYTES_ENV, MAX_STREAM_EVENT_BYTES_ENV,
+    MAX_UPSTREAM_JSON_BYTES_ENV, MAX_UPSTREAM_SSE_LINE_BYTES_ENV, MIN_WIRE_HEADROOM_BYTES, ResponsesConfig,
+};
 
 /// Conservative operator-owned defaults for the opt-in code interpreter.
 ///
@@ -389,11 +329,12 @@ pub enum WebSearchProviderKind {
     Brave,
     Tavily,
     Searxng,
+    Serply,
 }
 
 impl WebSearchProviderKind {
     /// Every selectable provider, in the order operator-facing messages list them.
-    pub const ALL: &'static [Self] = &[Self::You, Self::Brave, Self::Tavily, Self::Searxng];
+    pub const ALL: &'static [Self] = &[Self::You, Self::Brave, Self::Tavily, Self::Searxng, Self::Serply];
 
     /// Environment variable that conventionally carries this provider's API key.
     #[must_use]
@@ -403,6 +344,7 @@ impl WebSearchProviderKind {
             Self::Brave => "BRAVE_API_KEY",
             Self::Tavily => "TAVILY_API_KEY",
             Self::Searxng => "SEARXNG_API_KEY",
+            Self::Serply => "SERPLY_API_KEY",
         }
     }
 
@@ -416,18 +358,19 @@ impl WebSearchProviderKind {
             Self::You | Self::Searxng => None,
             Self::Brave => Some("https://api.search.brave.com"),
             Self::Tavily => Some("https://api.tavily.com"),
+            Self::Serply => Some("https://api.serply.io"),
         }
     }
 
     /// Provider-imposed default ceiling on concurrent search requests. `None`
     /// inherits the gateway-wide limit. Brave's free plan allows roughly one
     /// request per second, so it defaults to serial queries; Tavily's plans
-    /// are metered per minute and SearXNG is operator-hosted, so both inherit
-    /// the gateway limit.
+    /// are metered per minute, Serply's per request, and SearXNG is
+    /// operator-hosted, so all three inherit the gateway limit.
     #[must_use]
     pub const fn default_max_concurrent_queries(self) -> Option<NonZeroUsize> {
         match self {
-            Self::You | Self::Tavily | Self::Searxng => None,
+            Self::You | Self::Tavily | Self::Searxng | Self::Serply => None,
             Self::Brave => Some(DEFAULT_BRAVE_MAX_CONCURRENT_QUERIES),
         }
     }
@@ -440,10 +383,11 @@ impl WebSearchProviderKind {
             Self::Brave => "Brave Search",
             Self::Tavily => "Tavily",
             Self::Searxng => "SearXNG",
+            Self::Serply => "Serply",
         }
     }
 
-    /// Configuration label (`you`, `brave`, `tavily`, `searxng`) matching the serialized form.
+    /// Configuration label (`you`, `brave`, `tavily`, `searxng`, `serply`) matching the serialized form.
     #[must_use]
     pub const fn config_name(self) -> &'static str {
         match self {
@@ -451,6 +395,7 @@ impl WebSearchProviderKind {
             Self::Brave => "brave",
             Self::Tavily => "tavily",
             Self::Searxng => "searxng",
+            Self::Serply => "serply",
         }
     }
 
@@ -772,6 +717,15 @@ mod tests {
         assert_eq!(WebSearchProviderKind::Searxng.default_base_url(), None);
         assert_eq!(WebSearchProviderKind::Searxng.default_max_concurrent_queries(), None);
         assert!(!WebSearchProviderKind::Searxng.is_you());
+
+        assert_eq!(WebSearchProviderKind::Serply.to_string(), "Serply");
+        assert_eq!(WebSearchProviderKind::Serply.default_api_key_env(), "SERPLY_API_KEY");
+        assert_eq!(
+            WebSearchProviderKind::Serply.default_base_url(),
+            Some("https://api.serply.io")
+        );
+        assert_eq!(WebSearchProviderKind::Serply.default_max_concurrent_queries(), None);
+        assert!(!WebSearchProviderKind::Serply.is_you());
     }
 
     #[test]
@@ -797,7 +751,7 @@ mod tests {
         let error = "bing".parse::<WebSearchProviderKind>().unwrap_err();
         assert_eq!(
             error.to_string(),
-            "unknown web_search provider \"bing\"; expected one of: you, brave, tavily, searxng"
+            "unknown web_search provider \"bing\"; expected one of: you, brave, tavily, searxng, serply"
         );
 
         assert_eq!(
@@ -886,6 +840,7 @@ mod tests {
     #[test]
     fn responses_config_validation() {
         let valid = ResponsesConfig {
+            prompt_cache_options_supported: false,
             max_retained_bytes: 1024 * 1024,
             max_upstream_json_bytes: 2 * 1024 * 1024,
             max_upstream_sse_line_bytes: 2 * 1024 * 1024,
@@ -907,6 +862,7 @@ mod tests {
 
         // For 4 MiB retained, 64 KiB is not enough headroom (requires 25% = 1 MiB)
         let borderline = ResponsesConfig {
+            prompt_cache_options_supported: false,
             max_retained_bytes: 4 * 1024 * 1024,
             max_upstream_json_bytes: 4 * 1024 * 1024 + 64 * 1024,
             max_upstream_sse_line_bytes: 5 * 1024 * 1024,

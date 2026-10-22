@@ -60,8 +60,10 @@ async fn combined_media_session_history_and_forks_do_not_compact_image_bytes() {
     .await;
     let requests = model.requests.lock().await;
     assert_eq!(requests.len(), 3, "one inference per turn, no image-driven summary");
+    let mut model_image = input[0]["content"][1].clone();
+    model_image["detail"] = json!("auto");
     for request in requests.iter() {
-        assert_eq!(retained_image(&request["input"]), &input[0]["content"][1]);
+        assert_eq!(retained_image(&request["input"]), &model_image);
     }
     drop(requests);
     source.wait_until_idle().await.unwrap();
@@ -121,7 +123,9 @@ async fn combined_media_text_compaction_promotes_and_restores_canonical_image_hi
     execute_local(&model, &fresh, restored).await;
     let requests = model.requests.lock().await;
     assert_eq!(requests.len(), 4, "canonical restore must not recompact image bytes");
-    assert_eq!(retained_image(&requests[3]["input"]), &input[0]["content"][1]);
+    let mut model_image = input[0]["content"][1].clone();
+    model_image["detail"] = json!("auto");
+    assert_eq!(retained_image(&requests[3]["input"]), &model_image);
     assert!(!requests[3]["input"].to_string().contains(&old_answer));
     drop(requests);
     model.close().await;
@@ -140,7 +144,7 @@ async fn combined_media_token_allowance_does_not_bypass_serialized_retention_bud
         media_request(None, media_input(128 * 1024)),
         Arc::new(model.exec.clone()),
     )
-    .with_session(&session)
+    .with_session(&session, None)
     .unwrap()
     .run()
     .await
@@ -180,13 +184,13 @@ async fn combined_media_message_file_rejection_precedes_compaction_and_releases_
         .unwrap()
         .push(json!({"type":"input_file", "file_data":"encoded document"}));
     let error = ExecuteRequest::new(media_request(None, input), Arc::new(model.exec.clone()))
-        .with_session(&session)
+        .with_session(&session, None)
         .unwrap()
         .run()
         .await
         .err()
         .expect("unsupported message file");
-    assert!(matches!(error, ExecutorError::InvalidRequest(_)));
+    assert!(matches!(error, ExecutorError::InvalidInput(_)));
     assert!(error.to_string().contains("input_file"), "{error}");
     assert!(
         model.requests.lock().await.is_empty(),

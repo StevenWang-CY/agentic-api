@@ -15,6 +15,8 @@ use crate::executor::messages_context::MessagesRequestContext;
 use crate::executor::messages_request::{
     web_fetch_budget_exhausted_result, web_fetch_refused_result, web_search_budget_exhausted_result,
 };
+use crate::executor::telemetry::FailureCategory;
+use crate::executor::telemetry::metrics::{ExecutorMetrics, Stage};
 use crate::tool::web_fetch::{WebFetchArguments, WebFetchErrorCode};
 use crate::tool::web_search::args::requested_searches;
 use crate::tool::{ToolOwnership, ToolRegistry, ToolType};
@@ -59,7 +61,8 @@ pub(super) fn request_gateway_map(
 
 /// Execute one round's gateway calls under the shared scheduling policy. The
 /// per-call timeout starts after permit acquisition. A failure or timeout
-/// becomes an error `tool_result` (E5).
+/// becomes an error `tool_result` (E5). Each call that runs is traced and
+/// timed as a `tool` stage; a refused call is not.
 ///
 /// Returns one `tool_result` block per call, in model order, fed back next
 /// round. (The model's own `tool_use` block is carried forward via the preserved
@@ -71,6 +74,7 @@ pub(super) async fn execute_gateway_calls(
     registry: &ToolRegistry,
     gateway_map: &tool_seam::GatewayToolMap,
     policy: &GatewaySchedulerPolicy,
+    metrics: &ExecutorMetrics,
 ) -> Vec<GatewayToolResult> {
     // Admission is sequential and in model order, before any call starts: the
     // budgets belong to the whole request, so they cannot be decided while
@@ -83,7 +87,7 @@ pub(super) async fn execute_gateway_calls(
     join_all(
         admissions
             .into_iter()
-            .map(|admission| run(admission, registry, policy, &execution_slots)),
+            .map(|admission| run(admission, registry, policy, &execution_slots, metrics)),
     )
     .await
 }
@@ -156,20 +160,45 @@ async fn run(
     registry: &ToolRegistry,
     policy: &GatewaySchedulerPolicy,
     execution_slots: &Semaphore,
+    metrics: &ExecutorMetrics,
 ) -> GatewayToolResult {
     let (call, name) = match admission {
         Admission::Run { call, name } => (call, name),
+        // Answered without running: there is no tool stage to record.
         Admission::Refused(result) => return result,
     };
+    // Typed by the registry entry that serves the call, never by the name
+    // the model supplied.
+    let tool_type = registry.tool_type(&call.name);
+    let timer = metrics.stage(Stage::Tool(tool_type));
+    let (output, is_error) = dispatch(&call, name, registry, tool_type, policy, execution_slots).await;
+    // An error result is a failed stage even though the loop continues.
+    timer.finish(is_error.then_some(FailureCategory::Tool));
+    tool_seam::tool_result_block(&call.call_id, output, is_error)
+}
+
+/// Run one admitted call under the scheduling policy; returns its output and
+/// whether it is an error. A call without a handler acquires no permits.
+#[tracing::instrument(name = "agentic.tool.execute", skip_all, fields(
+    agentic.tool.r#type = super::telemetry::stages::tool_type(tool_type)
+))]
+async fn dispatch(
+    call: &FunctionToolCall,
+    name: &str,
+    registry: &ToolRegistry,
+    tool_type: ToolType,
+    policy: &GatewaySchedulerPolicy,
+    execution_slots: &Semaphore,
+) -> (String, bool) {
     let binding = registry.lookup(&call.name).and_then(|entry| match &entry.ownership {
         ToolOwnership::Gateway(binding) => binding.as_ref(),
         ToolOwnership::Client => None,
     });
     let Some(binding) = binding else {
-        return tool_seam::tool_result_block(&call.call_id, format!("no handler for tool '{name}'"), true);
+        return (format!("no handler for tool '{name}'"), true);
     };
     let _permits = policy.acquire_execution_permits(binding, execution_slots).await;
-    let (output, is_error) = match tokio::time::timeout(
+    match tokio::time::timeout(
         GATEWAY_TOOL_TIMEOUT,
         binding.execute(&call.call_id, &call.name, &call.arguments),
     )
@@ -186,6 +215,5 @@ async fn run(
             format!("gateway tool '{name}' timed out after {GATEWAY_TOOL_TIMEOUT:?}"),
             true,
         ),
-    };
-    tool_seam::tool_result_block(&call.call_id, output, is_error)
+    }
 }
