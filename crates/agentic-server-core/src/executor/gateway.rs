@@ -285,7 +285,7 @@ impl GatewayScheduler {
         &mut self,
         response_budget: &ExecutorResponseBudget,
     ) -> ExecutorResult<Vec<GatewayCallResult>> {
-        let execution_slots = self.policy.execution_slots();
+        let execution_slots = self.policy.new_round_execution_slots();
         let results = join_all(
             self.calls
                 .iter()

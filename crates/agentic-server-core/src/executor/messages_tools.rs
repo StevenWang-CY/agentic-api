@@ -83,7 +83,7 @@ pub(super) async fn execute_gateway_calls(
         .into_iter()
         .map(|tool_use| admit(tool_use, ctx, gateway_map))
         .collect();
-    let execution_slots = policy.execution_slots();
+    let execution_slots = policy.new_round_execution_slots();
     join_all(
         admissions
             .into_iter()

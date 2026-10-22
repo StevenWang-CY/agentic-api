@@ -101,7 +101,7 @@ struct Harness {
     started: mpsc::Receiver<Started>,
     requests: mpsc::Receiver<Value>,
     active: Arc<AtomicUsize>,
-    task: JoinHandle<Value>,
+    task: JoinHandle<()>,
     server: JoinHandle<()>,
 }
 
@@ -217,12 +217,10 @@ impl Harness {
                 assert_eq!(text.matches("event: message_stop\n").count(), 1);
                 assert!(!text.contains("event: error"), "{text}");
                 assert!(!text.contains("tool_use"), "gateway calls stay hidden: {text}");
-                Value::Null
             } else {
                 let response = run_messages_loop(context, &registry, &exec, &upstream).await.unwrap();
                 assert_eq!(response.body["stop_reason"], "end_turn");
                 assert_eq!(response.body["content"], json!([]));
-                response.body
             }
         });
         Self {

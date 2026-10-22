@@ -43,7 +43,7 @@ impl GatewaySchedulerPolicy {
 
     /// A fresh execution window for one inference round. Materialization
     /// capacity remains shared by all users of this policy.
-    pub(crate) fn execution_slots(&self) -> Semaphore {
+    pub(crate) fn new_round_execution_slots(&self) -> Semaphore {
         Semaphore::new(self.max_concurrent_calls.get())
     }
 
@@ -68,7 +68,7 @@ impl GatewaySchedulerPolicy {
         }
     }
 
-    /// Acquires one process-wide materialization slot shared by cloned execution contexts.
+    /// Acquires one materialization slot shared by this policy and its clones.
     pub(crate) fn acquire_materialization_permit(
         &self,
     ) -> impl Future<Output = OwnedSemaphorePermit> + Send + 'static + use<> {
