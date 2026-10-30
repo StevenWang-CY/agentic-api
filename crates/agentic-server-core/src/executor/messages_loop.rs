@@ -147,7 +147,8 @@ async fn run_messages_loop_traced(
         .await;
         timer.finish_result(&fetched);
         let (resp_text, response_headers) = fetched?;
-        let mut message: Value = deserialize_from_str(&resp_text).map_err(ExecutorError::JsonError)?;
+        // A reply that is not a JSON object is refused like malformed JSON.
+        let mut message = Value::Object(deserialize_from_str(&resp_text).map_err(ExecutorError::JsonError)?);
         record_message_usage(&exec_ctx.metrics, message.get("usage"));
 
         // Any error body from upstream is surfaced verbatim (handler maps it to
@@ -285,7 +286,8 @@ fn record_message_usage(metrics: &ExecutorMetrics, usage: Option<&Value>) {
 /// upstream. A round can end while a gateway call is present whenever the stop
 /// reason is not a tool-call stop, for example a `max_tokens` truncation
 /// mid-call. The streaming loop suppresses these blocks too; this is the
-/// non-streaming half of the same contract.
+/// non-streaming half of the same contract. A final round whose `content` is a
+/// bare string keeps it as a text block after the shown rounds.
 fn deliver(
     mut message: Value,
     turn: ClientTurn,
@@ -293,16 +295,17 @@ fn deliver(
     headers: http::HeaderMap,
 ) -> MessagesResponse<Value> {
     let ClientTurn { mut shown, mut usage } = turn;
-    match message.get("content").and_then(Value::as_array) {
-        Some(content) => {
+    let visible = match message.get("content") {
+        Some(Value::Array(content)) => {
             let visible = tool_seam::strip_gateway_tool_use(content, gateway_map);
-            if !shown.is_empty() || visible.len() != content.len() {
-                shown.extend(visible);
-                message["content"] = Value::Array(shown);
-            }
+            (!shown.is_empty() || visible.len() != content.len()).then_some(visible)
         }
-        None if !shown.is_empty() => message["content"] = Value::Array(shown),
-        None => {}
+        Some(Value::String(text)) => (!shown.is_empty()).then(|| vec![json!({"type": "text", "text": text})]),
+        _ => (!shown.is_empty()).then(Vec::new),
+    };
+    if let (Some(visible), Some(fields)) = (visible, message.as_object_mut()) {
+        shown.extend(visible);
+        fields.insert("content".to_owned(), Value::Array(shown));
     }
     usage.finish(&mut message);
     MessagesResponse { body: message, headers }

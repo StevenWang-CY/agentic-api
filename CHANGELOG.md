@@ -12,7 +12,8 @@ All notable changes to Agentic API are documented here.
   `usage.server_tool_use` counts the searches (one per query) and fetches that ran. Claude Code's web search now
   shows its sources and search count through the gateway. A later turn that sends the blocks back reaches the
   upstream as the rounds it saw, with the same ids and result text, on `/v1/messages` (with or without a gateway
-  tool) and `/v1/messages/count_tokens`; an unpaired, repeated, or altered gateway block is refused with HTTP 400.
+  tool) and `/v1/messages/count_tokens`; an unpaired or repeated gateway block, or altered search content, is refused
+  with HTTP 400.
   Search page text travels sealed in `encrypted_content`; set `AGENTIC_MESSAGES_RESULT_KEY` (at least 32 random
   bytes) on every replica to keep results readable across restarts and replicas, since results sealed under another
   key reach the model as a note that they are no longer available. A web fetch result also carries the content
@@ -60,8 +61,8 @@ All notable changes to Agentic API are documented here.
   (#381). `language` maps to Google's `hl` plus the `lr=lang_xx` result-language restrict where Google supports one.
 - Added Claude's native `web_fetch_20250910` server tool as a gateway-executed tool on `/v1/messages` and
   `/v1/messages/count_tokens` (#408). The declaration is rewritten into an ordinary `web_fetch` function tool for the
-  upstream, the gateway fetches the page the model names and feeds the text back as a hidden `tool_result`, and the
-  call never reaches the client, like native web search. `max_uses` is a request-wide budget of fetches charged for
+  upstream, and the gateway fetches the page the model names and feeds the text back to the model as a
+  `tool_result`. `max_uses` is a request-wide budget of fetches charged for
   every admitted call, `allowed_domains` / `blocked_domains` match on the host and apply to every redirect hop, and
   `max_content_tokens` cuts the text at an approximate four bytes per token below the 1 MiB tool output cap. Only a
   URL that already appeared in a user message or a tool result can be fetched; non-public addresses (loopback,

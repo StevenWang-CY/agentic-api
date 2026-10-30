@@ -1734,8 +1734,12 @@ it on the live round and again on replay, so a returned turn reproduces the orig
 exactly. `replay::replay_server_tool_blocks` runs at the start of both loops, in
 `count_tokens`, and on the proxy path when a body carries a gateway id; it splits each
 assistant message at the end of every run of result blocks into the round's `tool_use`
-blocks and a user message of `tool_result`s, and refuses an unpaired, repeated, or altered
-gateway block with HTTP 400. A search result carries the executor's result data sealed in
+blocks and a user message of `tool_result`s, and refuses with HTTP 400 a gateway block that
+is unpaired or repeated, or search content that does not open under the key. Replay is exact
+for every round whose gateway calls were all shown. A hidden call leaves no block, so a round
+that also ran one replays without it, and a round whose calls were all hidden leaves only its
+other blocks, which join the next round; a fetch result carries its page text in the clear and
+replays as sent. A search result carries the executor's result data sealed in
 `encrypted_content` (`sealing.rs`: AES-256-GCM under a content key drawn per envelope by
 HKDF from `AGENTIC_MESSAGES_RESULT_KEY`, or from a secret generated once per process; the
 associated data binds the upstream id, the call's queries, and the result's position).

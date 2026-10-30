@@ -5,17 +5,21 @@
 //! `web_search_tool_result`, over JSON and SSE. Sending the returned turn back
 //! gives the upstream exactly the rounds it saw — the same ids and the same
 //! `tool_result` text — without running the search again. One local listener
-//! plays the scripted vLLM `/v1/messages` and the You.com search backend.
+//! plays the scripted vLLM `/v1/messages`, the You.com search backend, and a
+//! page to fetch.
 
 use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
 
+use agentic_core::config::{DEFAULT_MAX_CONCURRENT_GATEWAY_CALLS, WebFetchConfig};
 use agentic_core::executor::{
     ConversationHandler, ExecutionContext, ExecutorError, MessagesRequestContext, MessagesResultKey, MessagesUpstream,
     ResponseHandler, run_messages_loop, run_messages_stream,
 };
 use agentic_core::storage::{ConversationStore, ResponseStore};
-use agentic_core::tool::{ToolRegistry, WebSearchHandler, registry_tools};
+use agentic_core::tool::{
+    GatewayExecutorRegistration, ToolRegistry, WebFetchHandler, WebSearchHandler, registry_tools,
+};
 use agentic_core::types::messages::GatewayToolMap;
 use axum::extract::State;
 use axum::http::{StatusCode, Uri};
@@ -62,15 +66,28 @@ fn sse_turn(message: &Value) -> String {
     push(&json!({"type": "message_start", "message": start}));
     for (index, block) in message["content"].as_array().unwrap().iter().enumerate() {
         let mut initial = block.clone();
-        let delta = if block["type"] == "tool_use" {
-            initial["input"] = json!({});
-            json!({"type": "input_json_delta", "partial_json": block["input"].to_string()})
-        } else {
-            initial["text"] = json!("");
-            json!({"type": "text_delta", "text": block["text"]})
+        let deltas = match block["type"].as_str().unwrap() {
+            "tool_use" => {
+                initial["input"] = json!({});
+                vec![json!({"type": "input_json_delta", "partial_json": block["input"].to_string()})]
+            }
+            "thinking" => {
+                initial["thinking"] = json!("");
+                initial["signature"] = json!("");
+                vec![
+                    json!({"type": "thinking_delta", "thinking": block["thinking"]}),
+                    json!({"type": "signature_delta", "signature": block["signature"]}),
+                ]
+            }
+            _ => {
+                initial["text"] = json!("");
+                vec![json!({"type": "text_delta", "text": block["text"]})]
+            }
         };
         push(&json!({"type": "content_block_start", "index": index, "content_block": initial}));
-        push(&json!({"type": "content_block_delta", "index": index, "delta": delta}));
+        for delta in deltas {
+            push(&json!({"type": "content_block_delta", "index": index, "delta": delta}));
+        }
         push(&json!({"type": "content_block_stop", "index": index}));
     }
     push(
@@ -167,6 +184,7 @@ async fn harness() -> Harness {
     let app = Router::new()
         .route("/v1/messages", post(infer))
         .route("/v1/search", get(search))
+        .route("/page", get(|| async { "PAGE-TEXT" }))
         .with_state(backend.clone());
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
@@ -250,18 +268,24 @@ fn assembled(events: &[Value]) -> Value {
                 blocks.push(event["content_block"].clone());
                 inputs.push(String::new());
             }
-            "content_block_delta" => match event["delta"]["type"].as_str().unwrap() {
-                "text_delta" => {
-                    let joined = format!(
-                        "{}{}",
-                        blocks[index]["text"].as_str().unwrap(),
-                        event["delta"]["text"].as_str().unwrap()
-                    );
-                    blocks[index]["text"] = json!(joined);
-                }
-                "input_json_delta" => inputs[index].push_str(event["delta"]["partial_json"].as_str().unwrap()),
-                other => panic!("unexpected delta {other}"),
-            },
+            "content_block_delta" => {
+                let (field, piece) = match event["delta"]["type"].as_str().unwrap() {
+                    "text_delta" => ("text", "text"),
+                    "thinking_delta" => ("thinking", "thinking"),
+                    "signature_delta" => ("signature", "signature"),
+                    "input_json_delta" => {
+                        inputs[index].push_str(event["delta"]["partial_json"].as_str().unwrap());
+                        continue;
+                    }
+                    other => panic!("unexpected delta {other}"),
+                };
+                let joined = format!(
+                    "{}{}",
+                    blocks[index][field].as_str().unwrap(),
+                    event["delta"][piece].as_str().unwrap()
+                );
+                blocks[index][field] = json!(joined);
+            }
             _ => {}
         }
     }
@@ -290,6 +314,8 @@ fn shape(content: &Value) -> Vec<String> {
                 )
             ),
             "text" => format!("text {}", block["text"].as_str().unwrap()),
+            "thinking" => format!("thinking {}", block["thinking"].as_str().unwrap()),
+            "web_fetch_tool_result" => format!("web_fetch_tool_result {}", block["tool_use_id"].as_str().unwrap()),
             other => format!("{other} {}", block["id"].as_str().unwrap_or_default()),
         })
         .collect()
@@ -318,18 +344,19 @@ async fn assert_replays_the_original_rounds(harness: &Harness, first: &Value, co
         live[..],
         "the same ids and tool_result text as the live rounds"
     );
-    let final_text: Vec<Value> = content
+    // The final round is everything after the last result block.
+    let final_round: Vec<Value> = content
         .as_array()
         .unwrap()
         .iter()
         .rev()
-        .take_while(|block| block["type"] == "text")
+        .take_while(|block| !block["type"].as_str().unwrap().ends_with("_tool_result"))
         .cloned()
         .collect::<Vec<_>>()
         .into_iter()
         .rev()
         .collect();
-    assert_eq!(sent[live.len()], json!({"role": "assistant", "content": final_text}));
+    assert_eq!(sent[live.len()], json!({"role": "assistant", "content": final_round}));
     assert_eq!(sent[live.len() + 1], json!({"role": "user", "content": "Thanks."}));
     assert_eq!(sent.len(), live.len() + 2);
     assert_eq!(harness.searches().len(), searched, "the search is not run again");
@@ -476,6 +503,218 @@ async fn a_block_after_a_native_call_keeps_its_place() {
             "stream={stream}"
         );
         assert_replays_the_original_rounds(&harness, &first, &content, stream).await;
+    }
+}
+
+/// The final round follows the shown rounds whatever its content: an empty
+/// list, a bare string, or none at all.
+#[tokio::test]
+async fn a_final_round_without_blocks_keeps_the_shown_rounds() {
+    for (case, content, stream) in [
+        ("empty list", Some(json!([])), false),
+        ("empty list", Some(json!([])), true),
+        ("bare string", Some(json!("Done.")), false),
+        ("no content", None, false),
+    ] {
+        let harness = harness().await;
+        let mut last = assistant(&[], "end_turn");
+        match content {
+            Some(content) => last["content"] = content,
+            None => {
+                last.as_object_mut().unwrap().remove("content");
+            }
+        }
+        harness.script(vec![assistant(&[search_call("t1", "rust")], "tool_use"), last]);
+
+        let (content, usage) = run(
+            &harness,
+            request(
+                &json!([{"role": "user", "content": "Go."}]),
+                &json!([native_search()]),
+                stream,
+            ),
+        )
+        .await
+        .unwrap();
+
+        let mut expected = vec![
+            "server_tool_use srvtoolu_gw_t1",
+            "web_search_tool_result srvtoolu_gw_t1 3 results",
+        ];
+        if case == "bare string" {
+            expected.push("text Done.");
+        }
+        assert_eq!(shape(&content), expected, "{case} stream={stream}");
+        assert_eq!(usage["server_tool_use"]["web_search_requests"], 1, "{case}");
+    }
+}
+
+/// A reply that is not a message object is refused like malformed JSON, also
+/// after an executed round.
+#[tokio::test]
+async fn a_reply_that_is_not_an_object_is_refused() {
+    let harness = harness().await;
+    harness.script(vec![
+        assistant(&[search_call("t1", "rust")], "tool_use"),
+        json!(["not", "a", "message"]),
+    ]);
+
+    let error = run(
+        &harness,
+        request(
+            &json!([{"role": "user", "content": "Go."}]),
+            &json!([native_search()]),
+            false,
+        ),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(*error, ExecutorError::JsonError(_)), "{error:?}");
+}
+
+/// Thinking blocks keep their place and signature in the shown turn, and the
+/// replayed rounds carry them back to the upstream unchanged.
+#[tokio::test]
+async fn thinking_blocks_keep_their_place_across_rounds() {
+    let thinking = |text: &str, signature: &str| json!({"type": "thinking", "thinking": text, "signature": signature});
+    for stream in [false, true] {
+        let harness = harness().await;
+        harness.script(vec![
+            assistant(
+                &[thinking("Search first.", "sig-1"), search_call("t1", "rust")],
+                "tool_use",
+            ),
+            assistant(&[thinking("Now answer.", "sig-2"), text("Done.")], "end_turn"),
+        ]);
+        let first = request(
+            &json!([{"role": "user", "content": "Go."}]),
+            &json!([native_search()]),
+            stream,
+        );
+
+        let (content, _) = run(&harness, first.clone()).await.unwrap();
+
+        assert_eq!(
+            shape(&content),
+            [
+                "thinking Search first.",
+                "server_tool_use srvtoolu_gw_t1",
+                "web_search_tool_result srvtoolu_gw_t1 3 results",
+                "thinking Now answer.",
+                "text Done."
+            ],
+            "stream={stream}"
+        );
+        assert_eq!(content[0]["signature"], "sig-1");
+        assert_eq!(content[3]["signature"], "sig-2");
+        assert_replays_the_original_rounds(&harness, &first, &content, stream).await;
+    }
+}
+
+/// A native call in a round the gateway does not run stays hidden: a round cut
+/// off by `max_tokens`, or one that ends its turn instead of asking for the
+/// call. The blocks around it keep their order.
+#[tokio::test]
+async fn a_native_call_in_a_round_that_does_not_run_stays_hidden() {
+    for stop_reason in ["max_tokens", "end_turn"] {
+        for stream in [false, true] {
+            let harness = harness().await;
+            harness.script(vec![assistant(
+                &[text("Let me search."), search_call("t1", "rust"), text("More.")],
+                stop_reason,
+            )]);
+
+            let (content, usage) = run(
+                &harness,
+                request(
+                    &json!([{"role": "user", "content": "Go."}]),
+                    &json!([native_search()]),
+                    stream,
+                ),
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(
+                shape(&content),
+                ["text Let me search.", "text More."],
+                "{stop_reason} stream={stream}"
+            );
+            assert!(usage.get("server_tool_use").is_none(), "{usage}");
+            assert!(harness.searches().is_empty(), "the search never ran");
+        }
+    }
+}
+
+/// A native call and a hidden gateway call in one round both run: here a
+/// native `web_fetch` and a plain function named `web_search`. Only the native
+/// call is shown and counted, so the returned turn replays that round with the
+/// native call alone, its `tool_result` unchanged.
+#[tokio::test]
+async fn a_hidden_call_beside_a_native_call_is_not_replayed() {
+    for stream in [false, true] {
+        let mut harness = harness().await;
+        harness.exec_ctx = harness
+            .exec_ctx
+            .clone()
+            .with_gateway_executor(GatewayExecutorRegistration::WebFetch(Arc::new(
+                WebFetchHandler::from_config(
+                    &WebFetchConfig::default().with_allow_private_networks(true),
+                    DEFAULT_MAX_CONCURRENT_GATEWAY_CALLS,
+                ),
+            )));
+        let page = format!("{}/page", harness.url);
+        let fetch_call = json!({"type": "tool_use", "id": "t1", "name": "web_fetch", "input": {"url": page}});
+        harness.script(vec![
+            assistant(&[fetch_call, search_call("t2", "rust")], "tool_use"),
+            assistant(&[text("Done.")], "end_turn"),
+        ]);
+        let tools = json!([
+            {"type": "web_fetch_20250910", "name": "web_fetch"},
+            {"name": "web_search", "input_schema": {"type": "object"}}
+        ]);
+        let first = request(
+            &json!([{"role": "user", "content": format!("Read {page}, then search.")}]),
+            &tools,
+            stream,
+        );
+
+        let (content, usage) = run(&harness, first.clone()).await.unwrap();
+
+        assert_eq!(
+            shape(&content),
+            [
+                "server_tool_use srvtoolu_gw_t1",
+                "web_fetch_tool_result srvtoolu_gw_t1",
+                "text Done."
+            ],
+            "stream={stream}"
+        );
+        assert_eq!(content[1]["content"]["content"]["source"]["data"], "PAGE-TEXT");
+        assert_eq!(usage["server_tool_use"], json!({"web_fetch_requests": 1}));
+        assert_eq!(harness.searches(), ["rust"], "the hidden search ran");
+        let live = harness.upstream_requests()[1]["messages"].clone();
+        assert_eq!(live[2]["content"][1]["tool_use_id"], "t2");
+
+        harness.script(vec![assistant(&[text("You're welcome.")], "end_turn")]);
+        let mut messages = first["messages"].as_array().unwrap().clone();
+        messages.push(json!({"role": "assistant", "content": content}));
+        messages.push(json!({"role": "user", "content": "Thanks."}));
+        run(&harness, request(&json!(messages), &tools, stream)).await.unwrap();
+
+        let sent = harness.upstream_requests()[0]["messages"].clone();
+        assert_eq!(
+            sent[1]["content"],
+            json!([live[1]["content"][0]]),
+            "the native call alone"
+        );
+        assert_eq!(
+            sent[2]["content"],
+            json!([live[2]["content"][0]]),
+            "its tool_result unchanged"
+        );
+        assert_eq!(sent[3], json!({"role": "assistant", "content": [text("Done.")]}));
     }
 }
 

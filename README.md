@@ -723,7 +723,9 @@ query, then a `web_search_tool_result` listing each result's URL, title, and pag
 `usage.server_tool_use.web_search_requests` counts the searches that ran. Claude Code builds its result list and search
 count from these blocks. The page text travels in each result's `encrypted_content`, which the gateway seals; send the
 blocks back unchanged, and the next turn gives the model the same results it read before without searching again.
-Altered content is refused with HTTP 400, as Anthropic refuses it. A failed search shows its documented error code.
+Altered `encrypted_content` is refused with HTTP 400, as Anthropic refuses it. A failed search shows its documented
+error code. The `server_tool_use` input is the call as the model made it, in the gateway's search schema (`query`, or
+`queries` for a batch).
 Results stay readable across restarts and on every replica that shares `AGENTIC_MESSAGES_RESULT_KEY`, a secret of at
 least 32 random bytes; without it, each process generates its own key, and results sealed by another process reach
 the model as a note that they are no longer available.
