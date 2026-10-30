@@ -16,6 +16,7 @@ use url::Url;
 use super::backend::{FetchFailure, FetchedDocument};
 use super::extract::{self, truncate_to_char_boundary};
 use crate::tool::handler::{MAX_GATEWAY_TOOL_OUTPUT_BYTES, ToolError, ToolOutput};
+pub(crate) use crate::types::messages::WebFetchErrorCode;
 use crate::types::tools::WebFetchToolParam;
 
 /// Bytes of UTF-8 per token assumed when applying `max_content_tokens`. The
@@ -28,21 +29,6 @@ const MAX_CONTENT_BYTES: usize = MAX_GATEWAY_TOOL_OUTPUT_BYTES - 16 * 1024;
 const RESULT_TYPE: &str = "web_fetch_result";
 /// The `type` of a model-facing result that reports a documented failure.
 const FAILURE_TYPE: &str = "web_fetch_tool_result_error";
-
-/// The documented `web_fetch_tool_result_error` codes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum WebFetchErrorCode {
-    InvalidToolInput,
-    UrlTooLong,
-    UrlNotAllowed,
-    UrlNotInPriorContext,
-    UrlNotAccessible,
-    TooManyRequests,
-    UnsupportedContentType,
-    MaxUsesExceeded,
-    Unavailable,
-}
 
 /// A fetch the handler refused or could not complete: the documented code and
 /// a message the model can act on.

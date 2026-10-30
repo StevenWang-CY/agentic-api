@@ -8,7 +8,7 @@
 
 pub(crate) mod args;
 pub(crate) mod brave;
-mod provider;
+pub(crate) mod provider;
 pub(crate) mod searxng;
 pub(crate) mod serply;
 pub(crate) mod tavily;

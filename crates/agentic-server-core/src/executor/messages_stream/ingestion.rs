@@ -135,13 +135,22 @@ impl MessagesStreamAccumulator {
         if block_type == "tool_use" {
             if is_gateway_tool {
                 // Suppress gateway-owned tool_use from the client; it stays in the
-                // buffered history only and drives the loop.
+                // buffered history only and drives the loop. A native call is
+                // shown if its round runs it, so it and the rest of the round
+                // wait for the round's end in its place.
                 self.suppressed_indices.insert(up_index);
+                if self.native.tool(name).is_some() {
+                    self.held.push(event.clone());
+                }
                 return Vec::new();
             }
             // A client-owned tool_use: the client must execute it, so this round
             // is terminal (E7). Forward it (below) and stop the loop.
             self.has_client_tool_use = true;
+        }
+        if !self.held.is_empty() {
+            self.held.push(event.clone());
+            return Vec::new();
         }
 
         // Forward with a rebased contiguous client index.
@@ -187,6 +196,7 @@ impl MessagesStreamAccumulator {
             return Vec::new();
         }
         let Some(&client_index) = self.index_map.get(&up_index) else {
+            self.hold(event);
             return Vec::new();
         };
         event["index"] = Value::from(client_index);
@@ -206,10 +216,19 @@ impl MessagesStreamAccumulator {
             return Vec::new();
         }
         let Some(&client_index) = self.index_map.get(&up_index) else {
+            self.hold(event);
             return Vec::new();
         };
         event["index"] = Value::from(client_index);
         vec![sse("content_block_stop", event)]
+    }
+
+    /// Hold an event of a block that started after the round's first native
+    /// call; such a block has no client index until the round ends.
+    fn hold(&mut self, event: &Value) {
+        if !self.held.is_empty() {
+            self.held.push(event.clone());
+        }
     }
 }
 
