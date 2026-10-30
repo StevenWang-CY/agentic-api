@@ -116,6 +116,8 @@ async fn only_configured_mcp_servers_receive_the_calling_trace_and_baggage() {
             headers: Some(configured_headers),
             allowed_tools: None,
             require_approval: None,
+            description: None,
+            defer_loading: None,
         },
     )]))
     .await;
