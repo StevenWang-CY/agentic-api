@@ -96,8 +96,13 @@ impl MessagesResultKey {
     /// Returns [`MessagesResultKeyError::TooShort`] for a secret that is set but
     /// too short.
     pub fn from_env() -> Result<Option<Self>, MessagesResultKeyError> {
-        std::env::var(MESSAGES_RESULT_KEY_ENV)
-            .ok()
+        Self::from_env_value(std::env::var(MESSAGES_RESULT_KEY_ENV).ok())
+    }
+
+    /// The key a value of [`MESSAGES_RESULT_KEY_ENV`] configures; surrounding
+    /// whitespace is ignored, and a blank value configures none.
+    fn from_env_value(value: Option<String>) -> Result<Option<Self>, MessagesResultKeyError> {
+        value
             .map(|secret| secret.trim().to_owned())
             .filter(|secret| !secret.is_empty())
             .map(|secret| Self::from_secret(secret.as_bytes()))
@@ -269,6 +274,29 @@ mod tests {
             Err(MessagesResultKeyError::TooShort)
         ));
         assert!(MessagesResultKey::from_secret("a".repeat(MIN_SECRET_LEN).as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn the_environment_value_configures_the_key() {
+        assert!(MessagesResultKey::from_env_value(None).unwrap().is_none());
+        assert!(
+            MessagesResultKey::from_env_value(Some(" \n".to_owned()))
+                .unwrap()
+                .is_none()
+        );
+        assert!(matches!(
+            MessagesResultKey::from_env_value(Some("short".to_owned())),
+            Err(MessagesResultKeyError::TooShort)
+        ));
+        let configured = MessagesResultKey::from_env_value(Some(format!(" {SECRET}\n")))
+            .unwrap()
+            .unwrap();
+        let sealed = key_from(SECRET).seal(b"aad", b"x".to_vec()).unwrap();
+        assert_eq!(
+            configured.open(b"aad", &sealed).unwrap(),
+            b"x",
+            "the trimmed value is the secret"
+        );
     }
 
     #[test]
