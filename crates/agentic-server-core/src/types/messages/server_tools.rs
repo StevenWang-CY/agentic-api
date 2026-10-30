@@ -68,6 +68,15 @@ impl ServerToolResultBlock {
             Self::WebFetchToolResult { .. } => "web_fetch",
         }
     }
+
+    /// The block's `type`.
+    #[must_use]
+    pub fn block_type(&self) -> &'static str {
+        match self {
+            Self::WebSearchToolResult { .. } => "web_search_tool_result",
+            Self::WebFetchToolResult { .. } => "web_fetch_tool_result",
+        }
+    }
 }
 
 /// `web_search_tool_result.content`: the results, or a single error object. An
@@ -277,6 +286,7 @@ mod tests {
         }));
         assert_eq!(results.tool_use_id(), "srvtoolu_01");
         assert_eq!(results.tool_name(), "web_search");
+        assert_eq!(results.block_type(), "web_search_tool_result");
 
         let empty: ServerToolResultBlock = round_trip(&json!({
             "type": "web_search_tool_result", "tool_use_id": "srvtoolu_02", "content": []
@@ -317,6 +327,7 @@ mod tests {
                         "retrieved_at": "2025-08-25T10:30:00Z"}
         }));
         assert_eq!(document.tool_name(), "web_fetch");
+        assert_eq!(document.block_type(), "web_fetch_tool_result");
         // The documented example without a title or retrieval time parses too.
         let _: ServerToolResultBlock = round_trip(&json!({
             "type": "web_fetch_tool_result", "tool_use_id": "srvtoolu_01H",

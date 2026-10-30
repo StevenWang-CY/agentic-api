@@ -2,15 +2,19 @@
 //! given back to the model: both project the model's `tool_result` from the
 //! block, so the two always agree.
 
+use std::borrow::Cow;
+
 use serde_json::Value;
 
 use super::model_text::{
-    ExecutorFetchFailure, ExecutorFetchOutput, ExecutorSearchOutput, SealedSearchResult, SearchSection,
-    UNAVAILABLE_RESULTS_TEXT, projected_tool_result, search_error_text, search_queries, search_result_aad, search_text,
+    SealedSearchResult, SearchSection, UNAVAILABLE_RESULTS_TEXT, projected_tool_result, search_error_text,
+    search_queries, search_result_aad, search_text,
 };
 use super::sealing::{MESSAGES_RESULT_KEY_ENV, MessagesResultKey, OpenError};
 use super::{NativeOutcome, NativeTool, ProjectedResult, Refusal, ReplayFailure, client_tool_use_id};
 use crate::executor::messages_usage::ServerToolUses;
+use crate::tool::web_fetch::{FailureOutput, WebFetchToolOutput};
+use crate::tool::web_search::output::WebSearchToolOutput;
 use crate::types::messages::{
     GatewayToolResult, ServerToolResultBlock, WebFetchDocument, WebFetchErrorCode, WebFetchResult,
     WebFetchToolResultContent, WebSearchErrorCode, WebSearchResultBlock, WebSearchToolResultContent,
@@ -46,15 +50,18 @@ pub(crate) fn project_native_call(
         NativeTool::WebFetch => {
             let block = match outcome {
                 NativeOutcome::Output { text, failed: false } => {
-                    match serde_json::from_str::<ExecutorFetchOutput>(&text) {
+                    match serde_json::from_str::<WebFetchToolOutput<'_>>(&text) {
                         Ok(page) => ServerToolResultBlock::WebFetchToolResult {
                             tool_use_id: client_id,
                             content: WebFetchToolResultContent::WebFetchResult(WebFetchResult {
-                                url: page.url,
-                                content: WebFetchDocument::new(page.content, page.title),
-                                retrieved_at: Some(page.retrieved_at),
-                                content_type: Some(page.content_type),
-                                truncated: Some(page.truncated),
+                                url: page.url.into_owned(),
+                                content: WebFetchDocument::new(
+                                    page.content.into_owned(),
+                                    page.title.map(Cow::into_owned),
+                                ),
+                                retrieved_at: page.retrieved_at.map(Cow::into_owned),
+                                content_type: page.content_type.map(Cow::into_owned),
+                                truncated: page.truncated,
                             }),
                         },
                         Err(error) => {
@@ -64,8 +71,8 @@ pub(crate) fn project_native_call(
                     }
                 }
                 NativeOutcome::Output { text, failed: true } => {
-                    if let Ok(failure) = serde_json::from_str::<ExecutorFetchFailure>(&text) {
-                        fetch_error(client_id, failure.error_code, Some(failure.message))
+                    if let Ok(failure) = serde_json::from_str::<FailureOutput<'_>>(&text) {
+                        fetch_error(client_id, failure.error_code, Some(failure.message.into_owned()))
                     } else {
                         tracing::warn!(output = %text, "native web_fetch call failed");
                         fetch_error(client_id, WebFetchErrorCode::Unavailable, None)
@@ -145,7 +152,8 @@ fn seal_search(
     text: &str,
     key: &MessagesResultKey,
 ) -> Result<ProjectedResult, &'static str> {
-    let output: ExecutorSearchOutput = serde_json::from_str(text).map_err(|_| "the executor output did not parse")?;
+    let output: WebSearchToolOutput<'_> =
+        serde_json::from_str(text).map_err(|_| "the executor output did not parse")?;
     let queries = search_queries(input).ok_or("the call input did not parse")?;
     let sealed: Vec<SealedSearchResult> = output
         .results

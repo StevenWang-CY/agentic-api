@@ -157,19 +157,20 @@ impl Replay<'_> {
                     open_calls.insert(call.id.clone(), call);
                 }
                 Some(GatewayBlock::Result) => {
+                    let kind = block.get("type").and_then(Value::as_str).unwrap_or_default().to_owned();
                     let result: ServerToolResultBlock = serde_json::from_value(block)
-                        .map_err(|error| invalid(format!("invalid gateway server tool result block: {error}")))?;
+                        .map_err(|error| invalid(format!("invalid gateway {kind} block: {error}")))?;
                     let id = result.tool_use_id();
                     let call = open_calls.remove(id).ok_or_else(|| {
                         invalid(format!(
-                            "{}_result block for `{id}` does not follow its server_tool_use block in the same message",
-                            result.tool_name()
+                            "{} block for `{id}` does not follow its server_tool_use block in the same message",
+                            result.block_type()
                         ))
                     })?;
                     if call.name != result.tool_name() {
                         return Err(invalid(format!(
-                            "{}_result block for `{id}` answers a `{}` call",
-                            result.tool_name(),
+                            "{} block for `{id}` answers a `{}` call",
+                            result.block_type(),
                             call.name
                         )));
                     }
@@ -178,8 +179,8 @@ impl Replay<'_> {
                         replayed_tool_result(upstream_id, &call.input, &result, self.key).map_err(|failure| {
                             match failure {
                                 ReplayFailure::Tampered => invalid(format!(
-                                    "{}_result block for `{id}` was modified or was not issued by this gateway",
-                                    result.tool_name()
+                                    "{} block for `{id}` was modified or was not issued by this gateway",
+                                    result.block_type()
                                 )),
                                 ReplayFailure::InvalidInput => {
                                     invalid(format!("server_tool_use `{id}` no longer carries the search it ran"))

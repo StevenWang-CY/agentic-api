@@ -6,30 +6,23 @@
 //! order, each native call as a `server_tool_use` block (start, one
 //! `input_json_delta`, stop) when the round runs its calls, or hidden like any
 //! unexecuted gateway call when it does not. The result blocks follow the
-//! round's last block, each complete in one `content_block_start`.
+//! round's last block, each complete in one `content_block_start`. A released
+//! block reaches the client through the same `forward` as a live one.
 
 use serde_json::{Value, json};
 
+use super::ingestion::Frame;
 use super::{MessagesRoundDecision, MessagesStreamAccumulator, sse};
 use crate::executor::messages_tools::ExecutedCall;
 use crate::types::messages::{GatewayToolResult, ServerToolUseBlock};
 
-/// One client SSE frame and whether it carries output text.
-pub(super) type Frame = (String, bool);
-
 impl MessagesStreamAccumulator {
-    fn next_client_index(&mut self) -> u32 {
-        let index = self.next_index;
-        self.next_index += 1;
-        index
-    }
-
     /// Release the blocks held since the round's first native call, showing
     /// the native calls when `show_native_calls` (the round runs them).
     pub(super) fn release_held(&mut self, show_native_calls: bool) -> Vec<Frame> {
         let held = std::mem::take(&mut self.held);
         let mut frames = Vec::with_capacity(held.len());
-        for mut event in held {
+        for event in held {
             let up_index = event.get("index").and_then(Value::as_u64).unwrap_or(0);
             if self.suppressed_indices.contains(&up_index) {
                 // Only a native call's start is held, to keep its place.
@@ -43,17 +36,7 @@ impl MessagesStreamAccumulator {
                 }
                 continue;
             }
-            if event["type"] == "content_block_start" {
-                let index = self.next_client_index();
-                self.index_map.insert(up_index, index);
-            }
-            let Some(&index) = self.index_map.get(&up_index) else {
-                continue;
-            };
-            event["index"] = Value::from(index);
-            let text = event["delta"]["type"] == "text_delta";
-            let name = event["type"].as_str().unwrap_or_default().to_owned();
-            frames.push((sse(&name, &event), text));
+            frames.extend(self.forward(event));
         }
         frames
     }

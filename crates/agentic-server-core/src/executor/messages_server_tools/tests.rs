@@ -616,7 +616,7 @@ fn malformed_or_unpaired_gateway_blocks_are_refused() {
         (
             "result without call",
             vec![fetched.clone()],
-            "does not follow its server_tool_use block",
+            "web_fetch_tool_result block for `srvtoolu_gw_toolu_1` does not follow its server_tool_use block",
         ),
         (
             "result before call",
@@ -650,17 +650,17 @@ fn malformed_or_unpaired_gateway_blocks_are_refused() {
         (
             "kind mismatch",
             vec![call("toolu_1", "web_fetch", &fetch_input), wrong_kind],
-            "invalid gateway server tool result block",
+            "invalid gateway web_search_tool_result block",
         ),
         (
             "search answering a fetch",
             vec![call("toolu_1", "web_fetch", &fetch_input), tampered.clone()],
-            "answers a `web_fetch` call",
+            "web_search_tool_result block for `srvtoolu_gw_toolu_1` answers a `web_fetch` call",
         ),
         (
             "tampered content",
             vec![call("toolu_1", "web_search", &search_input()), tampered],
-            "was modified or was not issued by this gateway",
+            "web_search_tool_result block for `srvtoolu_gw_toolu_1` was modified or was not issued by this gateway",
         ),
         (
             "malformed call",

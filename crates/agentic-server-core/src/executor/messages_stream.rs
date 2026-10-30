@@ -23,7 +23,7 @@ mod ingestion;
 mod server_tools;
 mod wire;
 use blocks::BufferedBlock;
-use server_tools::Frame;
+use ingestion::Frame;
 use wire::{error_sse, executor_error_sse, sse};
 
 use std::collections::{BTreeMap, HashMap, HashSet};
